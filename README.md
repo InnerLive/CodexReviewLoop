@@ -75,8 +75,11 @@ diagram readable on GitHub instead of drawing a long backward edge.
 The trigger judge may choose a point fix without invoking the architecture
 roles. Architecture-positive or uncertain decisions receive independent
 confirmation and, if needed, one tie-break. The same pattern is used for finding
-verification. Every finding cluster gets a fresh fixer thread; only its second
-attempt resumes that thread.
+verification. A direct verifier acceptance requires high confidence and an
+exact match to passing targeted-test evidence reported by the fixer; otherwise
+Sol confirmation or Terra adjudication is required. Configured host gates still
+run independently before every commit. Every finding cluster gets a fresh fixer
+thread; only its second attempt resumes that thread.
 
 An atomic checkpoint is written after every role transition. Restarting resumes
 the active cluster. Model disagreement, architecture scope violations, failed
@@ -102,7 +105,9 @@ heartbeat. `-HeartbeatSeconds 0` disables these heartbeats.
 
 Every visible status line is also written to `terminal.log` in the run directory
 with a timestamp and without color codes. Codex JSONL, stderr, and host-gate logs
-are flushed while the process is running.
+are flushed while the process is running. Role completion separates new input,
+cached input, and output tokens so large cached context is not mistaken for
+equally expensive new input.
 
 ## Help
 

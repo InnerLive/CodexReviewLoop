@@ -321,7 +321,7 @@ function Invoke-ReviewLoopCluster {
         $targetedCommand = [string]$verification.Result.targetedTest.command
         $targetedState = if ([bool]$verification.Result.targetedTest.passed) { "passed" } else { "failed" }
         Write-ReviewLoopStatus `
-            -Message "Verifier: $($verification.Result.verdict) · Confidence $($verification.Result.confidence) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
+            -Message "Verifier: $($verification.Result.verdict) · Confidence $($verification.Result.confidence) · $($verification.Basis) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
             -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
 

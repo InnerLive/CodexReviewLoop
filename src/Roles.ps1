@@ -103,6 +103,8 @@ Review the complete branch diff against $($Config.ReviewBase).
 Report only discrete, actionable correctness, security, reliability, or material performance defects.
 Ignore style-only cleanup and optional architecture ideas. Verify each finding against current code.
 Do not run build or test commands in this read-only review role. Inspect relevant tests instead; executable host gates run separately.
+Keep investigation scoped to changed hunks, their direct dependencies, and relevant tests. Avoid repeated broad searches and full-file dumps.
+Prefer narrow line ranges and capped search results. On Windows, discover wildcard matches with rg --files -g or Get-ChildItem instead of passing wildcard path literals to rg or Get-Content.
 "@
     $native = Invoke-ConfiguredCodexRole `
         -Config $Config `
@@ -453,6 +455,35 @@ function Invoke-ReviewLoopFixer {
         -CallId ("$($State.ActiveClusterId)-fix-$Attempt") -State $State -StatePath $StatePath
 }
 
+function ConvertTo-ReviewLoopComparableCommand {
+    param([AllowNull()][string]$Command)
+
+    return ([regex]::Replace(($Command ?? "").Trim(), "\s+", " ")).ToLowerInvariant()
+}
+
+function Test-ReviewLoopFixerTestEvidence {
+    param(
+        [Parameter(Mandatory = $true)][object]$FixerResult,
+        [Parameter(Mandatory = $true)][object]$VerificationResult
+    )
+
+    if (-not [bool]$VerificationResult.targetedTest.passed) {
+        return $false
+    }
+    $verificationCommand = ConvertTo-ReviewLoopComparableCommand `
+        -Command ([string]$VerificationResult.targetedTest.command)
+    if ([string]::IsNullOrWhiteSpace($verificationCommand)) {
+        return $false
+    }
+    foreach ($test in @($FixerResult.targetedTests)) {
+        if ([bool]$test.passed -and
+            (ConvertTo-ReviewLoopComparableCommand -Command ([string]$test.command)) -eq $verificationCommand) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Invoke-ReviewLoopVerifier {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -481,11 +512,26 @@ function Invoke-ReviewLoopVerifier {
         -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-primary" -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $primary
     $result = $primary.StructuredResult
-    if ([string]$result.verdict -eq "resolved" -and [bool]$result.targetedTest.passed) {
-        return [pscustomobject]@{ Accepted = $true; Result = $result; Calls = @($primary) }
+    $hasFixerTestEvidence = Test-ReviewLoopFixerTestEvidence `
+        -FixerResult $FixerCall.StructuredResult `
+        -VerificationResult $result
+    if ([string]$result.verdict -eq "resolved" -and
+        [string]$result.confidence -eq "high" -and
+        $hasFixerTestEvidence) {
+        return [pscustomobject]@{
+            Accepted = $true
+            Result = $result
+            Calls = @($primary)
+            Basis = "Luna + matching fixer test evidence"
+        }
     }
     if ([string]$result.verdict -in @("reproduced", "obsolete") -and [string]$result.confidence -eq "high") {
-        return [pscustomobject]@{ Accepted = $false; Result = $result; Calls = @($primary) }
+        return [pscustomobject]@{
+            Accepted = $false
+            Result = $result
+            Calls = @($primary)
+            Basis = "Luna"
+        }
     }
 
     $confirm = Invoke-ConfiguredCodexRole `
@@ -499,6 +545,7 @@ function Invoke-ReviewLoopVerifier {
             Accepted = [string]$confirmed.verdict -eq "resolved"
             Result = $confirmed
             Calls = @($primary, $confirm)
+            Basis = "Luna + Sol confirmation"
         }
     }
 
@@ -516,5 +563,6 @@ function Invoke-ReviewLoopVerifier {
         Accepted = [string]$final.verdict -eq "resolved"
         Result = $final
         Calls = @($primary, $confirm, $tie)
+        Basis = "Terra adjudication"
     }
 }

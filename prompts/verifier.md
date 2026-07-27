@@ -12,7 +12,9 @@ Rules:
 - A changed line is not proof of resolution.
 - Follow failure, cancellation, retry, caching, and deferred-state paths when relevant.
 - Report exact file/line or test evidence.
-- Use `resolved` only with a passing targeted test. A detailed targeted-test result supplied by the fixer may be reused when it is clearly bound to the current correction; otherwise run the smallest suitable test yourself.
+- This role is read-only. Do not run build or test commands.
+- Use `resolved` only with a passing targeted-test result supplied by the fixer that is clearly bound to the current correction.
+- When reusing fixer evidence, copy its exact command and result into `targetedTest`; do not describe it as an independent verifier execution.
 - If no suitable test exists or the supplied test evidence cannot be tied to the current correction, return `insufficient_evidence`.
 - Do not edit files.
 

@@ -555,6 +555,56 @@ Describe "Semantic trigger candidates" {
     }
 }
 
+Describe "Verifier evidence matching" {
+    It "accepts only a passing verifier command present in passing fixer evidence" {
+        $module = Get-Module CodexReviewLoop
+        $matches = & $module {
+            $fixer = [pscustomobject]@{
+                targetedTests = @(
+                    [pscustomobject]@{
+                        command = "dotnet test .\tests\Tests.csproj --filter Example"
+                        passed = $true
+                    }
+                )
+            }
+            $verification = [pscustomobject]@{
+                targetedTest = [pscustomobject]@{
+                    command = "  DOTNET   test .\tests\Tests.csproj --filter Example "
+                    passed = $true
+                }
+            }
+            Test-ReviewLoopFixerTestEvidence -FixerResult $fixer -VerificationResult $verification
+        }
+
+        $matches | Should Be $true
+    }
+
+    It "rejects invented or failed verifier test evidence" {
+        $module = Get-Module CodexReviewLoop
+        $matches = & $module {
+            $fixer = [pscustomobject]@{
+                targetedTests = @(
+                    [pscustomobject]@{ command = "dotnet test A"; passed = $true }
+                )
+            }
+            @(
+                Test-ReviewLoopFixerTestEvidence `
+                    -FixerResult $fixer `
+                    -VerificationResult ([pscustomobject]@{
+                        targetedTest = [pscustomobject]@{ command = "dotnet test B"; passed = $true }
+                    })
+                Test-ReviewLoopFixerTestEvidence `
+                    -FixerResult $fixer `
+                    -VerificationResult ([pscustomobject]@{
+                        targetedTest = [pscustomobject]@{ command = "dotnet test A"; passed = $false }
+                    })
+            )
+        }
+
+        @($matches | Where-Object { $_ }).Count | Should Be 0
+    }
+}
+
 Describe "Run state" {
     BeforeEach {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
@@ -645,6 +695,22 @@ Describe "Fake Codex integration" {
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex
         $call.Usage.InputTokens | Should Be 100
         $call.Usage.CachedInputTokens | Should Be 80
+    }
+
+    It "separates new, cached, and output tokens in terminal usage" {
+        $transcript = Join-Path $TestDrive "usage-terminal.log"
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($path)
+            Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
+        } $transcript
+
+        Invoke-CodexCliRole `
+            -Role Test -RepoPath $repo.FullName -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
+
+        (Get-Content -Raw -LiteralPath $transcript) |
+            Should Match "20 new input · 80 cached input · 20 output tokens"
     }
 
     It "passes the prompt over stdin" {
@@ -858,6 +924,28 @@ Describe "Live terminal and streaming process observation" {
         $text | Should Not Match "\[X\] Skill descriptions were shortened"
     }
 
+    It "shows dropped app-server events as a warning" {
+        $transcript = Join-Path $caseRoot "event-lag-warning.log"
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($path)
+            Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
+            $activity = [pscustomobject]@{ ActionCount = 0; ThreadId = "" }
+            $event = [pscustomobject]@{
+                type = "item.completed"
+                item = [pscustomobject]@{
+                    type = "error"
+                    message = "in-process app-server event stream lagged; dropped 390 events"
+                }
+            } | ConvertTo-Json -Depth 5 -Compress
+            Update-ReviewLoopCodexActivity -Line $event -Activity $activity
+        } $transcript
+
+        $text = Get-Content -Raw -LiteralPath $transcript
+        $text | Should Match "\[!\] in-process app-server event stream lagged"
+        $text | Should Not Match "\[X\] in-process app-server event stream lagged"
+    }
+
     It "keeps the cause and tail of long failure output" {
         $module = Get-Module CodexReviewLoop
         $excerpt = & $module {
@@ -1010,6 +1098,20 @@ Describe "Schemas, prompts, and CLI-only invariants" {
     It "prevents read-only reviewers from launching build or test commands" {
         $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
         $roles | Should Match 'Do not run build or test commands in this read-only review role'
+        $roles | Should Match 'Avoid repeated broad searches and full-file dumps'
+        $roles | Should Match 'instead of passing wildcard path literals'
+    }
+
+    It "prevents read-only verifiers from launching build or test commands" {
+        $verifier = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\verifier.md")
+        $verifier | Should Match 'Do not run build or test commands'
+    }
+
+    It "leaves full repository test suites to host gates" {
+        $fixer = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\fixer.md")
+        $fixer | Should Match 'Do not run the full repository or solution test suite'
+        $fixer | Should Match 'Never stop unrelated processes'
+        $fixer | Should Match 'do not pass wildcard path literals'
     }
 
     It "has no direct HTTP model invocation in active code" {

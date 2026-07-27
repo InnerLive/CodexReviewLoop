@@ -316,7 +316,7 @@ function Test-ReviewLoopCodexAdvisoryMessage {
     param([AllowNull()][string]$Message)
 
     return -not [string]::IsNullOrWhiteSpace($Message) -and
-        $Message -match "(?i)^Skill descriptions were shortened to fit\b"
+        $Message -match "(?i)^(Skill descriptions were shortened to fit\b|in-process app-server event stream lagged; dropped \d+ events\b)"
 }
 
 function Update-ReviewLoopCodexActivity {
@@ -691,8 +691,13 @@ function Invoke-CodexCliRole {
             }
 
             $duration = Format-ReviewLoopDuration -Duration ($finishedAt - $startedAt)
-            $tokens = [long]$parsed.Usage.InputTokens + [long]$parsed.Usage.OutputTokens
-            Write-ReviewLoopStatus -Message "$Role completed · $duration · $tokens tokens" -Kind Success
+            $inputTokens = [long]$parsed.Usage.InputTokens
+            $cachedTokens = [long]$parsed.Usage.CachedInputTokens
+            $newInputTokens = [Math]::Max(0L, $inputTokens - $cachedTokens)
+            $outputTokens = [long]$parsed.Usage.OutputTokens
+            Write-ReviewLoopStatus `
+                -Message "$Role completed · $duration · $newInputTokens new input · $cachedTokens cached input · $outputTokens output tokens" `
+                -Kind Success
             return [pscustomobject]@{
                 Success = $true
                 Role = $Role
