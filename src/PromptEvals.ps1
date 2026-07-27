@@ -75,9 +75,9 @@ function Test-CodexReviewLoopPrompts {
         [string]$CodexPath = ""
     )
 
-    $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     $resolvedConfigPath = Resolve-ReviewLoopConfigPath -RepoPath $repo -ConfigPath $ConfigPath
-    $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath
+    $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath -RepoPath $repo
     $casesPath = Join-Path $script:ModuleRoot "evals\historical-cases.psd1"
     $cases = Import-PowerShellDataFile -LiteralPath $casesPath
     $requiresHistoricalLogs = @($cases.Normalizer | Where-Object {

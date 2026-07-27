@@ -468,9 +468,9 @@ function Invoke-CodexReviewLoop {
         -HeartbeatSeconds $HeartbeatSeconds `
         -ColorMode $ColorMode `
         -TranscriptPath ""
-    $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     $resolvedConfigPath = Resolve-ReviewLoopConfigPath -RepoPath $repo -ConfigPath $ConfigPath
-    $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath
+    $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath -RepoPath $repo
     $paths = New-ReviewLoopRunPaths -Config $config -RepoPath $repo
     $statePath = ""
     $state = $null

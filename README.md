@@ -29,10 +29,15 @@ pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
 
 `ConfigPath` ist optional. Ohne Angabe sucht das Tool zuerst nach
 `.codex-review-loop.psd1` beziehungsweise `.codex\review-loop.psd1` im
-Repository und danach nach `profiles\<Repositoryname>.psd1` im Toolverzeichnis.
-Existiert noch kein Profil, wird dort automatisch ein kommentiertes
-Standardprofil angelegt und unmittelbar verwendet. Ein expliziter, noch nicht
-existierender `ConfigPath` wird ebenfalls automatisch angelegt.
+Repository und danach unter `profiles\` nach einem Profil, dessen
+`RepositoryPath` exakt dem kanonischen Git-Root entspricht. Existiert noch kein
+Profil, wird dort automatisch das nächste nummerierte Profil mit dem
+Repositorynamen als Präfix angelegt, beispielsweise `MeinProjekt-001.psd1`.
+Gleichnamige Repositories in verschiedenen
+Verzeichnissen erhalten dadurch getrennte Profile wie `MeinProjekt-001.psd1`
+und `MeinProjekt-002.psd1`. Ein
+expliziter, noch nicht existierender `ConfigPath` wird ebenfalls automatisch
+angelegt.
 Der Standardwert `LogRoot = '.\runs'` wird immer relativ zum Verzeichnis des
 Review-Loop-Skripts aufgelöst, nicht relativ zum aktuellen Arbeitsverzeichnis
 oder zum geprüften Repository.

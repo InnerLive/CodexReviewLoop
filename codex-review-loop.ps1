@@ -10,18 +10,20 @@ sich erst nach den im Profil konfigurierten Clean-Passes.
 ConfigPath ist optional. Ohne expliziten Pfad wird in dieser Reihenfolge gesucht:
 1. <RepoPath>\.codex-review-loop.psd1
 2. <RepoPath>\.codex\review-loop.psd1
-3. <Toolverzeichnis>\profiles\<Repositoryname>.psd1
+3. Ein Profil unter <Toolverzeichnis>\profiles, dessen RepositoryPath
+   exakt dem kanonischen Git-Root entspricht.
 
 Wird kein Profil gefunden, legt das Tool automatisch ein kommentiertes Profil
-unter <Toolverzeichnis>\profiles\<Repositoryname>.psd1 an und setzt den Lauf
-damit fort.
+als nächste freie Nummer unter <Toolverzeichnis>\profiles an, beispielsweise
+MeinProjekt-001.psd1 oder MeinProjekt-002.psd1, und setzt den Lauf damit fort.
 
 .PARAMETER RepoPath
 Pfad zum Git-Repository, das geprüft und gegebenenfalls korrigiert wird.
 
 .PARAMETER ConfigPath
 Optionaler Pfad zu einer PSD1-Profildatei. Existiert der explizit angegebene
-Pfad noch nicht, wird dort automatisch ein kommentiertes Profil angelegt.
+Pfad noch nicht, wird dort automatisch ein kommentiertes Profil mit dem
+kanonischen RepositoryPath angelegt.
 
 .PARAMETER Speed
 Globaler Service-Tier für ausnahmslos alle Rollen und Resume-Aufrufe.

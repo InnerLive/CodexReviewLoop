@@ -123,6 +123,138 @@ function ConvertTo-ReviewLoopPowerShellLiteral {
     return "'$(([string]$Value).Replace("'", "''"))'"
 }
 
+function Get-ReviewLoopComparablePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    $absolute = [System.IO.Path]::GetFullPath($expanded)
+    return [System.IO.Path]::TrimEndingDirectorySeparator($absolute)
+}
+
+function Get-ReviewLoopRepositoryRoot {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $candidate = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $root = (& git -C $candidate rev-parse --show-toplevel 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
+        throw "RepoPath ist kein Git-Repository: $candidate"
+    }
+    return Get-ReviewLoopComparablePath -Path $root
+}
+
+function Test-ReviewLoopSamePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    $comparison = if ($IsWindows) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [System.StringComparison]::Ordinal
+    }
+    return [string]::Equals(
+        (Get-ReviewLoopComparablePath -Path $Left),
+        (Get-ReviewLoopComparablePath -Path $Right),
+        $comparison)
+}
+
+function Assert-ReviewLoopConfigRepository {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $config = Import-PowerShellDataFile -LiteralPath $ConfigPath
+    if (-not $config.ContainsKey("RepositoryPath") -or
+        [string]::IsNullOrWhiteSpace([string]$config.RepositoryPath)) {
+        return
+    }
+    $configured = [string]$config.RepositoryPath
+    if (-not [System.IO.Path]::IsPathRooted(
+        [Environment]::ExpandEnvironmentVariables($configured))) {
+        throw "RepositoryPath muss absolut sein: $ConfigPath"
+    }
+    if (-not (Test-ReviewLoopSamePath -Left $configured -Right $RepoPath)) {
+        throw "Profil '$ConfigPath' gehört zu '$configured', nicht zu '$RepoPath'."
+    }
+}
+
+function Find-ReviewLoopProfileByRepository {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfilesRoot,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ProfilesRoot -PathType Container)) {
+        return ""
+    }
+    $matches = [System.Collections.Generic.List[string]]::new()
+    foreach ($profile in @(Get-ChildItem -LiteralPath $ProfilesRoot -Filter "*.psd1" -File)) {
+        try {
+            $config = Import-PowerShellDataFile -LiteralPath $profile.FullName
+        }
+        catch {
+            Write-ReviewLoopStatus `
+                -Message "Ungültiges Profil wird bei der Repository-Suche übersprungen: $($profile.FullName)" `
+                -Kind Warning
+            continue
+        }
+        if (-not $config.ContainsKey("RepositoryPath")) {
+            continue
+        }
+        $configured = [string]$config.RepositoryPath
+        if ([string]::IsNullOrWhiteSpace($configured) -or
+            -not [System.IO.Path]::IsPathRooted(
+                [Environment]::ExpandEnvironmentVariables($configured))) {
+            continue
+        }
+        if (Test-ReviewLoopSamePath -Left $configured -Right $RepoPath) {
+            [void]$matches.Add($profile.FullName)
+        }
+    }
+    if ($matches.Count -gt 1) {
+        throw "Mehrere Profile gehören zu '$RepoPath': $($matches -join ', ')"
+    }
+    if ($matches.Count -eq 1) {
+        return Get-ReviewLoopComparablePath -Path $matches[0]
+    }
+    return ""
+}
+
+function Get-ReviewLoopNextProfilePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfilesRoot,
+        [Parameter(Mandatory = $true)][string]$RepositoryName
+    )
+
+    [System.IO.Directory]::CreateDirectory($ProfilesRoot) | Out-Null
+    $safeName = [regex]::Replace($RepositoryName, "[^A-Za-z0-9._-]+", "-").Trim("-", ".", "_")
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = "repository"
+    }
+    $namePattern = "^{0}-(\d+)$" -f [regex]::Escape($safeName)
+    $numbers = @(Get-ChildItem -LiteralPath $ProfilesRoot -Filter "*.psd1" -File |
+        Where-Object { $_.BaseName -match $namePattern } |
+        ForEach-Object {
+            if ($_.BaseName -match $namePattern) {
+                [int64]$Matches[1]
+            }
+        })
+    $next = if ($numbers.Count -eq 0) {
+        1L
+    }
+    else {
+        [int64](($numbers | Measure-Object -Maximum).Maximum) + 1L
+    }
+    do {
+        $path = Join-Path $ProfilesRoot ("{0}-{1:D3}.psd1" -f $safeName, $next)
+        $next++
+    } while (Test-Path -LiteralPath $path)
+    return $path
+}
+
 function Get-ReviewLoopDefaultReviewBase {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
@@ -147,7 +279,7 @@ function New-ReviewLoopProfile {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     $absolute = Resolve-ReviewLoopPath -Path $Path
     $name = Split-Path -Leaf $repo
     $reviewBase = Get-ReviewLoopDefaultReviewBase -RepoPath $repo
@@ -179,6 +311,9 @@ function New-ReviewLoopProfile {
 @{
     # Anzeigename des Profils. Er bildet zugleich den Unterordner für Ledger und Runs.
     Name = $(ConvertTo-ReviewLoopPowerShellLiteral $name)
+
+    # Kanonischer Git-Root dieses Profils. Er verhindert Kollisionen zwischen gleichnamigen Repositories.
+    RepositoryPath = $(ConvertTo-ReviewLoopPowerShellLiteral $repo)
 
     # Git-Revision, gegen die Codex den Branch prüft, z. B. origin/main, origin/master oder main.
     ReviewBase = $(ConvertTo-ReviewLoopPowerShellLiteral $reviewBase)
@@ -244,10 +379,11 @@ function Resolve-ReviewLoopConfigPath {
         [string]$ProfilesRoot = ""
     )
 
-    $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
         $explicit = Resolve-ReviewLoopPath -Path $ConfigPath
         if (Test-Path -LiteralPath $explicit -PathType Leaf) {
+            Assert-ReviewLoopConfigRepository -ConfigPath $explicit -RepoPath $repo
             return $explicit
         }
         return New-ReviewLoopProfile -RepoPath $repo -Path $explicit
@@ -258,7 +394,9 @@ function Resolve-ReviewLoopConfigPath {
         (Join-Path $repo ".codex\review-loop.psd1")
     )) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return (Resolve-ReviewLoopPath -Path $candidate)
+            $local = Resolve-ReviewLoopPath -Path $candidate
+            Assert-ReviewLoopConfigRepository -ConfigPath $local -RepoPath $repo
+            return $local
         }
     }
 
@@ -268,17 +406,30 @@ function Resolve-ReviewLoopConfigPath {
     else {
         Resolve-ReviewLoopPath -Path $ProfilesRoot
     }
-    $profilePath = Join-Path $profileDirectory ("{0}.psd1" -f (Split-Path -Leaf $repo))
-    if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
-        return (Resolve-ReviewLoopPath -Path $profilePath)
+    $matched = Find-ReviewLoopProfileByRepository `
+        -ProfilesRoot $profileDirectory `
+        -RepoPath $repo
+    if (-not [string]::IsNullOrWhiteSpace($matched)) {
+        return $matched
     }
+    $profilePath = Get-ReviewLoopNextProfilePath `
+        -ProfilesRoot $profileDirectory `
+        -RepositoryName (Split-Path -Leaf $repo)
     return New-ReviewLoopProfile -RepoPath $repo -Path $profilePath
 }
 
 function Import-ReviewLoopConfig {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [string]$RepoPath = ""
+    )
 
     $absolute = Resolve-ReviewLoopPath -Path $ConfigPath -MustExist
+    if (-not [string]::IsNullOrWhiteSpace($RepoPath)) {
+        Assert-ReviewLoopConfigRepository `
+            -ConfigPath $absolute `
+            -RepoPath (Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath)
+    }
     $config = Import-PowerShellDataFile -LiteralPath $absolute
     $required = @("Name", "ReviewBase", "LogRoot", "Roles", "HostGates")
     foreach ($name in $required) {

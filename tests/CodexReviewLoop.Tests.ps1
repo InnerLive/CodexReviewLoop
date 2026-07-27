@@ -184,13 +184,18 @@ Describe "Optional profiles and command help" {
             Resolve-ReviewLoopConfigPath -RepoPath $repository -ProfilesRoot $profiles
         } $repo $profilesRoot
 
-        (Split-Path -Leaf $resolved) | Should Be "automatic-profile-repo.psd1"
+        (Split-Path -Leaf $resolved) | Should Be "automatic-profile-repo-001.psd1"
         (Test-Path -LiteralPath $resolved -PathType Leaf) | Should Be $true
         $content = Get-Content -Raw -LiteralPath $resolved
         $content | Should Match "# Rollenwerte:"
         $content | Should Match "# Host-Gates"
         $profile = Import-PowerShellDataFile -LiteralPath $resolved
         $profile.Name | Should Be "automatic-profile-repo"
+        $canonicalRepo = & $module {
+            param($repository)
+            Get-ReviewLoopRepositoryRoot -RepoPath $repository
+        } $repo
+        $profile.RepositoryPath | Should Be $canonicalRepo
         $profile.LogRoot | Should Be ".\runs"
         $profile.Roles.Keys.Count | Should Be 14
         @($profile.HostGates).Count | Should Be 1
@@ -199,6 +204,76 @@ Describe "Optional profiles and command help" {
             Import-ReviewLoopConfig -ConfigPath $path
         } $resolved
         $imported.LogRoot | Should Be (Join-Path $root "runs")
+    }
+
+    It "reuses the profile matched by canonical repository path" {
+        $repo = New-TestRepo (Join-Path $TestDrive "canonical-profile-repo")
+        $subdirectory = Join-Path $repo "src"
+        New-Item -ItemType Directory -Path $subdirectory | Out-Null
+        $profilesRoot = Join-Path $TestDrive "canonical-profiles"
+        $module = Get-Module CodexReviewLoop
+
+        $first = & $module {
+            param($repository, $profiles)
+            Resolve-ReviewLoopConfigPath -RepoPath $repository -ProfilesRoot $profiles
+        } $repo $profilesRoot
+        $fromSubdirectory = & $module {
+            param($repository, $profiles)
+            Resolve-ReviewLoopConfigPath -RepoPath $repository -ProfilesRoot $profiles
+        } $subdirectory $profilesRoot
+
+        $fromSubdirectory | Should Be $first
+        @(Get-ChildItem -LiteralPath $profilesRoot -Filter "*.psd1").Count | Should Be 1
+    }
+
+    It "numbers profiles separately for equal repository names" {
+        $firstRepo = New-TestRepo (Join-Path $TestDrive "first\SharedRepo")
+        $secondRepo = New-TestRepo (Join-Path $TestDrive "second\SharedRepo")
+        $profilesRoot = Join-Path $TestDrive "numbered-profiles"
+        $module = Get-Module CodexReviewLoop
+
+        $first = & $module {
+            param($repository, $profiles)
+            Resolve-ReviewLoopConfigPath -RepoPath $repository -ProfilesRoot $profiles
+        } $firstRepo $profilesRoot
+        $second = & $module {
+            param($repository, $profiles)
+            Resolve-ReviewLoopConfigPath -RepoPath $repository -ProfilesRoot $profiles
+        } $secondRepo $profilesRoot
+
+        (Split-Path -Leaf $first) | Should Be "SharedRepo-001.psd1"
+        (Split-Path -Leaf $second) | Should Be "SharedRepo-002.psd1"
+        $firstProfile = Import-PowerShellDataFile -LiteralPath $first
+        $secondProfile = Import-PowerShellDataFile -LiteralPath $second
+        $canonicalFirst = & $module {
+            param($repository)
+            Get-ReviewLoopRepositoryRoot -RepoPath $repository
+        } $firstRepo
+        $canonicalSecond = & $module {
+            param($repository)
+            Get-ReviewLoopRepositoryRoot -RepoPath $repository
+        } $secondRepo
+        $firstProfile.RepositoryPath | Should Be $canonicalFirst
+        $secondProfile.RepositoryPath | Should Be $canonicalSecond
+    }
+
+    It "rejects an explicit profile bound to another repository" {
+        $firstRepo = New-TestRepo (Join-Path $TestDrive "bound-first")
+        $secondRepo = New-TestRepo (Join-Path $TestDrive "bound-second")
+        $profilePath = Join-Path $TestDrive "bound\profile.psd1"
+        $module = Get-Module CodexReviewLoop
+
+        & $module {
+            param($repository, $path)
+            Resolve-ReviewLoopConfigPath -RepoPath $repository -ConfigPath $path
+        } $firstRepo $profilePath | Out-Null
+
+        (Test-Throws {
+            & $module {
+                param($repository, $path)
+                Resolve-ReviewLoopConfigPath -RepoPath $repository -ConfigPath $path
+            } $secondRepo $profilePath
+        }) | Should Be $true
     }
 
     It "creates an explicitly requested missing profile" {
