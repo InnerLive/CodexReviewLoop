@@ -151,7 +151,7 @@ function New-ReviewLoopProfile {
     $absolute = Resolve-ReviewLoopPath -Path $Path
     $name = Split-Path -Leaf $repo
     $reviewBase = Get-ReviewLoopDefaultReviewBase -RepoPath $repo
-    $logRoot = Join-Path $script:ModuleRoot "runs"
+    $logRoot = ".\runs"
     $solution = @(Get-ChildItem -LiteralPath $repo -File | Where-Object {
         $_.Extension -in @(".sln", ".slnx")
     })
@@ -184,6 +184,7 @@ function New-ReviewLoopProfile {
     ReviewBase = $(ConvertTo-ReviewLoopPowerShellLiteral $reviewBase)
 
     # Verzeichnis für Ledger, Checkpoints, JSONL- und Ergebnislogs.
+    # Relative Pfade werden gegen das Verzeichnis des Review-Loop-Skripts aufgelöst.
     LogRoot = $(ConvertTo-ReviewLoopPowerShellLiteral $logRoot)
 
     # Zwei Clean-Passes auf unverändertem HEAD sind der empfohlene Abschluss.
@@ -285,6 +286,9 @@ function Import-ReviewLoopConfig {
             throw "Konfiguration enthält '$name' nicht: $absolute"
         }
     }
+    if ([string]::IsNullOrWhiteSpace([string]$config.LogRoot)) {
+        throw "Konfiguration enthält keinen gültigen LogRoot: $absolute"
+    }
 
     $defaults = @{
         CleanPassesRequired = 2
@@ -300,6 +304,14 @@ function Import-ReviewLoopConfig {
         if (-not $config.ContainsKey($entry.Key)) {
             $config[$entry.Key] = $entry.Value
         }
+    }
+
+    $configuredLogRoot = [Environment]::ExpandEnvironmentVariables([string]$config.LogRoot)
+    $config.LogRoot = if ([System.IO.Path]::IsPathRooted($configuredLogRoot)) {
+        [System.IO.Path]::GetFullPath($configuredLogRoot)
+    }
+    else {
+        [System.IO.Path]::GetFullPath((Join-Path $script:ModuleRoot $configuredLogRoot))
     }
 
     return $config

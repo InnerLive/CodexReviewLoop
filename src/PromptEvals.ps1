@@ -71,7 +71,7 @@ function Test-CodexReviewLoopPrompts {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$ConfigPath = "",
-        [string]$HistoricalLogRoot = "C:\dev\codex-review-loop\PKonf",
+        [string]$HistoricalLogRoot = "",
         [string]$CodexPath = ""
     )
 
@@ -80,7 +80,18 @@ function Test-CodexReviewLoopPrompts {
     $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath
     $casesPath = Join-Path $script:ModuleRoot "evals\historical-cases.psd1"
     $cases = Import-PowerShellDataFile -LiteralPath $casesPath
-    $history = Resolve-ReviewLoopPath -Path $HistoricalLogRoot -MustExist
+    $requiresHistoricalLogs = @($cases.Normalizer | Where-Object {
+        $_.ContainsKey("HistoricalNativePath")
+    }).Count -gt 0
+    if ($requiresHistoricalLogs -and [string]::IsNullOrWhiteSpace($HistoricalLogRoot)) {
+        throw "HistoricalLogRoot ist für Eval-Fälle mit HistoricalNativePath erforderlich."
+    }
+    $history = if ([string]::IsNullOrWhiteSpace($HistoricalLogRoot)) {
+        ""
+    }
+    else {
+        Resolve-ReviewLoopPath -Path $HistoricalLogRoot -MustExist
+    }
     $beforeHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
     $beforeStatus = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("status", "--porcelain=v1", "--untracked-files=all")
     $evalRoot = Join-Path $script:ModuleRoot ("eval-results\{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss"))

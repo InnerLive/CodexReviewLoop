@@ -57,9 +57,9 @@ Die Datei terminal.log bleibt unabhängig davon immer frei von Farbcodes.
 Zeigt diese Hilfe an, ohne ein Profil anzulegen oder den Review-Loop zu starten.
 
 .EXAMPLE
-C:\dev\CodexReviewLoop\codex-review-loop.ps1 -RepoPath C:\dev\PKonf
+C:\Tools\CodexReviewLoop\codex-review-loop.ps1 -RepoPath C:\dev\MeinProjekt
 
-Verwendet automatisch profiles\PKonf.psd1 und Standard-Speed.
+Erzeugt bei Bedarf automatisch ein kommentiertes Profil und verwendet Standard-Speed.
 
 .EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 `

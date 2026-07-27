@@ -2,11 +2,23 @@
 
 Die Review Loop v3 orchestriert native Codex-Reviews, semantische Architekturentscheidungen, begrenzte Fixversuche und unabhängige Verifikation ausschließlich über die lokal installierte Codex-CLI.
 
+## Voraussetzungen und Installation
+
+- PowerShell 7
+- Git
+- installierte und authentifizierte Codex-CLI
+
+```powershell
+git clone https://github.com/InnerLive/CodexReviewLoop.git C:\Tools\CodexReviewLoop
+Set-Location C:\Tools\CodexReviewLoop
+pwsh -File .\codex-review-loop.ps1 -Help
+```
+
 ## Aufruf
 
 ```powershell
-C:\dev\CodexReviewLoop\codex-review-loop.ps1 `
-    -RepoPath C:\dev\PKonf `
+pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
+    -RepoPath C:\dev\MeinProjekt `
     -Speed standard `
     -OutputMode compact `
     -HeartbeatSeconds 30 `
@@ -15,14 +27,15 @@ C:\dev\CodexReviewLoop\codex-review-loop.ps1 `
 
 `standard` ist der kostenbewusste Default. `fast` setzt denselben Fast-Tier für jede Rolle, auch für Adjudikatoren und fortgesetzte Fixer-Threads. Ein Run wird ausschließlich mit demselben Speed fortgesetzt.
 
-Das PKonf-Profil ist eine Konfiguration für einen späteren produktiven Lauf. Die Implementierungs- und Prompt-Eval-Tests verändern PKonf nicht.
-
 `ConfigPath` ist optional. Ohne Angabe sucht das Tool zuerst nach
 `.codex-review-loop.psd1` beziehungsweise `.codex\review-loop.psd1` im
 Repository und danach nach `profiles\<Repositoryname>.psd1` im Toolverzeichnis.
 Existiert noch kein Profil, wird dort automatisch ein kommentiertes
 Standardprofil angelegt und unmittelbar verwendet. Ein expliziter, noch nicht
 existierender `ConfigPath` wird ebenfalls automatisch angelegt.
+Der Standardwert `LogRoot = '.\runs'` wird immer relativ zum Verzeichnis des
+Review-Loop-Skripts aufgelöst, nicht relativ zum aktuellen Arbeitsverzeichnis
+oder zum geprüften Repository.
 
 ## Live-Status
 
@@ -62,9 +75,11 @@ Das profilweite `ledger-v1.json` hält Findings über Runs hinweg. Jeder Run bes
 ## Prompt-Qualifikation
 
 ```powershell
-Import-Module C:\dev\CodexReviewLoop\CodexReviewLoop.psd1 -Force
+Import-Module C:\Tools\CodexReviewLoop\CodexReviewLoop.psd1 -Force
 Test-CodexReviewLoopPrompts `
-    -RepoPath C:\dev\PKonf
+    -RepoPath C:\dev\MeinProjekt `
+    -HistoricalLogRoot C:\ReviewLoop-Evaldaten
 ```
 
-Die Qualifikation läuft immer mit Standard-Speed und Read-only-Sandbox. Historische Logs und der aktuelle PKonf-Code werden nur gelesen.
+Die Qualifikation läuft immer mit Standard-Speed und Read-only-Sandbox.
+Historische Logs und das angegebene Ziel-Repository werden nur gelesen.

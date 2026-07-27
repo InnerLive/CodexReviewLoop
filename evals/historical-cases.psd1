@@ -32,7 +32,7 @@
         @{
             CaseId = "verifier-f48"
             Expected = "resolved"
-            Description = "F48 alleged that tools/ModuleScaffold.ps1 declared EventTime in the runner descriptor but omitted it from the generated manifest. On current HEAD both generated contracts include EventTime, and tests/DevEnv.Tests/ModuleScaffoldTests.cs asserts both generated outputs. Historical verification after this correction on the code state carried into current HEAD ran dotnet test .\PKonf.sln successfully (2,550 passed, one unrelated planned skip), including the DevEnv.Tests project. Verify that the relevant lines and regression assertions are still present; do not rerun tests in this read-only eval."
+            Description = "F48 alleged that tools/ModuleScaffold.ps1 declared EventTime in the runner descriptor but omitted it from the generated manifest. On current HEAD both generated contracts include EventTime, and tests/DevEnv.Tests/ModuleScaffoldTests.cs asserts both generated outputs. Historical verification after this correction ran the full solution test command successfully (2,550 passed, one unrelated planned skip), including the relevant test project. Verify that the relevant lines and regression assertions are still present; do not rerun tests in this read-only eval."
         },
         @{
             CaseId = "verifier-f27"

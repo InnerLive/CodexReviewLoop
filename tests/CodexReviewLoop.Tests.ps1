@@ -2,7 +2,6 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
 $modulePath = Join-Path $root "CodexReviewLoop.psd1"
 $fakeCodex = Join-Path $here "FakeCodex.ps1"
-$profilePath = Join-Path $root "profiles\PKonf.psd1"
 
 Import-Module $modulePath -Force
 
@@ -123,13 +122,19 @@ Describe "Codex Review Loop module" {
         Get-Command Invoke-CodexCliRole -ErrorAction Stop | Should Not BeNullOrEmpty
     }
 
-    It "loads the PKonf profile" {
-        $profile = Import-PowerShellDataFile -LiteralPath $profilePath
-        $profile.Name | Should Be "PKonf"
+    It "ships no repository-specific profiles" {
+        Test-Path (Join-Path $root "profiles\PKonf.psd1") | Should Be $false
     }
 
-    It "defines every planned role" {
-        $profile = Import-PowerShellDataFile -LiteralPath $profilePath
+    It "defines every planned role in generated profiles" {
+        $repo = New-TestRepo (Join-Path $TestDrive "role-profile-repo")
+        $profilePath = Join-Path $TestDrive "generated\roles.psd1"
+        $module = Get-Module CodexReviewLoop
+        $generated = & $module {
+            param($repository, $path)
+            New-ReviewLoopProfile -RepoPath $repository -Path $path
+        } $repo $profilePath
+        $profile = Import-PowerShellDataFile -LiteralPath $generated
         $profile.Roles.Keys.Count | Should Be 14
     }
 }
@@ -186,8 +191,14 @@ Describe "Optional profiles and command help" {
         $content | Should Match "# Host-Gates"
         $profile = Import-PowerShellDataFile -LiteralPath $resolved
         $profile.Name | Should Be "automatic-profile-repo"
+        $profile.LogRoot | Should Be ".\runs"
         $profile.Roles.Keys.Count | Should Be 14
         @($profile.HostGates).Count | Should Be 1
+        $imported = & $module {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $resolved
+        $imported.LogRoot | Should Be (Join-Path $root "runs")
     }
 
     It "creates an explicitly requested missing profile" {
@@ -849,8 +860,11 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $text | Should Not Match 'ArchitectureAutoApplyAll|InteractiveArchitectureGate|ArchitectureHotspot'
     }
 
-    It "keeps prompt eval cases outside PKonf" {
-        (Resolve-Path (Join-Path $root "evals\historical-cases.psd1")).Path | Should Match 'CodexReviewLoop'
+    It "has no active PKonf-specific coupling" {
+        $active = Get-ChildItem -Recurse -File -LiteralPath $root |
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\.git\\' }
+        $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
+        $text | Should Not Match '(?i)\bPKonf\b'
     }
 }
 

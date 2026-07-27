@@ -1,6 +1,7 @@
 # Review-Loop-Laufdaten und Live-Transkripte
 runs/
 eval-results/
+profiles/
 **/terminal.log
 **/ledger-v1.json
 **/run-v1.json

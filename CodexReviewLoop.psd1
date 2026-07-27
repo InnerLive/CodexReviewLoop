@@ -2,9 +2,9 @@
     RootModule = "CodexReviewLoop.psm1"
     ModuleVersion = "3.0.0"
     GUID = "22caaf8b-bbde-4a3f-9b7e-84137e5a7b92"
-    Author = "PKonf"
-    CompanyName = "PKonf"
-    Copyright = "(c) PKonf"
+    Author = "InnerLive"
+    CompanyName = "InnerLive"
+    Copyright = "(c) InnerLive"
     Description = "Unattended, CLI-only Codex review loop with semantic architecture gates and verified fixes."
     PowerShellVersion = "7.0"
     FunctionsToExport = @(
