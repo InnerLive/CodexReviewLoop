@@ -57,19 +57,21 @@ flowchart TD
 
     clean -- Yes --> passes["Count clean pass<br/>on unchanged HEAD"]
     passes -- Required passes reached --> done([Complete])
-    passes -- Another pass required --> review
+    passes -- Another pass required --> next([Next review cycle])
 
-    clean -- No --> cluster["Select semantic<br/>finding cluster"]
-    cluster --> strategy["Judge trigger and, when justified,<br/>gate one bounded architecture proposal"]
-    strategy --> fix["Fix cluster<br/>at most two attempts"]
+    clean -- No --> remediate["Cluster findings, judge architecture,<br/>and run at most two fix attempts"]
+    remediate --> fix["Verify targeted fix<br/>and run host gates"]
     fix --> verify{"Verified and<br/>host gates pass?"}
     verify -- Yes --> resolve["Resolve findings, optionally commit,<br/>and reset clean-pass count"]
-    resolve --> review
+    resolve --> next
     verify -- No --> stop([Checkpoint stop])
 
     review -. Blocked ledger or cycle limit .-> stop
-    strategy -. Disagreement or scope limit .-> stop
+    remediate -. Disagreement or scope limit .-> stop
 ```
+
+`Next review cycle` returns to the review step. It is shown as an endpoint to
+keep the diagram readable on GitHub instead of drawing long backward edges.
 
 The trigger judge may choose a point fix without invoking the architecture
 roles. Architecture-positive or uncertain decisions receive independent
