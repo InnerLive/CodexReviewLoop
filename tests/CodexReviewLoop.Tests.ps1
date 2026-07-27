@@ -1095,6 +1095,40 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
     }
 
+    It "replaces only placeholders from the original prompt template" {
+        $values = @{
+            FINDINGS = 'Finding contains {{DIFF}}.'
+            FIXER_RESULT = 'Generated code contains {{heading}}.'
+            DIFF = 'Template text contains {{mode}}.'
+        }
+        $rendered = & (Get-Module CodexReviewLoop) {
+            param($promptValues)
+            Get-ReviewLoopPrompt -Name "verifier.md" -Values $promptValues
+        } $values
+
+        $rendered | Should Match ([regex]::Escape("Finding contains {{DIFF}}."))
+        $rendered | Should Match ([regex]::Escape("Generated code contains {{heading}}."))
+        $rendered | Should Match ([regex]::Escape("Template text contains {{mode}}."))
+    }
+
+    It "reports missing original prompt placeholders by name" {
+        $message = ""
+        try {
+            & (Get-Module CodexReviewLoop) {
+                Get-ReviewLoopPrompt -Name "verifier.md" -Values @{
+                    FINDINGS = "findings"
+                    FIXER_RESULT = "result"
+                }
+            } | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        $message | Should Match "missing values"
+        $message | Should Match "DIFF"
+    }
+
     It "prevents read-only reviewers from launching build or test commands" {
         $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
         $roles | Should Match 'Do not run build or test commands in this read-only review role'
@@ -1359,5 +1393,69 @@ Describe "End-to-end orchestration with fake Codex" {
         @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 1
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
             Should Match "Output:\s+balanced · heartbeat 0s · Never"
+    }
+
+    It "resumes a failed verifier checkpoint without rerunning the completed fixer attempt" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $profileRoot = Join-Path $config.LogRoot $config.Name
+        $runRoot = Join-Path $profileRoot "99999999-failed"
+        New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $profileRoot "ledger-v1.json"
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-TestFinding)) -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.FixAttempts = 1
+        $finding.FixerThreadId = "cluster-thread"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.Status = "failed"
+        $state.ExitCode = 2
+        $state.Stage = "stopped"
+        $state.BlockedReason = "Prompt 'verifier.md' contains unreplaced placeholders."
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.LastFixerResult = [pscustomobject]@{
+            StructuredResult = [pscustomobject]@{
+                schemaVersion = "1.0"
+                outcome = "changed"
+                summary = "fix already completed"
+                changedPaths = @("interrupted.txt")
+                targetedTests = @(
+                    [pscustomobject]@{
+                        command = "fake test"
+                        passed = $true
+                        evidence = "passed"
+                    }
+                )
+                remainingRisk = ""
+            }
+            ThreadId = "cluster-thread"
+            Attempt = 1
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "dirty"
+
+        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":["test"],"targetedTest":{"command":"fake test","passed":true,"evidence":"passed"}}'
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            $resolved,
+            "No findings.", '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
+            "No findings.", '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        )
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
+        }).Count | Should Be 0
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
+        $terminal | Should Match "Resuming the completed fixer checkpoint"
+        $terminal | Should Match "Resuming interrupted fix cluster"
     }
 }

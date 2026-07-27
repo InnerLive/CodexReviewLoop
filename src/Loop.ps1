@@ -1,3 +1,17 @@
+function Test-ReviewLoopStateCanResume {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    if ([string]$State.Status -eq "running") {
+        return $true
+    }
+    return (
+        [string]$State.Status -eq "failed" -and
+        @($State.ActiveFindingIds).Count -gt 0 -and
+        $null -ne $State.LastFixerResult -and
+        $null -ne $State.LastFixerResult.StructuredResult
+    )
+}
+
 function Get-ReviewLoopLatestActiveStatePath {
     param([Parameter(Mandatory = $true)][string]$ProfileRoot)
 
@@ -10,7 +24,7 @@ function Get-ReviewLoopLatestActiveStatePath {
             $path = Join-Path $_.FullName "run-v1.json"
             if (Test-Path -LiteralPath $path) {
                 $state = Read-ReviewLoopState -Path $path
-                if ([string]$state.Status -eq "running") {
+                if (Test-ReviewLoopStateCanResume -State $state) {
                     return $path
                 }
             }
@@ -479,6 +493,7 @@ function Invoke-CodexReviewLoop {
     $statePath = ""
     $state = $null
     $resumed = $false
+    $resumedFromFailure = $false
     if (-not $NewRun) {
         $active = Get-ReviewLoopLatestActiveStatePath -ProfileRoot $paths.ProfileRoot
         if (-not [string]::IsNullOrWhiteSpace($active)) {
@@ -500,6 +515,17 @@ function Invoke-CodexReviewLoop {
     }
     elseif ([string]$state.Speed -ne $Speed) {
         throw "A resumed run keeps its global speed '$($state.Speed)'; requested speed was '$Speed'."
+    }
+
+    if ($resumed -and [string]$state.Status -eq "failed") {
+        $resumedFromFailure = $true
+        if ([string]$state.Stage -notin @("fixing", "fix_attempted", "verified")) {
+            $state.Stage = "fix_attempted"
+        }
+        $state.Status = "running"
+        $state.ExitCode = 0
+        $state.BlockedReason = ""
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
 
     $terminalPath = Join-Path $paths.RunRoot "terminal.log"
@@ -525,6 +551,9 @@ function Invoke-CodexReviewLoop {
     Write-ReviewLoopKeyValue -Name "Checkpoint" -Value $statePath
     Write-ReviewLoopKeyValue -Name "Ledger" -Value $paths.LedgerPath
     Write-ReviewLoopKeyValue -Name "Terminal-Log" -Value $terminalPath
+    if ($resumedFromFailure) {
+        Write-ReviewLoopStatus -Message "Resuming the completed fixer checkpoint from the previous failed run." -Kind Warning
+    }
 
     try {
         Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "--verify", "$($config.ReviewBase)^{commit}") | Out-Null
@@ -614,10 +643,21 @@ function Invoke-CodexReviewLoop {
     }
     catch {
         $message = $_.Exception.Message
+        $failureStage = [string]$state.Stage
         $state.Status = if ($message -match "(?i)blocked|unclear|host gate|fix attempt|maximum|revision|architecture proposal") { "blocked" } else { "failed" }
         $state.ExitCode = if ($state.Status -eq "blocked") { 3 } else { 2 }
         $state.BlockedReason = $message
-        Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "stopped" -Status $state.Status
+        $checkpointStage = if (
+            $state.Status -eq "failed" -and
+            $failureStage -in @("fixing", "fix_attempted", "verified") -and
+            @($state.ActiveFindingIds).Count -gt 0
+        ) {
+            $failureStage
+        }
+        else {
+            "stopped"
+        }
+        Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage $checkpointStage -Status $state.Status
         Write-ReviewLoopStatus -Message $message -Kind Error
         $openCount = @($ledger.Findings | Where-Object { [string]$_.Status -in @("pending", "open", "fixing") }).Count
         $blockedCount = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" }).Count

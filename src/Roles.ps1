@@ -14,14 +14,23 @@ function Get-ReviewLoopPrompt {
     )
 
     $path = Get-ReviewLoopResourcePath -Kind prompts -Name $Name
-    $prompt = Get-Content -Raw -LiteralPath $path
-    foreach ($entry in $Values.GetEnumerator()) {
-        $prompt = $prompt.Replace("{{{0}}}" -f $entry.Key, [string]$entry.Value)
+    $template = Get-Content -Raw -LiteralPath $path
+    $placeholderPattern = "\{\{([A-Z0-9_]+)\}\}"
+    $placeholders = @(
+        [regex]::Matches($template, $placeholderPattern) |
+            ForEach-Object { $_.Groups[1].Value } |
+            Select-Object -Unique
+    )
+    $missing = @($placeholders | Where-Object { -not $Values.ContainsKey($_) })
+    if ($missing.Count -gt 0) {
+        throw "Prompt '$Name' is missing values for placeholder(s): $($missing -join ', ')."
     }
-    if ($prompt -match "\{\{[A-Z0-9_]+\}\}") {
-        throw "Prompt '$Name' contains unreplaced placeholders."
+
+    $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+        param([System.Text.RegularExpressions.Match]$match)
+        return [string]$Values[$match.Groups[1].Value]
     }
-    return $prompt
+    return [regex]::Replace($template, $placeholderPattern, $evaluator)
 }
 
 function Invoke-ConfiguredCodexRole {
