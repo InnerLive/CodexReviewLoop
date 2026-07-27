@@ -52,22 +52,17 @@ script, not the current working directory or the reviewed repository.
 
 ```mermaid
 flowchart TD
-    start([Start or resume]) --> review["Review, normalize,<br/>and update ledger"]
-    review --> clean{"Clean review and<br/>no open findings?"}
+    review["Start or resume<br/>Review → Normalize → Ledger"] --> clean{"Clean review and<br/>no open findings?"}
 
-    clean -- Yes --> passes["Count clean pass<br/>on unchanged HEAD"]
-    passes -- Required passes reached --> done([Complete])
-    passes -- Another pass required --> next([Next review cycle])
+    clean -- Yes --> passes{"Required clean passes<br/>on unchanged HEAD?"}
+    passes -- Reached --> done([Complete])
+    passes -- Not yet --> next([Next review cycle])
 
-    clean -- No --> remediate["Cluster findings, judge architecture,<br/>and run at most two fix attempts"]
-    remediate --> fix["Verify targeted fix<br/>and run host gates"]
-    fix --> verify{"Verified and<br/>host gates pass?"}
-    verify -- Yes --> resolve["Resolve findings, optionally commit,<br/>and reset clean-pass count"]
+    clean -- No --> remediate["Cluster findings → Judge trigger/architecture<br/>→ Fix, at most two attempts"]
+    remediate --> verify{"Verification and<br/>host gates pass?"}
+    verify -- Yes --> resolve["Resolve → Optional commit<br/>→ Reset clean-pass count"]
     resolve --> next
     verify -- No --> stop([Checkpoint stop])
-
-    review -. Blocked ledger or cycle limit .-> stop
-    remediate -. Disagreement or scope limit .-> stop
 ```
 
 `Next review cycle` returns to the review step. It is shown as an endpoint to
@@ -80,8 +75,9 @@ verification. Every finding cluster gets a fresh fixer thread; only its second
 attempt resumes that thread.
 
 An atomic checkpoint is written after every role transition. Restarting resumes
-the active cluster. A commit or any other HEAD change resets the clean-pass
-counter.
+the active cluster. Model disagreement, architecture scope violations, failed
+host gates, exhausted fix attempts, and the review-cycle limit stop at a
+checkpoint. A commit or any other HEAD change resets the clean-pass counter.
 
 ## Live status
 
