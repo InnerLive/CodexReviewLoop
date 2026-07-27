@@ -52,17 +52,15 @@ script, not the current working directory or the reviewed repository.
 
 ```mermaid
 flowchart TD
-    review["Start or resume<br/>Review → Normalize → Ledger"] --> clean{"Clean review and<br/>no open findings?"}
-
-    clean -- Yes --> passes{"Required clean passes<br/>on unchanged HEAD?"}
+    review{"Start or resume → Review → Normalize → Ledger<br/>Clean and no open findings?"}
+    review -- Yes --> passes{"Required clean passes<br/>on unchanged HEAD?"}
     passes -- Reached --> done([Complete])
     passes -- Not yet --> next([Next review cycle])
 
-    clean -- No --> remediate["Cluster findings → Judge trigger/architecture<br/>→ Fix, at most two attempts"]
-    remediate --> verify{"Verification and<br/>host gates pass?"}
-    verify -- Yes --> resolve["Resolve → Optional commit<br/>→ Reset clean-pass count"]
-    resolve --> next
-    verify -- No --> stop([Checkpoint stop])
+    review -- No --> remediate["Cluster findings → Judge trigger/architecture<br/>→ Fix, at most two attempts → Verify → Host gates"]
+    remediate --> resolved{"Resolved?"}
+    resolved -- Yes, optionally commit --> next
+    resolved -- No --> stop([Checkpoint stop])
 ```
 
 `Next review cycle` returns to the review step. It is shown as an endpoint to
