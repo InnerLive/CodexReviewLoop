@@ -784,6 +784,59 @@ Describe "Live terminal and streaming process observation" {
         $text | Should Match "last activity"
     }
 
+    It "formats elapsed time without rounding into future minutes or hours" {
+        $module = Get-Module CodexReviewLoop
+        $formatted = & $module {
+            @(
+                Format-ReviewLoopDuration -Duration ([TimeSpan]::FromSeconds(30))
+                Format-ReviewLoopDuration -Duration ([TimeSpan]::FromSeconds(90))
+                Format-ReviewLoopDuration -Duration ([TimeSpan]::new(0, 1, 30, 5))
+            )
+        }
+
+        $formatted[0] | Should Be "00:30"
+        $formatted[1] | Should Be "01:30"
+        $formatted[2] | Should Be "01:30:05"
+    }
+
+    It "shows skill-description context compression as a warning" {
+        $transcript = Join-Path $caseRoot "context-warning.log"
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($path)
+            Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
+            $activity = [pscustomobject]@{
+                ActionCount = 0
+                ThreadId = ""
+            }
+            $event = [pscustomobject]@{
+                type = "item.completed"
+                item = [pscustomobject]@{
+                    type = "error"
+                    message = "Skill descriptions were shortened to fit the 2% skills context budget."
+                }
+            } | ConvertTo-Json -Depth 5 -Compress
+            Update-ReviewLoopCodexActivity -Line $event -Activity $activity
+        } $transcript
+
+        $text = Get-Content -Raw -LiteralPath $transcript
+        $text | Should Match "\[!\] Skill descriptions were shortened"
+        $text | Should Not Match "\[X\] Skill descriptions were shortened"
+    }
+
+    It "keeps the cause and tail of long failure output" {
+        $module = Get-Module CodexReviewLoop
+        $excerpt = & $module {
+            Get-ReviewLoopTextExcerpt `
+                -Text ("root cause`nframe 1`nframe 2`nframe 3`nframe 4`nfinal frame") `
+                -MaxLines 4
+        }
+
+        $excerpt[0] | Should Be "root cause"
+        ($excerpt -join "`n") | Should Match "line\(s\) omitted"
+        $excerpt[-1] | Should Be "final frame"
+    }
+
     It "hides successful commands in compact mode and shows failed commands" {
         $module = Get-Module CodexReviewLoop
         $successTranscript = Join-Path $caseRoot "compact-success.log"
@@ -913,16 +966,21 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
     }
 
+    It "prevents read-only reviewers from launching build or test commands" {
+        $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
+        $roles | Should Match 'Do not run build or test commands in this read-only review role'
+    }
+
     It "has no direct HTTP model invocation in active code" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'Invoke-WebRequest|Invoke-RestMethod|/v1/responses'
     }
 
     It "has no direct API credential dependency in active code" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $credentialName = "OPENAI" + "_API_KEY"
         $text | Should Not Match $credentialName
@@ -930,14 +988,14 @@ Describe "Schemas, prompts, and CLI-only invariants" {
 
     It "does not retain legacy architecture switches" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'ArchitectureAutoApplyAll|InteractiveArchitectureGate|ArchitectureHotspot'
     }
 
     It "has no active PKonf-specific coupling" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\.git\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match '(?i)\bPKonf\b'
     }

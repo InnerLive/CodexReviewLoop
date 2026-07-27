@@ -275,11 +275,31 @@ function Get-ReviewLoopTextExcerpt {
     )
 
     $lines = @((ConvertTo-ReviewLoopRedactedText $Text) -split "\r?\n" |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Select-Object -Last $MaxLines)
-    return @($lines | ForEach-Object {
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $selected = if ($lines.Count -le $MaxLines) {
+        @($lines)
+    }
+    else {
+        $firstCount = [int][Math]::Ceiling($MaxLines / 2.0)
+        $lastCount = $MaxLines - $firstCount
+        @(
+            $lines | Select-Object -First $firstCount
+            "... $($lines.Count - $MaxLines) line(s) omitted ..."
+            if ($lastCount -gt 0) {
+                $lines | Select-Object -Last $lastCount
+            }
+        )
+    }
+    return @($selected | ForEach-Object {
         if ($_.Length -gt $MaxLineLength) { $_.Substring(0, $MaxLineLength) + "…" } else { $_ }
     })
+}
+
+function Test-ReviewLoopCodexAdvisoryMessage {
+    param([AllowNull()][string]$Message)
+
+    return -not [string]::IsNullOrWhiteSpace($Message) -and
+        $Message -match "(?i)^Skill descriptions were shortened to fit\b"
 }
 
 function Update-ReviewLoopCodexActivity {
@@ -338,7 +358,13 @@ function Update-ReviewLoopCodexActivity {
         if ([string]::IsNullOrWhiteSpace($message)) {
             $message = [string](Get-ReviewLoopObjectProperty -Object $event -Name "message" -Default "Codex reported an error.")
         }
-        Write-ReviewLoopStatus -Message $message -Kind Error -Indent 1
+        $kind = if (Test-ReviewLoopCodexAdvisoryMessage -Message $message) {
+            "Warning"
+        }
+        else {
+            "Error"
+        }
+        Write-ReviewLoopStatus -Message $message -Kind $kind -Indent 1
     }
 }
 

@@ -102,6 +102,7 @@ function Invoke-ReviewLoopReview {
 Review the complete branch diff against $($Config.ReviewBase).
 Report only discrete, actionable correctness, security, reliability, or material performance defects.
 Ignore style-only cleanup and optional architecture ideas. Verify each finding against current code.
+Do not run build or test commands in this read-only review role. Inspect relevant tests instead; executable host gates run separately.
 "@
     $native = Invoke-ConfiguredCodexRole `
         -Config $Config `

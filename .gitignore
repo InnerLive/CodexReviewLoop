@@ -1,4 +1,4 @@
-# Review-Loop-Laufdaten und Live-Transkripte
+# Review Loop run data and live transcripts
 runs/
 eval-results/
 profiles/
@@ -9,11 +9,11 @@ profiles/
 *.stderr.txt
 *.result.json
 
-# Repository-lokale Profile in geprüften Projekten
+# Repository-local profiles in reviewed projects
 .codex-review-loop.psd1
 .codex/review-loop.psd1
 
-# Lokale Editor-, Betriebssystem- und PowerShell-Artefakte
+# Local editor, operating-system, and PowerShell artifacts
 .idea/
 .vscode/
 *.user

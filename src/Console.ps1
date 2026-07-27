@@ -56,9 +56,11 @@ function Format-ReviewLoopDuration {
     param([Parameter(Mandatory = $true)][TimeSpan]$Duration)
 
     if ($Duration.TotalHours -ge 1) {
-        return "{0:00}:{1:00}:{2:00}" -f [int]$Duration.TotalHours, $Duration.Minutes, $Duration.Seconds
+        $hours = [int][Math]::Floor($Duration.TotalHours)
+        return "{0:00}:{1:00}:{2:00}" -f $hours, $Duration.Minutes, $Duration.Seconds
     }
-    return "{0:00}:{1:00}" -f [int]$Duration.TotalMinutes, $Duration.Seconds
+    $minutes = [int][Math]::Floor($Duration.TotalMinutes)
+    return "{0:00}:{1:00}" -f $minutes, $Duration.Seconds
 }
 
 function Get-ReviewLoopConsoleWidth {
