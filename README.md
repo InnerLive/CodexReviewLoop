@@ -51,20 +51,26 @@ script, not the current working directory or the reviewed repository.
 ## How the loop works
 
 ```mermaid
-flowchart TD
-    review{"Start or resume → Review → Normalize → Ledger<br/>Clean and no open findings?"}
-    review -- Yes --> passes{"Required clean passes<br/>on unchanged HEAD?"}
-    passes -- Reached --> done([Complete])
-    passes -- Not yet --> next([Next review cycle])
+flowchart LR
+    start([Start or resume]) --> review["Review cycle"]
+    review --> clean{"Clean?"}
+    clean -- Yes --> passes{"Required passes?"}
+    passes -- Yes --> done([Complete])
+    passes -- No --> next([Next cycle])
 
-    review -- No --> remediate["Cluster findings → Judge trigger/architecture<br/>→ Fix, at most two attempts → Verify → Host gates"]
+    clean -- No --> remediate["Remediate finding cluster"]
     remediate --> resolved{"Resolved?"}
-    resolved -- Yes, optionally commit --> next
+    resolved -- Yes --> next
     resolved -- No --> stop([Checkpoint stop])
 ```
 
-`Next review cycle` returns to the review step. It is shown as an endpoint to
-keep the diagram readable on GitHub instead of drawing long backward edges.
+`Review cycle` means review, normalization, and ledger update. `Remediate
+finding cluster` means semantic clustering, trigger and optional architecture
+adjudication, at most two fix attempts, independent verification, and host
+gates. A resolved cluster may be committed before continuing.
+
+`Next cycle` returns to the review step. It is shown as an endpoint to keep the
+diagram readable on GitHub instead of drawing a long backward edge.
 
 The trigger judge may choose a point fix without invoking the architecture
 roles. Architecture-positive or uncertain decisions receive independent
