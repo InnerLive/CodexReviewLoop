@@ -1,0 +1,21 @@
+# Review-Loop-Laufdaten und Live-Transkripte
+runs/
+eval-results/
+**/terminal.log
+**/ledger-v1.json
+**/run-v1.json
+*.jsonl
+*.stderr.txt
+*.result.json
+
+# Repository-lokale Profile in geprüften Projekten
+.codex-review-loop.psd1
+.codex/review-loop.psd1
+
+# Lokale Editor-, Betriebssystem- und PowerShell-Artefakte
+.idea/
+.vscode/
+*.user
+*.tmp
+.DS_Store
+Thumbs.db

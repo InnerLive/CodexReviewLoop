@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "1.0" },
+    "classification": { "type": "string", "enum": ["clean", "findings"] },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "title": { "type": "string" },
+          "path": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "component": { "type": "string" },
+          "rootCause": { "type": "string" },
+          "invariant": { "type": "string" },
+          "evidence": { "type": "string" },
+          "reproduction": { "type": "string" },
+          "suggestedFix": { "type": "string" },
+          "suggestedTest": { "type": "string" },
+          "fixPaths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "priority", "title", "path", "line", "component", "rootCause",
+          "invariant", "evidence", "reproduction", "suggestedFix",
+          "suggestedTest", "fixPaths"
+        ]
+      }
+    }
+  },
+  "required": ["schemaVersion", "classification", "summary", "findings"]
+}

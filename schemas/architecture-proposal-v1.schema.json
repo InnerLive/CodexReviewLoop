@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "1.0" },
+    "recommendation": {
+      "type": "string",
+      "enum": ["point_fix", "no_architecture", "consolidation"]
+    },
+    "summary": { "type": "string" },
+    "sharedRootCause": { "type": "string" },
+    "minimalAlternative": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "findingId": { "type": "string" },
+          "disposition": {
+            "type": "string",
+            "enum": ["fixed", "superseded", "duplicate", "out_of_scope"]
+          },
+          "reproduction": { "type": "string" },
+          "regressionTest": { "type": "string" }
+        },
+        "required": ["findingId", "disposition", "reproduction", "regressionTest"]
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "change": { "type": "string" },
+          "productionCode": { "type": "boolean" },
+          "findingIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "regressionTest": { "type": "string" }
+        },
+        "required": ["path", "change", "productionCode", "findingIds", "regressionTest"]
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "breaksPublicContract": { "type": "boolean" }
+  },
+  "required": [
+    "schemaVersion", "recommendation", "summary", "sharedRootCause",
+    "minimalAlternative", "findings", "steps", "risks", "breaksPublicContract"
+  ]
+}
