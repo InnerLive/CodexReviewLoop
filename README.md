@@ -1,6 +1,6 @@
-# Codex Review Loop v3
+# Codex Review Loop
 
-Die Review Loop v3 orchestriert native Codex-Reviews, semantische Architekturentscheidungen, begrenzte Fixversuche und unabhängige Verifikation ausschließlich über die lokal installierte Codex-CLI.
+Die Codex Review Loop orchestriert native Codex-Reviews, semantische Architekturentscheidungen, begrenzte Fixversuche und unabhängige Verifikation ausschließlich über die lokal installierte Codex-CLI.
 
 ## Voraussetzungen und Installation
 
@@ -41,6 +41,53 @@ angelegt.
 Der Standardwert `LogRoot = '.\runs'` wird immer relativ zum Verzeichnis des
 Review-Loop-Skripts aufgelöst, nicht relativ zum aktuellen Arbeitsverzeichnis
 oder zum geprüften Repository.
+
+## Ablauf
+
+```mermaid
+flowchart TD
+    start([Start oder Neustart]) --> config["Profil suchen oder erzeugen<br/>Ledger und Checkpoint laden"]
+    config --> resume{"Unterbrochener<br/>Fix vorhanden?"}
+    resume -- Nein --> review["Codex-Review<br/>und Normalisierung"]
+    resume -- Ja --> verify
+
+    review --> ledger["Findings in das persistente<br/>Ledger übernehmen"]
+    ledger --> blocked{"Blockierte Findings?"}
+    blocked -- Ja --> stop([Checkpoint-Stopp])
+    blocked -- Nein --> clean{"Clean und keine<br/>offenen Findings?"}
+
+    clean -- Ja --> count["Clean-Pass für den<br/>aktuellen HEAD zählen"]
+    count --> enough{"Erforderliche Clean-Pässe<br/>auf unverändertem HEAD erreicht?"}
+    enough -- Ja --> done([Erfolgreich abgeschlossen])
+    enough -- Nein --> review
+
+    clean -- Nein --> cluster["Nächsten semantischen<br/>Finding-Cluster wählen"]
+    cluster --> trigger["Trigger Judge<br/>mit Bestätigung oder Tie-Break"]
+    trigger --> architecture{"Architekturarbeit<br/>empfohlen?"}
+    architecture -- Ja --> gate["Vorschlag, Critic und Veto<br/>maximal eine Überarbeitung"]
+    architecture -- Nein --> fix
+    gate -- Freigegeben oder Point-Fix --> fix["Fixer<br/>Versuch 1 in neuem Thread"]
+    gate -- Unklar oder Scope-Limit --> stop
+
+    fix --> verify["Finding-Verifier<br/>mit Bestätigung oder Tie-Break"]
+    verify -- Gelöst --> host["Gezielter Test und Host-Gates"]
+    verify -- Obsolet --> superseded["Als superseded markieren"]
+    verify -- Nicht gelöst --> retry{"Zweiter Versuch<br/>noch verfügbar?"}
+    retry -- Ja --> fix2["Fixer Versuch 2<br/>im selben Thread"]
+    fix2 --> verify
+    retry -- Nein --> stop
+
+    host -- Fehlgeschlagen --> stop
+    host -- Bestanden --> resolved["Optional committen, Finding schließen<br/>und Clean-Zähler zurücksetzen"]
+    resolved --> more{"Weitere offene<br/>Cluster?"}
+    superseded --> more
+    more -- Ja --> cluster
+    more -- Nein --> review
+```
+
+Nach jedem Rollenwechsel wird atomar ein Checkpoint geschrieben. Ein Neustart
+setzt den aktiven Cluster fort; ein Commit oder eine andere Änderung des HEAD
+setzt den Clean-Zähler zurück.
 
 ## Live-Status
 
