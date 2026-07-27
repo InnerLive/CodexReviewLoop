@@ -9,7 +9,7 @@ Rules:
 - Every finding must identify the actual path and line, the responsible component, the concrete root cause, the violated invariant, reproducible evidence, a bounded fix, and a regression test.
 - Root cause is the defective mechanism, not a restatement of the symptom.
 - Invariant is the behavior that must remain true.
-- `fixPaths` contains every path demonstrably needed by the bounded fix; do not speculate.
+- `fixPaths` contains every path demonstrably needed by the bounded fix exactly once; do not speculate.
 - Do not merge independent findings merely because they share a file.
 
 Repository: {{REPOSITORY}}

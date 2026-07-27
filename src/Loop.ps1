@@ -283,7 +283,11 @@ function Invoke-ReviewLoopCluster {
             -Speed $Speed -RunRoot $RunRoot -Findings $Findings -Strategy $strategy `
             -Attempt $attempt -ThreadId $threadId -CodexPath $CodexPath
         Assert-ReviewLoopRoleSuccess $fixer
-        $changedPaths = @($fixer.StructuredResult.changedPaths)
+        $changedPaths = @($fixer.StructuredResult.changedPaths |
+            ForEach-Object { ([string]$_).Replace("\", "/") } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique)
+        $fixer.StructuredResult.changedPaths = $changedPaths
         Write-ReviewLoopStatus `
             -Message "Fixer: $($fixer.StructuredResult.outcome) · $($changedPaths.Count) changed paths$(if ($changedPaths.Count -gt 0) { ': ' + ($changedPaths -join ', ') } else { '' })" `
             -Kind $(if ([string]$fixer.StructuredResult.outcome -eq "changed") { "Success" } else { "Warning" })

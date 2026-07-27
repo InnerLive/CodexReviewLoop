@@ -21,6 +21,22 @@ function Resolve-CodexCliExecutable {
     return $command.Source
 }
 
+function Assert-CodexOutputSchemaSupported {
+    param([Parameter(Mandatory = $true)][string]$SchemaPath)
+
+    $path = Resolve-ReviewLoopPath -Path $SchemaPath -MustExist
+    $schemaText = Get-Content -Raw -LiteralPath $path
+    $unsupported = @(
+        "uniqueItems"
+    )
+    $found = @($unsupported | Where-Object {
+        $schemaText -match ('"{0}"\s*:' -f [regex]::Escape($_))
+    })
+    if ($found.Count -gt 0) {
+        throw "Codex Structured Output schema '$path' uses unsupported JSON Schema keyword(s): $($found -join ', ')."
+    }
+}
+
 function Get-CodexRoleArguments {
     [CmdletBinding()]
     param(
@@ -63,6 +79,7 @@ function Get-CodexRoleArguments {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($SchemaPath)) {
+        Assert-CodexOutputSchemaSupported -SchemaPath $SchemaPath
         [void]$arguments.Add("--output-schema")
         [void]$arguments.Add((Resolve-ReviewLoopPath -Path $SchemaPath -MustExist))
     }

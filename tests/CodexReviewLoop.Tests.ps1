@@ -359,6 +359,18 @@ Describe "Global CLI arguments" {
         ($args -contains "-o") | Should Be $true
     }
 
+    It "rejects unsupported Codex Structured Output schema keywords locally" {
+        $unsupportedSchema = Join-Path $TestDrive "unsupported-schema.json"
+        Set-Content -LiteralPath $unsupportedSchema -Encoding UTF8 -Value @'
+{"type":"array","items":{"type":"string"},"uniqueItems":true}
+'@
+        (Test-Throws {
+            Get-CodexRoleArguments `
+                -RepoPath $repo.FullName -Model m -Thinking low `
+                -SchemaPath $unsupportedSchema -ResultPath $result
+        }) | Should Be $true
+    }
+
     It "builds native review arguments" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Mode Review -ReviewBase main
         ($args -join " ") | Should Match 'review --base main$'
@@ -983,6 +995,13 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         }
     }
 
+    It "uses only Codex-compatible array uniqueness constraints" {
+        $schemas = Get-ChildItem -LiteralPath (Join-Path $root "schemas") -Filter "*.json"
+        foreach ($schema in $schemas) {
+            (Get-Content -Raw $schema.FullName) | Should Not Match '"uniqueItems"\s*:'
+        }
+    }
+
     It "contains every production prompt" {
         @("normalizer.md", "trigger-judge.md", "architect.md", "architecture-critic.md", "fixer.md", "verifier.md") |
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
@@ -1091,7 +1110,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $configPath = New-TestConfig -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"cache defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs","tests/A.Tests.cs"]}]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.txt"],"targetedTests":[{"command":"fake test","passed":true,"evidence":"ok"}],"remainingRisk":""}'
+        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.txt","fake-review-loop-change.txt"],"targetedTests":[{"command":"fake test","passed":true,"evidence":"ok"}],"remainingRisk":""}'
         $stillOpen = '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still open","evidence":["path"],"targetedTest":{"command":"fake test","passed":false,"evidence":"failed"}}'
         $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":["test"],"targetedTest":{"command":"fake test","passed":true,"evidence":"passed"}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
@@ -1112,6 +1131,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
         $terminal | Should Match "Fixer · attempt 2/2 · resuming thread"
+        $terminal | Should Match "Fixer: changed · 1 changed paths"
         $terminal | Should Match "Verifier: resolved"
         $terminal | Should Match "Host-Gate: fake gate"
         $terminal | Should Match "Committed"

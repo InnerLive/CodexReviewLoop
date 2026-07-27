@@ -25,8 +25,7 @@
           "suggestedTest": { "type": "string" },
           "fixPaths": {
             "type": "array",
-            "items": { "type": "string" },
-            "uniqueItems": true
+            "items": { "type": "string" }
           }
         },
         "required": [
