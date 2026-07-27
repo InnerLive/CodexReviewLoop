@@ -19,7 +19,7 @@ function Get-ReviewLoopPrompt {
         $prompt = $prompt.Replace("{{{0}}}" -f $entry.Key, [string]$entry.Value)
     }
     if ($prompt -match "\{\{[A-Z0-9_]+\}\}") {
-        throw "Prompt '$Name' enthält nicht ersetzte Platzhalter."
+        throw "Prompt '$Name' contains unreplaced placeholders."
     }
     return $prompt
 }
@@ -82,7 +82,7 @@ function Assert-ReviewLoopRoleSuccess {
     param([Parameter(Mandatory = $true)][object]$Call)
 
     if (-not $Call.Success) {
-        throw "Codex-Rolle '$($Call.Role)' fehlgeschlagen ($($Call.FailureKind)): $($Call.FailureReason)"
+        throw "Codex role '$($Call.Role)' failed ($($Call.FailureKind)): $($Call.FailureReason)"
     }
 }
 
@@ -142,14 +142,14 @@ Ignore style-only cleanup and optional architecture ideas. Verify each finding a
     $result = $normalized.StructuredResult
     $findingCount = @($result.findings).Count
     if ([string]$result.classification -eq "clean" -and $findingCount -ne 0) {
-        throw "Normalizer meldet clean, liefert aber $findingCount Findings."
+        throw "Normalizer reported clean but returned $findingCount findings."
     }
     if ([string]$result.classification -eq "findings" -and $findingCount -eq 0) {
-        throw "Normalizer meldet findings, liefert aber kein Finding."
+        throw "Normalizer reported findings but returned no finding."
     }
 
     if ([string]$result.classification -eq "clean") {
-        Write-ReviewLoopStatus -Message "Review ist clean: $($result.summary)" -Kind Success
+        Write-ReviewLoopStatus -Message "Review is clean: $($result.summary)" -Kind Success
     }
     else {
         Write-ReviewLoopStatus -Message "$findingCount Finding(s): $($result.summary)" -Kind Review
@@ -160,7 +160,7 @@ Ignore style-only cleanup and optional architecture ideas. Verify each finding a
             }
             Write-ReviewLoopStatus -Message "$($finding.priority) · $($finding.title) · $location" -Kind Review -Indent 1
             if (Test-ReviewLoopOutputLevel -Minimum balanced) {
-                Write-ReviewLoopStatus -Message "Ursache: $($finding.rootCause)" -Kind Muted -Indent 2
+                Write-ReviewLoopStatus -Message "Root cause: $($finding.rootCause)" -Kind Muted -Indent 2
             }
         }
     }
@@ -210,7 +210,7 @@ function Invoke-ReviewLoopTriggerJudge {
             ArchitectureRecommended = $false
             Relation = "insufficient_evidence"
             Confidence = "high"
-            Rationale = "Keine semantischen Kandidaten im Ledger."
+            Rationale = "No semantic candidates in the ledger."
             Decision = $null
             Calls = @()
         }
@@ -283,7 +283,7 @@ function Invoke-ReviewLoopTriggerJudge {
     [void]$calls.Add($tie)
     $final = $tie.StructuredResult
     if ([string]$final.confidence -ne "high" -or [string]$final.relation -eq "insufficient_evidence") {
-        throw "blocked/model_disagreement: Trigger-Entscheidung bleibt nach Adjudikation unklar."
+        throw "blocked/model_disagreement: Trigger decision remains unclear after adjudication."
     }
 
     return [pscustomobject]@{
@@ -345,22 +345,22 @@ function Invoke-ReviewLoopArchitectureGate {
             -CodexPath $CodexPath -CallId ("$($State.ActiveClusterId)-architecture-r$revision") -State $State -StatePath $StatePath
         Assert-ReviewLoopRoleSuccess $architect
         $proposal = $architect.StructuredResult
-        Write-ReviewLoopStatus -Message "Vorschlag r${revision}: $($proposal.recommendation) · $($proposal.summary)" -Kind Architecture
+        Write-ReviewLoopStatus -Message "Proposal r${revision}: $($proposal.recommendation) · $($proposal.summary)" -Kind Architecture
         if ([string]$proposal.recommendation -in @("point_fix", "no_architecture")) {
-            Write-ReviewLoopStatus -Message "Architect begrenzt den Cluster auf einen Point-Fix." -Kind Warning -Indent 1
+            Write-ReviewLoopStatus -Message "Architect limited the cluster to a point fix." -Kind Warning -Indent 1
             return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $null }
         }
 
         $scope = Get-ReviewLoopArchitectureScope $proposal
-        Write-ReviewLoopStatus -Message "Umfang: $($scope.PathCount) Pfade, davon $($scope.ProductionPathCount) Produktion" -Kind Architecture -Indent 1
+        Write-ReviewLoopStatus -Message "Scope: $($scope.PathCount) paths, $($scope.ProductionPathCount) production" -Kind Architecture -Indent 1
         if ($scope.BreaksPublicContract) {
-            throw "Architekturvorschlag bricht einen öffentlichen Vertrag."
+            throw "Architecture proposal breaks a public contract."
         }
         if ($scope.PathCount -gt [int]$Config.MaxArchitecturePaths) {
-            throw "Architekturvorschlag umfasst $($scope.PathCount) Pfade; erlaubt sind $($Config.MaxArchitecturePaths)."
+            throw "Architecture proposal covers $($scope.PathCount) paths; the limit is $($Config.MaxArchitecturePaths)."
         }
         if ($scope.ProductionPathCount -gt [int]$Config.MaxProductionPaths) {
-            throw "Architekturvorschlag umfasst $($scope.ProductionPathCount) Produktionspfade; erlaubt sind $($Config.MaxProductionPaths)."
+            throw "Architecture proposal covers $($scope.ProductionPathCount) production paths; the limit is $($Config.MaxProductionPaths)."
         }
 
         $criticPrompt = Get-ReviewLoopPrompt -Name "architecture-critic.md" -Values @{
@@ -396,7 +396,7 @@ function Invoke-ReviewLoopArchitectureGate {
             $decision = $tie.StructuredResult
             Write-ReviewLoopStatus -Message "Terra-Tie-Break: $($decision.decision) · Confidence $($decision.confidence)" -Kind Architecture
             if ([string]$decision.confidence -ne "high") {
-                throw "blocked/model_disagreement: Architekturkritik bleibt nach Adjudikation unklar."
+                throw "blocked/model_disagreement: Architecture critique remains unclear after adjudication."
             }
             if ([string]$decision.decision -eq "approve") {
                 return [pscustomobject]@{ Approved = $true; PointFix = $false; Proposal = $proposal; Critique = $decision }
@@ -407,16 +407,16 @@ function Invoke-ReviewLoopArchitectureGate {
             return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
         }
         if ([string]$decision.decision -eq "blocked") {
-            throw "Architekturvorschlag wurde blockiert: $($decision.rationale)"
+            throw "Architecture proposal was blocked: $($decision.rationale)"
         }
         if ([string]$decision.decision -ne "revise") {
-            throw "Nicht unterstützte Architekturentscheidung: $($decision.decision)"
+            throw "Unsupported architecture decision: $($decision.decision)"
         }
         if ($revision -ge [int]$Config.MaxArchitectureRevisions) {
-            throw "Architekturvorschlag benötigt mehr als eine erlaubte Überarbeitung."
+            throw "Architecture proposal requires more than the single allowed revision."
         }
         $revision++
-        Write-ReviewLoopStatus -Message "Einmalige Überarbeitung des Architekturvorschlags wird angefordert." -Kind Warning
+        Write-ReviewLoopStatus -Message "Requesting the single allowed architecture-proposal revision." -Kind Warning
         $State.ArchitectureRevision = $revision
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         $architectPrompt += "`n`nRequired critic changes for the single allowed revision:`n$(ConvertTo-ReviewLoopJsonCompact $decision)"
@@ -509,7 +509,7 @@ function Invoke-ReviewLoopVerifier {
     Assert-ReviewLoopRoleSuccess $tie
     $final = $tie.StructuredResult
     if ([string]$final.confidence -ne "high" -or [string]$final.verdict -eq "insufficient_evidence") {
-        throw "blocked/model_disagreement: Finding-Verifikation bleibt nach Adjudikation unklar."
+        throw "blocked/model_disagreement: Finding verification remains unclear after adjudication."
     }
     return [pscustomobject]@{
         Accepted = [string]$final.verdict -eq "resolved"

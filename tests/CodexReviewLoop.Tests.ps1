@@ -187,8 +187,8 @@ Describe "Optional profiles and command help" {
         (Split-Path -Leaf $resolved) | Should Be "automatic-profile-repo-001.psd1"
         (Test-Path -LiteralPath $resolved -PathType Leaf) | Should Be $true
         $content = Get-Content -Raw -LiteralPath $resolved
-        $content | Should Match "# Rollenwerte:"
-        $content | Should Match "# Host-Gates"
+        $content | Should Match "# Role settings:"
+        $content | Should Match "# Host gates"
         $profile = Import-PowerShellDataFile -LiteralPath $resolved
         $profile.Name | Should Be "automatic-profile-repo"
         $canonicalRepo = & $module {
@@ -298,7 +298,7 @@ Describe "Optional profiles and command help" {
 
         $exitCode | Should Be 0
         ($output -join "`n") | Should Match "ConfigPath"
-        ($output -join "`n") | Should Match "automatisch"
+        ($output -join "`n") | Should Match "automatically"
         ($output -join "`n") | Should Match "NewRun"
         ($output -join "`n") | Should Match "OutputMode"
         ($output -join "`n") | Should Match "HeartbeatSeconds"
@@ -779,9 +779,9 @@ Describe "Live terminal and streaming process observation" {
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
 
         $text = Get-Content -Raw -LiteralPath $transcript
-        $text | Should Match "Reviewer läuft 00:01"
-        $text | Should Match "1 CLI-Aktionen"
-        $text | Should Match "letzte Aktivität"
+        $text | Should Match "Reviewer running for 00:01"
+        $text | Should Match "1 CLI actions"
+        $text | Should Match "last activity"
     }
 
     It "hides successful commands in compact mode and shows failed commands" {
@@ -807,8 +807,8 @@ Describe "Live terminal and streaming process observation" {
             -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -CallId failure | Out-Null
         $failureText = Get-Content -Raw -LiteralPath $failureTranscript
-        $failureText | Should Match "CLI-Befehl fehlgeschlagen"
-        $failureText | Should Match "Exitcode 7"
+        $failureText | Should Match "CLI command failed"
+        $failureText | Should Match "exit code 7"
     }
 
     It "keeps terminal.log ANSI-free and applies the requested color style" {
@@ -817,14 +817,14 @@ Describe "Live terminal and streaming process observation" {
         $rendered = & $module {
             param($path)
             Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 0 -ColorMode Ansi -TranscriptPath $path
-            Write-ReviewLoopStatus -Message "bestanden" -Kind Success
+            Write-ReviewLoopStatus -Message "passed" -Kind Success
             $style = Get-ReviewLoopConsoleStyle -Kind Success
             "$(Test-ReviewLoopUseAnsi)|$($style.Color)|$($style.Ansi)"
         } $transcript 6>&1
 
         ($rendered | Out-String) | Should Match "True\|Green\|32"
         $plain = Get-Content -Raw -LiteralPath $transcript
-        $plain | Should Match "\[OK\] bestanden"
+        $plain | Should Match "\[OK\] passed"
         $plain | Should Not Match ([regex]::Escape("`e["))
     }
 
@@ -941,6 +941,7 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match '(?i)\bPKonf\b'
     }
+
 }
 
 Describe "End-to-end orchestration with fake Codex" {
@@ -982,11 +983,11 @@ Describe "End-to-end orchestration with fake Codex" {
         $result.CleanPasses | Should Be 2
         $result.ReviewCycles | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Review-Zyklus 1/6"
+        $terminal | Should Match "Review cycle 1/6"
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Normalizer"
-        $terminal | Should Match "Clean-Pass 2/2"
-        $terminal | Should Match "Review Loop abgeschlossen"
+        $terminal | Should Match "Clean pass 2/2"
+        $terminal | Should Match "Review Loop completed"
     }
 
     It "propagates fast to every role in a complete run" {
@@ -1003,7 +1004,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object { ($_.arguments -join " ") -notmatch 'service_tier="fast"' }).Count | Should Be 0
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
-            Should Match "Ausgabe:\s+detailed · Heartbeat 0s · Never"
+            Should Match "Output:\s+detailed · heartbeat 0s · Never"
     }
 
     It "uses exactly two fixer attempts and resumes only the cluster thread" {
@@ -1030,7 +1031,7 @@ Describe "End-to-end orchestration with fake Codex" {
         @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 1
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
-        $terminal | Should Match "Fixer · Versuch 2/2 · Thread wird fortgesetzt"
+        $terminal | Should Match "Fixer · attempt 2/2 · resuming thread"
         $terminal | Should Match "Verifier: resolved"
         $terminal | Should Match "Host-Gate: fake gate"
         $terminal | Should Match "Committed"
@@ -1076,7 +1077,7 @@ Describe "End-to-end orchestration with fake Codex" {
         @($records | Where-Object { [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-critique-v1.schema.json" }).Count | Should Be 3
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Trigger: same_contract_different_edge"
-        $terminal | Should Match "Vorschlag r0: consolidation"
+        $terminal | Should Match "Proposal r0: consolidation"
         $terminal | Should Match "Terra-Critic: approve"
         $terminal | Should Match "Sol-Veto: reject_to_point_fix"
         $terminal | Should Match "Terra-Tie-Break: reject_to_point_fix"
@@ -1096,7 +1097,7 @@ Describe "End-to-end orchestration with fake Codex" {
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun
         $result.Status | Should Be "blocked"
-        $result.Reason | Should Match "mehr als eine erlaubte Überarbeitung"
+        $result.Reason | Should Match "more than the single allowed revision"
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object { [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json" }).Count | Should Be 0
     }
@@ -1155,6 +1156,6 @@ Describe "End-to-end orchestration with fake Codex" {
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 1
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
-            Should Match "Ausgabe:\s+balanced · Heartbeat 0s · Never"
+            Should Match "Output:\s+balanced · heartbeat 0s · Never"
     }
 }

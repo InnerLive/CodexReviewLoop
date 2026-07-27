@@ -59,21 +59,21 @@ function Test-ReviewLoopLedger {
     param([Parameter(Mandatory = $true)][object]$Ledger)
 
     if ([string]$Ledger.SchemaVersion -ne "1.0") {
-        throw "Unbekannte Ledger-Version: $($Ledger.SchemaVersion)"
+        throw "Unknown ledger version: $($Ledger.SchemaVersion)"
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($finding in @($Ledger.Findings)) {
         if ([string]::IsNullOrWhiteSpace([string]$finding.Id)) {
-            throw "Ledger-Finding ohne ID."
+            throw "Ledger finding has no ID."
         }
         if (-not $seen.Add([string]$finding.Id)) {
-            throw "Doppelte Finding-ID im Ledger: $($finding.Id)"
+            throw "Duplicate finding ID in ledger: $($finding.Id)"
         }
         if ([string]$finding.Status -notin $script:FindingStatuses) {
-            throw "Ungültiger Finding-Status '$($finding.Status)' für $($finding.Id)."
+            throw "Invalid finding status '$($finding.Status)' for $($finding.Id)."
         }
         if ([string]$finding.Status -eq "resolved" -and $null -eq $finding.Verification) {
-            throw "Finding $($finding.Id) ist resolved, besitzt aber keinen Verifikationsnachweis."
+            throw "Finding $($finding.Id) is resolved but has no verification evidence."
         }
     }
     return $true
@@ -88,7 +88,7 @@ function Read-ReviewLoopLedger {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         if ([string]::IsNullOrWhiteSpace($RepoPath)) {
-            throw "Ledger fehlt und RepoPath wurde nicht angegeben: $Path"
+            throw "Ledger is missing and RepoPath was not supplied: $Path"
         }
         return New-ReviewLoopLedger -RepoPath $RepoPath
     }
@@ -245,7 +245,7 @@ function Get-ReviewLoopTriggerCandidates {
         $sameCluster = [string]$Finding.ClusterId -eq [string]$candidate.ClusterId
         $overlap = @($candidate.FixPaths | Where-Object { $paths.Contains((ConvertTo-ReviewLoopCanonicalText $_)) }).Count -gt 0
 
-        # Pfadüberlappung ist nur Evidenz. Mindestens ein semantisches Merkmal muss passen.
+        # Path overlap is evidence only. At least one semantic property must match.
         if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster) {
             [pscustomobject]@{
                 Finding = $candidate
@@ -303,10 +303,10 @@ function Test-ReviewLoopState {
     param([Parameter(Mandatory = $true)][object]$State)
 
     if ([string]$State.SchemaVersion -ne "1.0") {
-        throw "Unbekannte State-Version: $($State.SchemaVersion)"
+        throw "Unknown state version: $($State.SchemaVersion)"
     }
     if ([string]$State.Status -notin @("running", "completed", "blocked", "failed")) {
-        throw "Ungültiger Run-Status: $($State.Status)"
+        throw "Invalid run status: $($State.Status)"
     }
     return $true
 }

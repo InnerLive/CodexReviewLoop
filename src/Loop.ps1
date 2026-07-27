@@ -75,10 +75,10 @@ function Invoke-ReviewLoopHostGate {
         $text = "$($observed.Stdout)`n$($observed.Stderr)"
         $duration = Format-ReviewLoopDuration -Duration $observed.Duration
         if ($exitCode -eq 0) {
-            Write-ReviewLoopStatus -Message "$name bestanden · $duration" -Kind Success -Indent 1
+            Write-ReviewLoopStatus -Message "$name passed · $duration" -Kind Success -Indent 1
         }
         else {
-            Write-ReviewLoopStatus -Message "$name fehlgeschlagen · Exitcode $exitCode · $duration" -Kind Error -Indent 1
+            Write-ReviewLoopStatus -Message "$name failed · exit code $exitCode · $duration" -Kind Error -Indent 1
             foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text $text -MaxLines 8)) {
                 Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 2
             }
@@ -88,7 +88,7 @@ function Invoke-ReviewLoopHostGate {
         $exitCode = -1
         $text = $_.Exception.Message
         Write-ReviewLoopUtf8File -Path $stderrPath -Content (ConvertTo-ReviewLoopRedactedText $text)
-        Write-ReviewLoopStatus -Message "$name konnte nicht ausgeführt werden: $text" -Kind Error -Indent 1
+        Write-ReviewLoopStatus -Message "$name could not be executed: $text" -Kind Error -Indent 1
     }
     return [pscustomobject]@{
         Name = $name
@@ -160,21 +160,21 @@ function Complete-ReviewLoopFix {
         -RunRoot $RunRoot `
         -ClusterId $State.ActiveClusterId
     if (-not $gates.Success) {
-        throw "Host-Gate '$($gates.Failure.Name)' ist fehlgeschlagen. Log: $($gates.Failure.LogPath)"
+        throw "Host gate '$($gates.Failure.Name)' failed. Log: $($gates.Failure.LogPath)"
     }
 
     $commit = ""
     if ([bool]$Config.AutoCommit) {
-        Write-ReviewLoopStatus -Message "Commit wird vorbereitet: alle Verifikations- und Host-Gates sind bestanden." -Kind Progress
+        Write-ReviewLoopStatus -Message "Preparing commit: verification and all host gates passed." -Kind Progress
         & git -C $RepoPath add -A
         if ($LASTEXITCODE -ne 0) {
-            throw "git add ist fehlgeschlagen."
+            throw "git add failed."
         }
         $title = @($Findings | Select-Object -First 1).Title
         $message = "$($Config.CommitMessagePrefix): $title"
         $commitOutput = & git -C $RepoPath commit -m $message 2>&1
         if ($LASTEXITCODE -ne 0) {
-            throw "git commit ist fehlgeschlagen: $($commitOutput -join [Environment]::NewLine)"
+            throw "git commit failed: $($commitOutput -join [Environment]::NewLine)"
         }
         $commit = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
         $shortCommit = if ($commit.Length -gt 10) { $commit.Substring(0, 10) } else { $commit }
@@ -199,7 +199,7 @@ function Complete-ReviewLoopFix {
     $State.LastFixerResult = $null
     $State.ArchitectureRevision = 0
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fix_committed"
-    Write-ReviewLoopStatus -Message "Finding(s) verifiziert geschlossen; Clean-Zähler auf 0 zurückgesetzt." -Kind Success
+    Write-ReviewLoopStatus -Message "Verified finding(s) resolved; clean-pass count reset to 0." -Kind Success
 }
 
 function Invoke-ReviewLoopCluster {
@@ -229,9 +229,9 @@ function Invoke-ReviewLoopCluster {
         -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
         -Speed $Speed -RunRoot $RunRoot -Finding $primary -Candidates $candidates -CodexPath $CodexPath
     $adjudication = switch (@($trigger.Calls).Count) {
-        0 { "ohne Modellaufruf" }
+        0 { "without a model call" }
         1 { "Luna" }
-        2 { "Luna + Sol-Bestätigung" }
+        2 { "Luna + Sol confirmation" }
         default { "Luna + Sol + Terra-Tie-Break" }
     }
     $triggerKind = if ($trigger.ArchitectureRecommended) { "Architecture" } elseif ($trigger.Confidence -eq "high") { "Info" } else { "Warning" }
@@ -240,7 +240,7 @@ function Invoke-ReviewLoopCluster {
         -Kind $triggerKind
     $strategy = $null
     if ($trigger.ArchitectureRecommended) {
-        Write-ReviewLoopStatus -Message "Semantischer Architektur-Trigger bestätigt; Vorschlag und unabhängige Kritik werden erstellt." -Kind Architecture
+        Write-ReviewLoopStatus -Message "Semantic architecture trigger confirmed; creating a proposal and independent critique." -Kind Architecture
         $architectureFindings = @($Findings)
         foreach ($candidate in $candidates) {
             if ([string]$candidate.Finding.Status -in @("open", "pending") -and
@@ -254,7 +254,7 @@ function Invoke-ReviewLoopCluster {
         $scope = Get-ReviewLoopArchitectureScope $strategy.Proposal
         $strategyKind = if ($strategy.Approved) { "Architecture" } else { "Warning" }
         Write-ReviewLoopStatus `
-            -Message "Architektur: $($strategy.Proposal.recommendation) · $($scope.PathCount) Pfade ($($scope.ProductionPathCount) Produktion) · $(if ($strategy.Approved) { 'freigegeben' } else { 'auf Point-Fix begrenzt' })" `
+            -Message "Architecture: $($strategy.Proposal.recommendation) · $($scope.PathCount) paths ($($scope.ProductionPathCount) production) · $(if ($strategy.Approved) { 'approved' } else { 'limited to point fix' })" `
             -Kind $strategyKind
         if ($null -ne $strategy.Critique) {
             Write-ReviewLoopStatus -Message "Critic: $($strategy.Critique.decision) · Confidence $($strategy.Critique.confidence)" -Kind Architecture -Indent 1
@@ -275,8 +275,8 @@ function Invoke-ReviewLoopCluster {
         }
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fixing"
-        $threadMode = if ($attempt -eq 1) { "neuer Thread" } else { "Thread wird fortgesetzt" }
-        Write-ReviewLoopStatus -Message "Fixer · Versuch $attempt/$($Config.MaxFixAttempts) · $threadMode" -Kind Progress
+        $threadMode = if ($attempt -eq 1) { "new thread" } else { "resuming thread" }
+        Write-ReviewLoopStatus -Message "Fixer · attempt $attempt/$($Config.MaxFixAttempts) · $threadMode" -Kind Progress
 
         $fixer = Invoke-ReviewLoopFixer `
             -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
@@ -285,11 +285,11 @@ function Invoke-ReviewLoopCluster {
         Assert-ReviewLoopRoleSuccess $fixer
         $changedPaths = @($fixer.StructuredResult.changedPaths)
         Write-ReviewLoopStatus `
-            -Message "Fixer: $($fixer.StructuredResult.outcome) · $($changedPaths.Count) geänderte Pfade$(if ($changedPaths.Count -gt 0) { ': ' + ($changedPaths -join ', ') } else { '' })" `
+            -Message "Fixer: $($fixer.StructuredResult.outcome) · $($changedPaths.Count) changed paths$(if ($changedPaths.Count -gt 0) { ': ' + ($changedPaths -join ', ') } else { '' })" `
             -Kind $(if ([string]$fixer.StructuredResult.outcome -eq "changed") { "Success" } else { "Warning" })
         if ($attempt -eq 1) {
             if ([string]::IsNullOrWhiteSpace([string]$fixer.ThreadId)) {
-                throw "Fixer hat keine Thread-ID für einen möglichen zweiten Versuch geliefert."
+                throw "Fixer did not return a thread ID for a possible second attempt."
             }
             $threadId = [string]$fixer.ThreadId
             foreach ($finding in $Findings) {
@@ -315,7 +315,7 @@ function Invoke-ReviewLoopCluster {
             -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
             -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $fixer -CodexPath $CodexPath
         $targetedCommand = [string]$verification.Result.targetedTest.command
-        $targetedState = if ([bool]$verification.Result.targetedTest.passed) { "bestanden" } else { "fehlgeschlagen" }
+        $targetedState = if ([bool]$verification.Result.targetedTest.passed) { "passed" } else { "failed" }
         Write-ReviewLoopStatus `
             -Message "Verifier: $($verification.Result.verdict) · Confidence $($verification.Result.confidence) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
             -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
@@ -338,7 +338,7 @@ function Invoke-ReviewLoopCluster {
         }
     }
 
-    $reason = "Finding-Cluster blieb nach $($Config.MaxFixAttempts) Fixversuchen offen."
+    $reason = "Finding cluster remained open after $($Config.MaxFixAttempts) fix attempts."
     Set-ReviewLoopFindingsStatus -Findings $Findings -Status "blocked" -Reason $reason
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
     throw $reason
@@ -365,10 +365,10 @@ function Resume-ReviewLoopInterruptedFix {
     $ids = @($State.ActiveFindingIds | ForEach-Object { [string]$_ })
     $findings = @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
     if ($findings.Count -ne $ids.Count) {
-        throw "Unterbrochener Fix kann nicht fortgesetzt werden: aktive Findings fehlen im Ledger."
+        throw "Interrupted fix cannot be resumed: active findings are missing from the ledger."
     }
 
-    Write-ReviewLoopStatus -Message "Setze unterbrochenen Fix-Cluster $($State.ActiveClusterId) fort." -Kind Warning
+    Write-ReviewLoopStatus -Message "Resuming interrupted fix cluster $($State.ActiveClusterId)." -Kind Warning
     $lastFixer = if ($null -ne $State.LastFixerResult -and $null -ne $State.LastFixerResult.StructuredResult) {
         [pscustomobject]@{
             StructuredResult = $State.LastFixerResult.StructuredResult
@@ -380,10 +380,10 @@ function Resume-ReviewLoopInterruptedFix {
             StructuredResult = [pscustomobject]@{
                 schemaVersion = "1.0"
                 outcome = "changed"
-                summary = "Unterbrochener Fix; der aktuelle Worktree wird unabhängig verifiziert."
+                summary = "Interrupted fix; the current worktree will be verified independently."
                 changedPaths = @()
                 targetedTests = @()
-                remainingRisk = "Fixer-Abschluss fehlte wegen Prozessunterbrechung."
+                remainingRisk = "Fixer completion is missing because the process was interrupted."
             }
             ThreadId = [string]$findings[0].FixerThreadId
         }
@@ -402,7 +402,7 @@ function Resume-ReviewLoopInterruptedFix {
 
     $attempt = (@($findings | ForEach-Object { [int]$_.FixAttempts } | Measure-Object -Maximum).Maximum)
     if ($attempt -ge [int]$Config.MaxFixAttempts) {
-        $reason = "Unterbrochener Cluster blieb nach $attempt Fixversuchen offen."
+        $reason = "Interrupted cluster remained open after $attempt fix attempts."
         Set-ReviewLoopFindingsStatus -Findings $findings -Status "blocked" -Reason $reason
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         throw $reason
@@ -413,7 +413,7 @@ function Resume-ReviewLoopInterruptedFix {
         $threadId = [string]$findings[0].FixerThreadId
     }
     if ([string]::IsNullOrWhiteSpace($threadId)) {
-        throw "Unterbrochener Fix benötigt für den letzten Versuch eine gespeicherte Fixer-Thread-ID."
+        throw "Interrupted fix requires a stored fixer thread ID for the final attempt."
     }
 
     $nextAttempt = $attempt + 1
@@ -437,7 +437,7 @@ function Resume-ReviewLoopInterruptedFix {
         -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
         -Speed $Speed -RunRoot $RunRoot -Findings $findings -FixerCall $fixer -CodexPath $CodexPath
     if (-not $finalVerification.Accepted) {
-        $reason = "Unterbrochener Cluster blieb nach $nextAttempt Fixversuchen offen."
+        $reason = "Interrupted cluster remained open after $nextAttempt fix attempts."
         Set-ReviewLoopFindingsStatus -Findings $findings -Status "blocked" -Reason $reason
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         throw $reason
@@ -487,7 +487,7 @@ function Invoke-CodexReviewLoop {
 
     if ($null -eq $state) {
         if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
-            throw "Ein neuer Review-Loop startet nur mit sauberem Worktree."
+            throw "A new review loop requires a clean worktree."
         }
         Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
         $statePath = $paths.StatePath
@@ -495,7 +495,7 @@ function Invoke-CodexReviewLoop {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
     elseif ([string]$state.Speed -ne $Speed) {
-        throw "Ein fortgesetzter Run behält seinen globalen Speed '$($state.Speed)'; angefordert wurde '$Speed'."
+        throw "A resumed run keeps its global speed '$($state.Speed)'; requested speed was '$Speed'."
     }
 
     $terminalPath = Join-Path $paths.RunRoot "terminal.log"
@@ -509,15 +509,15 @@ function Invoke-CodexReviewLoop {
     Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
     $head = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
     $shortHead = if ($head.Length -gt 10) { $head.Substring(0, 10) } else { $head }
-    Write-ReviewLoopRule -Title "Codex Review Loop v3" -Kind Progress
+    Write-ReviewLoopRule -Title "Codex Review Loop" -Kind Progress
     Write-ReviewLoopKeyValue -Name "Repository" -Value $repo
     Write-ReviewLoopKeyValue -Name "Branch" -Value ([string]$state.Branch)
     Write-ReviewLoopKeyValue -Name "Review-Base" -Value ([string]$config.ReviewBase)
     Write-ReviewLoopKeyValue -Name "HEAD" -Value $shortHead
     Write-ReviewLoopKeyValue -Name "Speed" -Value $Speed
-    Write-ReviewLoopKeyValue -Name "Ausgabe" -Value "$OutputMode · Heartbeat ${HeartbeatSeconds}s · $ColorMode"
-    Write-ReviewLoopKeyValue -Name "Profil" -Value "$($config.Name) · $resolvedConfigPath"
-    Write-ReviewLoopKeyValue -Name "Run" -Value "$($state.RunId) ($(if ($resumed) { 'fortgesetzt' } else { 'neu' }))"
+    Write-ReviewLoopKeyValue -Name "Output" -Value "$OutputMode · heartbeat ${HeartbeatSeconds}s · $ColorMode"
+    Write-ReviewLoopKeyValue -Name "Profile" -Value "$($config.Name) · $resolvedConfigPath"
+    Write-ReviewLoopKeyValue -Name "Run" -Value "$($state.RunId) ($(if ($resumed) { 'resumed' } else { 'new' }))"
     Write-ReviewLoopKeyValue -Name "Checkpoint" -Value $statePath
     Write-ReviewLoopKeyValue -Name "Ledger" -Value $paths.LedgerPath
     Write-ReviewLoopKeyValue -Name "Terminal-Log" -Value $terminalPath
@@ -530,13 +530,13 @@ function Invoke-CodexReviewLoop {
             -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath | Out-Null
         while ([int]$state.ReviewCycle -lt [int]$config.MaxReviewCycles) {
             if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
-                throw "Worktree ist außerhalb eines wiederaufnehmbaren Fix-Schritts nicht sauber."
+                throw "Worktree is not clean outside a resumable fix step."
             }
 
             $state.ReviewCycle = [int]$state.ReviewCycle + 1
             $state.CurrentHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewing"
-            Write-ReviewLoopRule -Title ("Review-Zyklus {0}/{1}" -f $state.ReviewCycle, $config.MaxReviewCycles) -Kind Review
+            Write-ReviewLoopRule -Title ("Review cycle {0}/{1}" -f $state.ReviewCycle, $config.MaxReviewCycles) -Kind Review
             $review = Invoke-ReviewLoopReview `
                 -Config $config -State $state -StatePath $statePath -RepoPath $repo `
                 -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
@@ -548,7 +548,7 @@ function Invoke-CodexReviewLoop {
 
             $blocked = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" })
             if ($blocked.Count -gt 0) {
-                throw "Ledger enthält $($blocked.Count) blockierte Findings."
+                throw "Ledger contains $($blocked.Count) blocked findings."
             }
             $open = @(Get-ReviewLoopOpenFindings -Ledger $ledger)
             if ($open.Count -eq 0 -and [string]$review.Result.classification -eq "clean") {
@@ -562,17 +562,17 @@ function Invoke-CodexReviewLoop {
                 Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "clean_review"
                 $reviewHead = [string]$review.Head
                 $cleanShortHead = if ($reviewHead.Length -gt 10) { $reviewHead.Substring(0, 10) } else { $reviewHead }
-                Write-ReviewLoopStatus -Message "Clean-Pass $($state.CleanPasses)/$($config.CleanPassesRequired) auf unverändertem HEAD $cleanShortHead" -Kind Success
+                Write-ReviewLoopStatus -Message "Clean pass $($state.CleanPasses)/$($config.CleanPassesRequired) on unchanged HEAD $cleanShortHead" -Kind Success
                 if ([int]$state.CleanPasses -ge [int]$config.CleanPassesRequired) {
                     $state.Status = "completed"
                     $state.ExitCode = 0
                     Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "completed" -Status "completed"
-                    Write-ReviewLoopResultBlock -Title "Review Loop abgeschlossen" -Kind Success -Values ([ordered]@{
+                    Write-ReviewLoopResultBlock -Title "Review Loop completed" -Kind Success -Values ([ordered]@{
                         Status = "completed"
-                        Zyklen = $state.ReviewCycle
-                        "Clean-Pässe" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
-                        "Offene Findings" = 0
-                        "Blockierte Findings" = 0
+                        Cycles = $state.ReviewCycle
+                        "Clean passes" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
+                        "Open findings" = 0
+                        "Blocked findings" = 0
                         Run = $paths.RunRoot
                         Ledger = $paths.LedgerPath
                         Transcript = $terminalPath
@@ -592,7 +592,7 @@ function Invoke-CodexReviewLoop {
 
             $state.CleanPasses = 0
             $state.CleanHead = ""
-            Write-ReviewLoopStatus -Message "Clean-Zähler zurückgesetzt; $($open.Count) offene Findings werden bearbeitet." -Kind Warning
+            Write-ReviewLoopStatus -Message "Clean-pass count reset; processing $($open.Count) open findings." -Kind Warning
             $groups = @($open | Group-Object ClusterId | Sort-Object Name)
             foreach ($group in $groups) {
                 $activeGroup = @($group.Group | Where-Object { [string]$_.Status -in @("pending", "open", "fixing") })
@@ -606,24 +606,24 @@ function Invoke-CodexReviewLoop {
                     -RunRoot $paths.RunRoot -CodexPath $CodexPath
             }
         }
-        throw "Maximale Review-Zyklenzahl $($config.MaxReviewCycles) erreicht."
+        throw "Maximum review cycle count $($config.MaxReviewCycles) reached."
     }
     catch {
         $message = $_.Exception.Message
-        $state.Status = if ($message -match "(?i)blocked|unklar|Host-Gate|Fixversuch|Maximale|Überarbeitung|Architekturvorschlag") { "blocked" } else { "failed" }
+        $state.Status = if ($message -match "(?i)blocked|unclear|host gate|fix attempt|maximum|revision|architecture proposal") { "blocked" } else { "failed" }
         $state.ExitCode = if ($state.Status -eq "blocked") { 3 } else { 2 }
         $state.BlockedReason = $message
         Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "stopped" -Status $state.Status
         Write-ReviewLoopStatus -Message $message -Kind Error
         $openCount = @($ledger.Findings | Where-Object { [string]$_.Status -in @("pending", "open", "fixing") }).Count
         $blockedCount = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" }).Count
-        Write-ReviewLoopResultBlock -Title "Review Loop gestoppt" -Kind Error -Values ([ordered]@{
+        Write-ReviewLoopResultBlock -Title "Review Loop stopped" -Kind Error -Values ([ordered]@{
             Status = $state.Status
-            Grund = $message
-            Zyklen = $state.ReviewCycle
-            "Clean-Pässe" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
-            "Offene Findings" = $openCount
-            "Blockierte Findings" = $blockedCount
+            Reason = $message
+            Cycles = $state.ReviewCycle
+            "Clean passes" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
+            "Open findings" = $openCount
+            "Blocked findings" = $blockedCount
             Run = $paths.RunRoot
             Ledger = $paths.LedgerPath
             Transcript = $terminalPath

@@ -1,12 +1,14 @@
 # Codex Review Loop
 
-Die Codex Review Loop orchestriert native Codex-Reviews, semantische Architekturentscheidungen, begrenzte Fixversuche und unabhängige Verifikation ausschließlich über die lokal installierte Codex-CLI.
+Codex Review Loop orchestrates native Codex reviews, semantic architecture
+decisions, bounded fix attempts, and independent verification exclusively
+through the locally installed Codex CLI.
 
-## Voraussetzungen und Installation
+## Requirements and installation
 
 - PowerShell 7
 - Git
-- installierte und authentifizierte Codex-CLI
+- An installed and authenticated Codex CLI
 
 ```powershell
 git clone https://github.com/InnerLive/CodexReviewLoop.git C:\Tools\CodexReviewLoop
@@ -14,124 +16,116 @@ Set-Location C:\Tools\CodexReviewLoop
 pwsh -File .\codex-review-loop.ps1 -Help
 ```
 
-## Aufruf
+## Usage
 
 ```powershell
 pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
-    -RepoPath C:\dev\MeinProjekt `
+    -RepoPath C:\dev\MyProject `
     -Speed standard `
     -OutputMode compact `
     -HeartbeatSeconds 30 `
     -ColorMode Host
 ```
 
-`standard` ist der kostenbewusste Default. `fast` setzt denselben Fast-Tier für jede Rolle, auch für Adjudikatoren und fortgesetzte Fixer-Threads. Ein Run wird ausschließlich mit demselben Speed fortgesetzt.
+`standard` is the cost-conscious default. `fast` applies the same fast service
+tier to every role, including adjudicators and resumed fixer threads. A run can
+only be resumed with the same speed.
 
-`ConfigPath` ist optional. Ohne Angabe sucht das Tool zuerst nach
-`.codex-review-loop.psd1` beziehungsweise `.codex\review-loop.psd1` im
-Repository und danach unter `profiles\` nach einem Profil, dessen
-`RepositoryPath` exakt dem kanonischen Git-Root entspricht. Existiert noch kein
-Profil, wird dort automatisch das nächste nummerierte Profil mit dem
-Repositorynamen als Präfix angelegt, beispielsweise `MeinProjekt-001.psd1`.
-Gleichnamige Repositories in verschiedenen
-Verzeichnissen erhalten dadurch getrennte Profile wie `MeinProjekt-001.psd1`
-und `MeinProjekt-002.psd1`. Ein
-expliziter, noch nicht existierender `ConfigPath` wird ebenfalls automatisch
-angelegt.
-Der Standardwert `LogRoot = '.\runs'` wird immer relativ zum Verzeichnis des
-Review-Loop-Skripts aufgelöst, nicht relativ zum aktuellen Arbeitsverzeichnis
-oder zum geprüften Repository.
+`ConfigPath` is optional. Without it, the tool checks these locations:
 
-## Ablauf
+1. `<repository>\.codex-review-loop.psd1`
+2. `<repository>\.codex\review-loop.psd1`
+3. A profile under the tool's `profiles\` directory whose `RepositoryPath`
+   exactly matches the canonical Git root
+
+If no matching profile exists, the tool creates and immediately uses the next
+numbered profile prefixed with the repository name, for example
+`MyProject-001.psd1`. Repositories with the same name but different paths
+receive separate files such as `MyProject-001.psd1` and
+`MyProject-002.psd1`. A missing explicitly requested `ConfigPath` is created
+automatically as well.
+
+The default `LogRoot = '.\runs'` is always resolved relative to the review loop
+script, not the current working directory or the reviewed repository.
+
+## How the loop works
 
 ```mermaid
 flowchart TD
-    start([Start oder Neustart]) --> config["Profil suchen oder erzeugen<br/>Ledger und Checkpoint laden"]
-    config --> resume{"Unterbrochener<br/>Fix vorhanden?"}
-    resume -- Nein --> review["Codex-Review<br/>und Normalisierung"]
-    resume -- Ja --> verify
+    start([Start or resume]) --> review["Review, normalize,<br/>and update ledger"]
+    review --> clean{"Clean review and<br/>no open findings?"}
 
-    review --> ledger["Findings in das persistente<br/>Ledger übernehmen"]
-    ledger --> blocked{"Blockierte Findings?"}
-    blocked -- Ja --> stop([Checkpoint-Stopp])
-    blocked -- Nein --> clean{"Clean und keine<br/>offenen Findings?"}
+    clean -- Yes --> passes["Count clean pass<br/>on unchanged HEAD"]
+    passes -- Required passes reached --> done([Complete])
+    passes -- Another pass required --> review
 
-    clean -- Ja --> count["Clean-Pass für den<br/>aktuellen HEAD zählen"]
-    count --> enough{"Erforderliche Clean-Pässe<br/>auf unverändertem HEAD erreicht?"}
-    enough -- Ja --> done([Erfolgreich abgeschlossen])
-    enough -- Nein --> review
+    clean -- No --> cluster["Select semantic<br/>finding cluster"]
+    cluster --> strategy["Judge trigger and, when justified,<br/>gate one bounded architecture proposal"]
+    strategy --> fix["Fix cluster<br/>at most two attempts"]
+    fix --> verify{"Verified and<br/>host gates pass?"}
+    verify -- Yes --> resolve["Resolve findings, optionally commit,<br/>and reset clean-pass count"]
+    resolve --> review
+    verify -- No --> stop([Checkpoint stop])
 
-    clean -- Nein --> cluster["Nächsten semantischen<br/>Finding-Cluster wählen"]
-    cluster --> trigger["Trigger Judge<br/>mit Bestätigung oder Tie-Break"]
-    trigger --> architecture{"Architekturarbeit<br/>empfohlen?"}
-    architecture -- Ja --> gate["Vorschlag, Critic und Veto<br/>maximal eine Überarbeitung"]
-    architecture -- Nein --> fix
-    gate -- Freigegeben oder Point-Fix --> fix["Fixer<br/>Versuch 1 in neuem Thread"]
-    gate -- Unklar oder Scope-Limit --> stop
-
-    fix --> verify["Finding-Verifier<br/>mit Bestätigung oder Tie-Break"]
-    verify -- Gelöst --> host["Gezielter Test und Host-Gates"]
-    verify -- Obsolet --> superseded["Als superseded markieren"]
-    verify -- Nicht gelöst --> retry{"Zweiter Versuch<br/>noch verfügbar?"}
-    retry -- Ja --> fix2["Fixer Versuch 2<br/>im selben Thread"]
-    fix2 --> verify
-    retry -- Nein --> stop
-
-    host -- Fehlgeschlagen --> stop
-    host -- Bestanden --> resolved["Optional committen, Finding schließen<br/>und Clean-Zähler zurücksetzen"]
-    resolved --> more{"Weitere offene<br/>Cluster?"}
-    superseded --> more
-    more -- Ja --> cluster
-    more -- Nein --> review
+    review -. Blocked ledger or cycle limit .-> stop
+    strategy -. Disagreement or scope limit .-> stop
 ```
 
-Nach jedem Rollenwechsel wird atomar ein Checkpoint geschrieben. Ein Neustart
-setzt den aktiven Cluster fort; ein Commit oder eine andere Änderung des HEAD
-setzt den Clean-Zähler zurück.
+The trigger judge may choose a point fix without invoking the architecture
+roles. Architecture-positive or uncertain decisions receive independent
+confirmation and, if needed, one tie-break. The same pattern is used for finding
+verification. Every finding cluster gets a fresh fixer thread; only its second
+attempt resumes that thread.
 
-## Live-Status
+An atomic checkpoint is written after every role transition. Restarting resumes
+the active cluster. A commit or any other HEAD change resets the clean-pass
+counter.
 
-`compact` zeigt standardmäßig Phasen, Rollen, Findings, Entscheidungen,
-Fixversuche, Verifikation, Host-Gates und Commits. Erfolgreiche interne
-CLI-Befehle bleiben verborgen; Fehler erscheinen sofort mit einem kurzen
-Auszug. `balanced` ergänzt kurze Aktivitätsmeldungen, `detailed` auch
-Start und Abschluss erfolgreicher interner Befehle. Agent- und
-Reasoning-Rohinhalte werden nie ausgegeben; ihre fachlichen Ergebnisse
-erscheinen nur in den Rollen- und Entscheidungszusammenfassungen.
+## Live status
 
-Länger laufende Rollen und Host-Gates melden standardmäßig alle 30 Sekunden
-Laufzeit, Aktivitätszahl und letzte Aktivität. `-HeartbeatSeconds 0` deaktiviert
-diese Meldung. `-ColorMode Host|Ansi|Always|Auto|Never` steuert die farbige
-Terminalausgabe.
+`compact` shows phases, roles, findings, decisions, fix attempts, verification,
+host gates, and commits. Successful internal CLI commands stay hidden; failures
+appear immediately with a short excerpt. `balanced` adds concise activity
+messages, while `detailed` also shows the start and completion of successful
+internal commands.
 
-Jede sichtbare Statuszeile wird zusätzlich mit Zeitstempel und ohne Farbcodes
-in `terminal.log` im Run-Verzeichnis geschrieben. Codex-JSONL, stderr und
-Host-Gate-Logs wachsen bereits während des laufenden Prozesses.
+Raw agent reasoning is never printed. Only role and decision summaries are
+shown.
 
-## Hilfe
+Long-running roles and host gates report their elapsed time, activity count, and
+last activity every 30 seconds by default. `-HeartbeatSeconds 0` disables these
+heartbeats. `-ColorMode Host|Ansi|Always|Auto|Never` controls terminal colors.
+
+Every visible status line is also written to `terminal.log` in the run directory
+with a timestamp and without color codes. Codex JSONL, stderr, and host-gate logs
+are flushed while the process is running.
+
+## Help
 
 ```powershell
-C:\dev\CodexReviewLoop\codex-review-loop.ps1 -Help
+C:\Tools\CodexReviewLoop\codex-review-loop.ps1 -Help
 ```
 
-Alternativ steht die normale PowerShell-Hilfe zur Verfügung:
+Standard PowerShell help is available as well:
 
 ```powershell
-Get-Help C:\dev\CodexReviewLoop\codex-review-loop.ps1 -Detailed
+Get-Help C:\Tools\CodexReviewLoop\codex-review-loop.ps1 -Detailed
 ```
 
-## Zustände
+## State
 
-Das profilweite `ledger-v1.json` hält Findings über Runs hinweg. Jeder Run besitzt ein separates `run-v1.json` und rollenbezogene JSONL-/Ergebnislogs. Ein Finding wird erst nach unabhängiger Verifikation geschlossen; ein Fix-Commit allein genügt nicht.
+The profile-wide `ledger-v1.json` persists findings across runs. Every run has a
+separate `run-v1.json` plus role-specific JSONL and result logs. A finding is
+only closed after independent verification; a fix commit alone is not enough.
 
-## Prompt-Qualifikation
+## Prompt qualification
 
 ```powershell
 Import-Module C:\Tools\CodexReviewLoop\CodexReviewLoop.psd1 -Force
 Test-CodexReviewLoopPrompts `
-    -RepoPath C:\dev\MeinProjekt `
-    -HistoricalLogRoot C:\ReviewLoop-Evaldaten
+    -RepoPath C:\dev\MyProject `
+    -HistoricalLogRoot C:\ReviewLoop-EvalData
 ```
 
-Die Qualifikation läuft immer mit Standard-Speed und Read-only-Sandbox.
-Historische Logs und das angegebene Ziel-Repository werden nur gelesen.
+Qualification always uses standard speed and a read-only sandbox. Historical
+logs and the target repository are only read.

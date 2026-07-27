@@ -53,7 +53,7 @@ $(ConvertTo-ReviewLoopJsonCompact $casePayload)
             Actual = if ($null -eq $actual) { "<missing>" } else { [string]$actual.verdict }
             Confidence = if ($null -eq $actual) { "<missing>" } else { [string]$actual.confidence }
             Passed = $null -ne $actual -and [string]$actual.verdict -eq [string]$case.Expected
-            Rationale = if ($null -eq $actual) { "Kein Ergebnis." } else { [string]$actual.rationale }
+            Rationale = if ($null -eq $actual) { "No result." } else { [string]$actual.rationale }
         }
     }
     return [pscustomobject]@{
@@ -84,7 +84,7 @@ function Test-CodexReviewLoopPrompts {
         $_.ContainsKey("HistoricalNativePath")
     }).Count -gt 0
     if ($requiresHistoricalLogs -and [string]::IsNullOrWhiteSpace($HistoricalLogRoot)) {
-        throw "HistoricalLogRoot ist für Eval-Fälle mit HistoricalNativePath erforderlich."
+        throw "HistoricalLogRoot is required for evaluation cases with HistoricalNativePath."
     }
     $history = if ([string]::IsNullOrWhiteSpace($HistoricalLogRoot)) {
         ""

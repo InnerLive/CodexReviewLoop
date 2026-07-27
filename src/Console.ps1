@@ -69,7 +69,7 @@ function Get-ReviewLoopConsoleWidth {
         }
     }
     catch {
-        # Nicht-interaktive Hosts haben keine verlässliche Fensterbreite.
+        # Non-interactive hosts do not expose a reliable window width.
     }
     return 100
 }

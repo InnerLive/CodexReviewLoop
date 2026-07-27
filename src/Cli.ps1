@@ -5,9 +5,9 @@ function Resolve-CodexCliExecutable {
         return Resolve-ReviewLoopPath -Path $CodexPath -MustExist
     }
 
-    # Der Windows-Store exponiert teilweise einen nicht direkt startbaren
-    # codex.exe-Alias. Der npm-PowerShell-Launcher ist der verlässliche,
-    # Windows-native Prozessrand und läuft in einem eigenen pwsh-Prozess.
+    # The Windows Store may expose a codex.exe alias that cannot be started
+    # directly. The npm PowerShell launcher is the reliable Windows-native
+    # process boundary and runs in its own pwsh process.
     $command = Get-Command "codex.ps1" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $command) {
         $command = Get-Command "codex.cmd" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -16,7 +16,7 @@ function Resolve-CodexCliExecutable {
         $command = Get-Command "codex.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     }
     if ($null -eq $command) {
-        throw "Codex CLI wurde nicht gefunden. Installiere oder authentifiziere Codex, bevor der Loop gestartet wird."
+        throw "Codex CLI was not found. Install or authenticate Codex before starting the loop."
     }
     return $command.Source
 }
@@ -74,11 +74,11 @@ function Get-CodexRoleArguments {
     switch ($Mode) {
         "Review" {
             if ([string]::IsNullOrWhiteSpace($ReviewBase)) {
-                throw "ReviewBase ist für einen Review-Aufruf erforderlich."
+                throw "ReviewBase is required for a review call."
             }
             if (-not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
-                # JSON-Stringliterale sind zugleich gültige TOML-Basic-Strings.
-                # Review --base darf keinen positionalen Prompt erhalten.
+                # JSON string literals are valid TOML basic strings as well.
+                # Review --base must not receive a positional prompt.
                 $tomlString = ConvertTo-Json -InputObject $DeveloperInstructions -Compress
                 [void]$arguments.Add("-c")
                 [void]$arguments.Add("developer_instructions=$tomlString")
@@ -89,7 +89,7 @@ function Get-CodexRoleArguments {
         }
         "Resume" {
             if ([string]::IsNullOrWhiteSpace($ThreadId)) {
-                throw "ThreadId ist für einen Resume-Aufruf erforderlich."
+                throw "ThreadId is required for a resume call."
             }
             [void]$arguments.Add("resume")
             [void]$arguments.Add($ThreadId)
@@ -189,7 +189,7 @@ function ConvertFrom-CodexJsonLines {
             }
         }
         catch {
-            # Nicht-JSON-Zeilen bleiben im Rohlog; die strukturierte Auswertung ignoriert sie.
+            # Non-JSON lines remain in the raw log and are ignored by structured parsing.
         }
     }
 
@@ -207,7 +207,7 @@ function Test-CodexStructuredResult {
     )
 
     if (-not (Test-Path -LiteralPath $ResultPath)) {
-        return [pscustomobject]@{ Valid = $false; Value = $null; Reason = "Finale Ergebnisdatei fehlt." }
+        return [pscustomobject]@{ Valid = $false; Value = $null; Reason = "Final result file is missing." }
     }
 
     $text = Get-Content -Raw -LiteralPath $ResultPath
@@ -215,18 +215,18 @@ function Test-CodexStructuredResult {
         $value = $text | ConvertFrom-Json
     }
     catch {
-        return [pscustomobject]@{ Valid = $false; Value = $null; Reason = "Finale Antwort ist kein gültiges JSON: $($_.Exception.Message)" }
+        return [pscustomobject]@{ Valid = $false; Value = $null; Reason = "Final response is not valid JSON: $($_.Exception.Message)" }
     }
 
     $testJson = Get-Command Test-Json -ErrorAction SilentlyContinue
     if ($null -ne $testJson) {
         try {
             if (-not ($text | Test-Json -SchemaFile $SchemaPath -ErrorAction Stop)) {
-                return [pscustomobject]@{ Valid = $false; Value = $value; Reason = "Finale Antwort verletzt das JSON-Schema." }
+                return [pscustomobject]@{ Valid = $false; Value = $value; Reason = "Final response violates the JSON schema." }
             }
         }
         catch {
-            return [pscustomobject]@{ Valid = $false; Value = $value; Reason = "Schema-Validierung fehlgeschlagen: $($_.Exception.Message)" }
+            return [pscustomobject]@{ Valid = $false; Value = $value; Reason = "Schema validation failed: $($_.Exception.Message)" }
         }
     }
 
@@ -314,29 +314,29 @@ function Update-ReviewLoopCodexActivity {
     if ($type -eq "item.started") {
         $Activity.ActionCount = [int]$Activity.ActionCount + 1
         if ($itemType -eq "command_execution" -and (Test-ReviewLoopOutputLevel -Minimum balanced)) {
-            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "Befehl")
+            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "command")
             Write-ReviewLoopStatus -Message "CLI: $command" -Kind Muted -Indent 1
         }
     }
     elseif ($type -eq "item.completed" -and $itemType -eq "command_execution") {
         $exitCode = [int](Get-ReviewLoopObjectProperty -Object $item -Name "exit_code" -Default 0)
         if ($exitCode -ne 0) {
-            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "interner Befehl")
-            Write-ReviewLoopStatus -Message "CLI-Befehl fehlgeschlagen (Exitcode $exitCode): $command" -Kind Warning -Indent 1
+            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "internal command")
+            Write-ReviewLoopStatus -Message "CLI command failed (exit code $exitCode): $command" -Kind Warning -Indent 1
             $output = [string](Get-ReviewLoopObjectProperty -Object $item -Name "aggregated_output" -Default "")
             foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text $output -MaxLines 4)) {
                 Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 2
             }
         }
         elseif (Test-ReviewLoopOutputLevel -Minimum detailed) {
-            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "Befehl")
-            Write-ReviewLoopStatus -Message "CLI abgeschlossen: $command" -Kind Muted -Indent 1
+            $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "command")
+            Write-ReviewLoopStatus -Message "CLI completed: $command" -Kind Muted -Indent 1
         }
     }
     elseif ($itemType -eq "error" -or $type -in @("error", "turn.failed")) {
         $message = [string](Get-ReviewLoopObjectProperty -Object $item -Name "message" -Default "")
         if ([string]::IsNullOrWhiteSpace($message)) {
-            $message = [string](Get-ReviewLoopObjectProperty -Object $event -Name "message" -Default "Codex meldet einen Fehler.")
+            $message = [string](Get-ReviewLoopObjectProperty -Object $event -Name "message" -Default "Codex reported an error.")
         }
         Write-ReviewLoopStatus -Message $message -Kind Error -Indent 1
     }
@@ -375,7 +375,7 @@ function Stop-ReviewLoopProcessTree {
         }
     }
     catch {
-        # Der Prozess kann zwischen HasExited und Kill bereits beendet worden sein.
+        # The process may terminate between HasExited and Kill.
     }
 }
 
@@ -409,12 +409,12 @@ function Invoke-ReviewLoopObservedProcess {
         $stdoutWriter = New-ReviewLoopStreamWriter -Path $StdoutPath -Append:$AppendLogs
         $stderrWriter = New-ReviewLoopStreamWriter -Path $StderrPath -Append:$AppendLogs
         if ($AppendLogs) {
-            $marker = "--- neuer Versuch $(Get-Date -Format o) ---"
+            $marker = "--- new attempt $(Get-Date -Format o) ---"
             $stdoutWriter.WriteLine($marker)
             $stderrWriter.WriteLine($marker)
         }
         if (-not $process.Start()) {
-            throw "$DisplayName konnte nicht gestartet werden."
+            throw "$DisplayName could not be started."
         }
         $wasStarted = $true
         if ($null -ne $InputText) {
@@ -473,12 +473,12 @@ function Invoke-ReviewLoopObservedProcess {
                 $elapsed = Format-ReviewLoopDuration -Duration ($now - $startedAt)
                 $idleSeconds = [Math]::Max(0, [int]($now - $activity.LastActivity).TotalSeconds)
                 $activityText = if ($EventKind -eq "Codex") {
-                    "$($activity.ActionCount) CLI-Aktionen"
+                    "$($activity.ActionCount) CLI actions"
                 }
                 else {
-                    "Prozess aktiv"
+                    "process active"
                 }
-                Write-ReviewLoopStatus -Message "$DisplayName läuft $elapsed · $activityText · letzte Aktivität vor ${idleSeconds}s" -Kind Progress
+                Write-ReviewLoopStatus -Message "$DisplayName running for $elapsed · $activityText · last activity ${idleSeconds}s ago" -Kind Progress
                 $nextHeartbeat = $now.AddSeconds($heartbeatSeconds)
             }
             if (-not ($stdoutDone -and $stderrDone -and $process.HasExited)) {
@@ -570,7 +570,7 @@ function Invoke-CodexCliRole {
 
     $attemptRecords = [System.Collections.Generic.List[object]]::new()
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        Write-ReviewLoopStatus -Message "$Role · $Model/$Thinking · $Speed · Versuch $attempt/$MaxAttempts" -Kind Progress
+        Write-ReviewLoopStatus -Message "$Role · $Model/$Thinking · $Speed · attempt $attempt/$MaxAttempts" -Kind Progress
         $startInfo = New-CodexProcessStartInfo -CodexExecutable $executable -Arguments $arguments
         $observed = $null
         try {
@@ -648,7 +648,7 @@ function Invoke-CodexCliRole {
 
             $duration = Format-ReviewLoopDuration -Duration ($finishedAt - $startedAt)
             $tokens = [long]$parsed.Usage.InputTokens + [long]$parsed.Usage.OutputTokens
-            Write-ReviewLoopStatus -Message "$Role abgeschlossen · $duration · $tokens Tokens" -Kind Success
+            Write-ReviewLoopStatus -Message "$Role completed · $duration · $tokens tokens" -Kind Success
             return [pscustomobject]@{
                 Success = $true
                 Role = $Role
@@ -670,7 +670,7 @@ function Invoke-CodexCliRole {
         }
 
         if ($failureKind -ne "transient" -or $attempt -ge $MaxAttempts) {
-            Write-ReviewLoopStatus -Message "$Role fehlgeschlagen ($failureKind, Exitcode $exitCode)" -Kind Error
+            Write-ReviewLoopStatus -Message "$Role failed ($failureKind, exit code $exitCode)" -Kind Error
             foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text "$stderr`n$stdout" -MaxLines 8)) {
                 Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 1
             }
@@ -695,7 +695,7 @@ function Invoke-CodexCliRole {
         }
 
         $delay = [int][Math]::Min(8, [Math]::Pow(2, $attempt))
-        Write-ReviewLoopStatus -Message "${Role}: transienter Fehler '$failureKind'; neuer Versuch in ${delay}s." -Kind Warning
+        Write-ReviewLoopStatus -Message "${Role}: transient failure '$failureKind'; retrying in ${delay}s." -Kind Warning
         Start-Sleep -Seconds $delay
     }
 }

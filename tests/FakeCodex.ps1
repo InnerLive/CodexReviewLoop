@@ -69,7 +69,7 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
     if (-not [string]::IsNullOrWhiteSpace($resultSequencePath) -and (Test-Path -LiteralPath $resultSequencePath)) {
         $sequence = @(Get-Content -Raw -LiteralPath $resultSequencePath | ConvertFrom-Json)
         if ($sequence.Count -eq 0) {
-            throw "Fake-Codex-Ergebnissequenz ist leer."
+            throw "Fake Codex result sequence is empty."
         }
         $result = [string]$sequence[0]
         $remaining = if ($sequence.Count -gt 1) { @($sequence[1..($sequence.Count - 1)]) } else { @() }

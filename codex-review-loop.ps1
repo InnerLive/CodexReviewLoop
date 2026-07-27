@@ -1,93 +1,94 @@
 <#
 .SYNOPSIS
-Startet die unattended Codex Review Loop v3 für ein Git-Repository.
+Starts the unattended Codex Review Loop for a Git repository.
 
 .DESCRIPTION
-Alle Modellinteraktionen laufen ausschließlich über die lokal installierte
-Codex-CLI. Die Loop prüft den Branch, führt verifizierte Fixes aus und beendet
-sich erst nach den im Profil konfigurierten Clean-Passes.
+All model interactions run exclusively through the locally installed Codex CLI.
+The loop reviews the branch, applies verified fixes, and only completes after
+the number of clean passes configured in the profile.
 
-ConfigPath ist optional. Ohne expliziten Pfad wird in dieser Reihenfolge gesucht:
+ConfigPath is optional. Without an explicit path, profiles are resolved in this
+order:
 1. <RepoPath>\.codex-review-loop.psd1
 2. <RepoPath>\.codex\review-loop.psd1
-3. Ein Profil unter <Toolverzeichnis>\profiles, dessen RepositoryPath
-   exakt dem kanonischen Git-Root entspricht.
+3. A profile under <tool directory>\profiles whose RepositoryPath exactly
+   matches the canonical Git root.
 
-Wird kein Profil gefunden, legt das Tool automatisch ein kommentiertes Profil
-als nächste freie Nummer unter <Toolverzeichnis>\profiles an, beispielsweise
-MeinProjekt-001.psd1 oder MeinProjekt-002.psd1, und setzt den Lauf damit fort.
+If no profile is found, the tool creates a commented profile using the next
+available number under <tool directory>\profiles, for example
+MyProject-001.psd1 or MyProject-002.psd1, and continues the run.
 
 .PARAMETER RepoPath
-Pfad zum Git-Repository, das geprüft und gegebenenfalls korrigiert wird.
+Path to the Git repository to review and, when needed, fix.
 
 .PARAMETER ConfigPath
-Optionaler Pfad zu einer PSD1-Profildatei. Existiert der explizit angegebene
-Pfad noch nicht, wird dort automatisch ein kommentiertes Profil mit dem
-kanonischen RepositoryPath angelegt.
+Optional path to a PSD1 profile. If the explicitly requested path does not
+exist, a commented profile bound to the canonical RepositoryPath is created
+there automatically.
 
 .PARAMETER Speed
-Globaler Service-Tier für ausnahmslos alle Rollen und Resume-Aufrufe.
-Zulässige Werte sind standard und fast. Der Default ist standard.
+Global service tier for every role and resume call without exception.
+Accepted values are standard and fast. The default is standard.
 
 .PARAMETER CodexPath
-Optionaler Pfad zu einer bestimmten Codex-CLI. Ohne Angabe wird die installierte
-Codex-CLI automatisch aufgelöst.
+Optional path to a specific Codex CLI executable. When omitted, the installed
+Codex CLI is resolved automatically.
 
 .PARAMETER NewRun
-Startet einen neuen Run, statt den jüngsten fortsetzbaren Checkpoint zu verwenden.
+Starts a new run instead of using the most recent resumable checkpoint.
 
 .PARAMETER OutputMode
-Steuert die fachliche Detailtiefe der Terminalausgabe:
-compact zeigt Phasen, Entscheidungen, Findings und Fehler (Default);
-balanced ergänzt interne CLI-Aktivitäten in Kurzform;
-detailed ergänzt Start und Abschluss erfolgreicher interner Befehle.
-Interne Reasoning-Inhalte werden in keinem Modus angezeigt.
+Controls the level of terminal detail:
+compact shows phases, decisions, findings, and failures (default);
+balanced adds concise internal CLI activity;
+detailed adds the start and completion of successful internal commands.
+Internal reasoning is never displayed.
 
 .PARAMETER HeartbeatSeconds
-Intervall für Laufzeitmeldungen bei länger laufenden Codex-Rollen und Host-Gates.
-Default ist 30 Sekunden. Der Wert 0 deaktiviert Heartbeats.
+Interval for progress messages from long-running Codex roles and host gates.
+The default is 30 seconds. Set to 0 to disable heartbeats.
 
 .PARAMETER ColorMode
-Steuert die Farbausgabe:
-Host verwendet native PowerShell-Hostfarben (Default);
-Ansi und Always schreiben ANSI-Farbcodes;
-Auto verwendet ANSI nur in einem geeigneten interaktiven Terminal;
-Never deaktiviert Farben.
-Die Datei terminal.log bleibt unabhängig davon immer frei von Farbcodes.
+Controls color output:
+Host uses native PowerShell host colors (default);
+Ansi and Always emit ANSI color codes;
+Auto uses ANSI only in a suitable interactive terminal;
+Never disables colors.
+The terminal.log file never contains color codes.
 
 .PARAMETER Help
-Zeigt diese Hilfe an, ohne ein Profil anzulegen oder den Review-Loop zu starten.
+Shows this help without creating a profile or starting the review loop.
 
 .EXAMPLE
-C:\Tools\CodexReviewLoop\codex-review-loop.ps1 -RepoPath C:\dev\MeinProjekt
+C:\Tools\CodexReviewLoop\codex-review-loop.ps1 -RepoPath C:\dev\MyProject
 
-Erzeugt bei Bedarf automatisch ein kommentiertes Profil und verwendet Standard-Speed.
+Creates a commented profile when needed and uses standard speed.
 
 .EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 `
-    -RepoPath C:\dev\Projekt `
-    -ConfigPath C:\Konfigurationen\Projekt.psd1 `
+    -RepoPath C:\dev\Project `
+    -ConfigPath C:\Configs\Project.psd1 `
     -Speed fast `
     -NewRun
 
-Verwendet ein explizites Profil und aktiviert Fast für alle Rollen.
+Uses an explicit profile and enables fast mode for every role.
 
 .EXAMPLE
-C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Projekt `
+C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
     -OutputMode balanced `
     -HeartbeatSeconds 15 `
     -ColorMode Host
 
-Zeigt zusätzlich kurze CLI-Aktivitäten und meldet alle 15 Sekunden den Fortschritt.
+Adds concise CLI activity and reports progress every 15 seconds.
 
 .EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 -Help
 
-Zeigt die vollständige Kommandohilfe an.
+Shows the full command help.
 
 .NOTES
-Ledger, Checkpoints und Rollenlogs werden unter dem im Profil angegebenen
-LogRoot abgelegt. AutoCommit und HostGates werden ebenfalls vom Profil gesteuert.
+The ledger, checkpoints, and role logs are stored under the profile's LogRoot.
+AutoCommit and HostGates are controlled by the profile as well.
 #>
 [CmdletBinding()]
 param(
@@ -122,7 +123,7 @@ if ($Help) {
     exit 0
 }
 if ([string]::IsNullOrWhiteSpace($RepoPath)) {
-    Write-Error "RepoPath ist erforderlich. Verwende -Help für Beispiele und Parameter."
+    Write-Error "RepoPath is required. Use -Help for examples and parameters."
     exit 1
 }
 

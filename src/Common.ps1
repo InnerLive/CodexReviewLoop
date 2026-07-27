@@ -29,7 +29,7 @@ function Resolve-ReviewLoopPath {
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
     $absolute = [System.IO.Path]::GetFullPath($expanded)
     if ($MustExist -and -not (Test-Path -LiteralPath $absolute)) {
-        throw "Pfad existiert nicht: $absolute"
+        throw "Path does not exist: $absolute"
     }
     return $absolute
 }
@@ -112,7 +112,7 @@ function Read-ReviewLoopJson {
         if ($Optional) {
             return $null
         }
-        throw "JSON-Datei fehlt: $Path"
+        throw "JSON file is missing: $Path"
     }
 
     return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
@@ -137,7 +137,7 @@ function Get-ReviewLoopRepositoryRoot {
     $candidate = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
     $root = (& git -C $candidate rev-parse --show-toplevel 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
-        throw "RepoPath ist kein Git-Repository: $candidate"
+        throw "RepoPath is not a Git repository: $candidate"
     }
     return Get-ReviewLoopComparablePath -Path $root
 }
@@ -174,10 +174,10 @@ function Assert-ReviewLoopConfigRepository {
     $configured = [string]$config.RepositoryPath
     if (-not [System.IO.Path]::IsPathRooted(
         [Environment]::ExpandEnvironmentVariables($configured))) {
-        throw "RepositoryPath muss absolut sein: $ConfigPath"
+        throw "RepositoryPath must be absolute: $ConfigPath"
     }
     if (-not (Test-ReviewLoopSamePath -Left $configured -Right $RepoPath)) {
-        throw "Profil '$ConfigPath' gehört zu '$configured', nicht zu '$RepoPath'."
+        throw "Profile '$ConfigPath' belongs to '$configured', not '$RepoPath'."
     }
 }
 
@@ -197,7 +197,7 @@ function Find-ReviewLoopProfileByRepository {
         }
         catch {
             Write-ReviewLoopStatus `
-                -Message "Ungültiges Profil wird bei der Repository-Suche übersprungen: $($profile.FullName)" `
+                -Message "Skipping invalid profile while matching the repository: $($profile.FullName)" `
                 -Kind Warning
             continue
         }
@@ -215,7 +215,7 @@ function Find-ReviewLoopProfileByRepository {
         }
     }
     if ($matches.Count -gt 1) {
-        throw "Mehrere Profile gehören zu '$RepoPath': $($matches -join ', ')"
+        throw "Multiple profiles belong to '$RepoPath': $($matches -join ', ')"
     }
     if ($matches.Count -eq 1) {
         return Get-ReviewLoopComparablePath -Path $matches[0]
@@ -309,45 +309,45 @@ function New-ReviewLoopProfile {
 
     $content = @"
 @{
-    # Anzeigename des Profils. Er bildet zugleich den Unterordner für Ledger und Runs.
+    # Profile display name. It is also used as the subdirectory for the ledger and runs.
     Name = $(ConvertTo-ReviewLoopPowerShellLiteral $name)
 
-    # Kanonischer Git-Root dieses Profils. Er verhindert Kollisionen zwischen gleichnamigen Repositories.
+    # Canonical Git root bound to this profile. It prevents collisions between equally named repositories.
     RepositoryPath = $(ConvertTo-ReviewLoopPowerShellLiteral $repo)
 
-    # Git-Revision, gegen die Codex den Branch prüft, z. B. origin/main, origin/master oder main.
+    # Git revision against which Codex reviews the branch, for example origin/main, origin/master, or main.
     ReviewBase = $(ConvertTo-ReviewLoopPowerShellLiteral $reviewBase)
 
-    # Verzeichnis für Ledger, Checkpoints, JSONL- und Ergebnislogs.
-    # Relative Pfade werden gegen das Verzeichnis des Review-Loop-Skripts aufgelöst.
+    # Directory for the ledger, checkpoints, JSONL logs, and result logs.
+    # Relative paths are resolved against the review loop script directory.
     LogRoot = $(ConvertTo-ReviewLoopPowerShellLiteral $logRoot)
 
-    # Zwei Clean-Passes auf unverändertem HEAD sind der empfohlene Abschluss.
+    # Two clean passes on an unchanged HEAD are the recommended completion gate.
     CleanPassesRequired = 2
 
-    # Harte Grenzen gegen endlose Review-, Fix- und Architektur-Schleifen.
+    # Hard limits prevent endless review, fix, and architecture loops.
     MaxReviewCycles = 12
     MaxFixAttempts = 2
     MaxArchitectureRevisions = 1
     MaxArchitecturePaths = 15
     MaxProductionPaths = 8
 
-    # `$true erstellt nach erfolgreicher Verifikation und allen Host-Gates einen Commit.
+    # `$true creates a commit after successful verification and all host gates.
     AutoCommit = `$true
     CommitMessagePrefix = 'Review-Loop'
 
-    # Host-Gates laufen nach erfolgreicher Finding-Verifikation und vor dem Commit.
-    # Ein Gate besteht aus Name, FilePath und einer Arguments-Liste. Weitere projektspezifische
-    # Tests können als zusätzliche Hashtables ergänzt werden.
+    # Host gates run after successful finding verification and before the commit.
+    # A gate consists of Name, FilePath, and an Arguments list. Add project-specific
+    # tests as additional hashtables.
     HostGates = @(
 $($hostGates -join "`n")
     )
 
-    # Rollenwerte:
-    # - Model: eine von der installierten Codex-CLI unterstützte Modell-ID.
-    # - Thinking: low, medium, high, xhigh oder max.
-    # - Sandbox: read-only, workspace-write oder danger-full-access.
-    # Fixer benötigen Schreibzugriff; alle beurteilenden Rollen bleiben read-only.
+    # Role settings:
+    # - Model: a model ID supported by the installed Codex CLI.
+    # - Thinking: low, medium, high, xhigh, or max.
+    # - Sandbox: read-only, workspace-write, or danger-full-access.
+    # Fixers require write access; all judging roles remain read-only.
     Roles = @{
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high'; Sandbox = 'read-only' }
         Normalizer = @{ Model = 'gpt-5.6-luna'; Thinking = 'low'; Sandbox = 'read-only' }
@@ -368,7 +368,7 @@ $($hostGates -join "`n")
 "@
 
     Write-ReviewLoopUtf8File -Path $absolute -Content $content
-    Write-ReviewLoopStatus -Message "Profil wurde angelegt: $absolute" -Kind Success
+    Write-ReviewLoopStatus -Message "Profile created: $absolute" -Kind Success
     return $absolute
 }
 
@@ -434,11 +434,11 @@ function Import-ReviewLoopConfig {
     $required = @("Name", "ReviewBase", "LogRoot", "Roles", "HostGates")
     foreach ($name in $required) {
         if (-not $config.ContainsKey($name)) {
-            throw "Konfiguration enthält '$name' nicht: $absolute"
+            throw "Configuration does not contain '$name': $absolute"
         }
     }
     if ([string]::IsNullOrWhiteSpace([string]$config.LogRoot)) {
-        throw "Konfiguration enthält keinen gültigen LogRoot: $absolute"
+        throw "Configuration does not contain a valid LogRoot: $absolute"
     }
 
     $defaults = @{
@@ -475,13 +475,13 @@ function Get-ReviewLoopRoleConfig {
     )
 
     if (-not $Config.Roles.ContainsKey($Role)) {
-        throw "Rolle '$Role' fehlt in der Konfiguration."
+        throw "Role '$Role' is missing from the configuration."
     }
 
     $roleConfig = $Config.Roles[$Role]
     foreach ($key in @("Model", "Thinking", "Sandbox")) {
         if (-not $roleConfig.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$roleConfig[$key])) {
-            throw "Rolle '$Role' enthält '$key' nicht."
+            throw "Role '$Role' does not contain '$key'."
         }
     }
     return $roleConfig
@@ -495,7 +495,7 @@ function Get-ReviewLoopGitValue {
 
     $value = & git -C $RepoPath @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') fehlgeschlagen: $($value -join [Environment]::NewLine)"
+        throw "git $($Arguments -join ' ') failed: $($value -join [Environment]::NewLine)"
     }
     return (($value | Out-String).Trim())
 }
