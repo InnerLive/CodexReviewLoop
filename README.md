@@ -94,9 +94,11 @@ internal commands.
 Raw agent reasoning is never printed. Only role and decision summaries are
 shown.
 
-Long-running roles and host gates report their elapsed time, activity count, and
-last activity every 30 seconds by default. `-HeartbeatSeconds 0` disables these
-heartbeats. `-ColorMode Host|Ansi|Always|Auto|Never` controls terminal colors.
+Long-running roles and host gates update one in-place status line with their
+elapsed time, activity count, and last activity every 30 seconds by default.
+Meaningful events continue on new lines, while `terminal.log` retains every
+heartbeat. `-HeartbeatSeconds 0` disables these heartbeats.
+`-ColorMode Host|Ansi|Always|Auto|Never` controls terminal colors.
 
 Every visible status line is also written to `terminal.log` in the run directory
 with a timestamp and without color codes. Codex JSONL, stderr, and host-gate logs

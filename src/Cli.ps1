@@ -504,7 +504,7 @@ function Invoke-ReviewLoopObservedProcess {
                 else {
                     "process active"
                 }
-                Write-ReviewLoopStatus -Message "$DisplayName running for $elapsed · $activityText · last activity ${idleSeconds}s ago" -Kind Progress
+                Write-ReviewLoopStatus -Message "$DisplayName running for $elapsed · $activityText · last activity ${idleSeconds}s ago" -Kind Progress -Inline
                 $nextHeartbeat = $now.AddSeconds($heartbeatSeconds)
             }
             if (-not ($stdoutDone -and $stderrDone -and $process.HasExited)) {
@@ -522,6 +522,7 @@ function Invoke-ReviewLoopObservedProcess {
         throw
     }
     finally {
+        Complete-ReviewLoopInlineStatus
         if ($wasStarted -and -not $process.HasExited) {
             Stop-ReviewLoopProcessTree -Process $process
         }

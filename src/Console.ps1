@@ -5,6 +5,8 @@ $script:ReviewLoopConsole = [ordered]@{
     TranscriptPath   = ""
     CapturePending   = $false
     PendingLines     = [System.Collections.Generic.List[string]]::new()
+    InlineActive     = $false
+    InlineWidth      = 0
 }
 
 function Initialize-ReviewLoopConsole {
@@ -22,6 +24,8 @@ function Initialize-ReviewLoopConsole {
     $script:ReviewLoopConsole.HeartbeatSeconds = $HeartbeatSeconds
     $script:ReviewLoopConsole.ColorMode = $ColorMode
     $script:ReviewLoopConsole.TranscriptPath = $TranscriptPath
+    $script:ReviewLoopConsole.InlineActive = $false
+    $script:ReviewLoopConsole.InlineWidth = 0
     if ([string]::IsNullOrWhiteSpace($TranscriptPath)) {
         $script:ReviewLoopConsole.PendingLines.Clear()
         $script:ReviewLoopConsole.CapturePending = $true
@@ -137,6 +141,7 @@ function Write-ReviewLoopConsoleLine {
         [Parameter(Mandatory = $true)][object]$Style
     )
 
+    Complete-ReviewLoopInlineStatus
     $safe = ConvertTo-ReviewLoopRedactedText $Text
     Add-ReviewLoopTranscriptLine -Text $safe
     $mode = [string]$script:ReviewLoopConsole.ColorMode
@@ -149,6 +154,45 @@ function Write-ReviewLoopConsoleLine {
     else {
         Write-Host $safe -ForegroundColor $Style.Color
     }
+}
+
+function Complete-ReviewLoopInlineStatus {
+    if (-not [bool]$script:ReviewLoopConsole.InlineActive) {
+        return
+    }
+
+    Write-Host ""
+    $script:ReviewLoopConsole.InlineActive = $false
+    $script:ReviewLoopConsole.InlineWidth = 0
+}
+
+function Write-ReviewLoopInlineStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][object]$Style
+    )
+
+    $safe = ConvertTo-ReviewLoopRedactedText ($Text -replace "\r?\n", " ")
+    $maxWidth = [Math]::Max(30, (Get-ReviewLoopConsoleWidth))
+    if ($safe.Length -gt $maxWidth) {
+        $safe = $safe.Substring(0, $maxWidth - 1) + "…"
+    }
+    Add-ReviewLoopTranscriptLine -Text $safe
+
+    $renderWidth = [Math]::Max([int]$script:ReviewLoopConsole.InlineWidth, $safe.Length)
+    $rendered = "`r$($safe.PadRight($renderWidth))"
+    $mode = [string]$script:ReviewLoopConsole.ColorMode
+    if ($mode -eq "Never") {
+        Write-Host $rendered -NoNewline
+    }
+    elseif (Test-ReviewLoopUseAnsi) {
+        Write-Host ("`r`e[{0}m{1}`e[0m" -f $Style.Ansi, $safe.PadRight($renderWidth)) -NoNewline
+    }
+    else {
+        Write-Host $rendered -NoNewline -ForegroundColor $Style.Color
+    }
+    $script:ReviewLoopConsole.InlineActive = $true
+    $script:ReviewLoopConsole.InlineWidth = $safe.Length
 }
 
 function Split-ReviewLoopWrappedText {
@@ -182,12 +226,17 @@ function Write-ReviewLoopStatus {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet("Info", "Progress", "Success", "Warning", "Error", "Review", "Architecture", "Muted")]
         [string]$Kind = "Info",
-        [int]$Indent = 0
+        [int]$Indent = 0,
+        [switch]$Inline
     )
 
     $style = Get-ReviewLoopConsoleStyle -Kind $Kind
     $indentText = "  " * [Math]::Max(0, $Indent)
     $firstPrefix = "$indentText$($style.Prefix) "
+    if ($Inline) {
+        Write-ReviewLoopInlineStatus -Text "$firstPrefix$Message" -Style $style
+        return
+    }
     $nextPrefix = "$indentText$(" " * ($style.Prefix.Length + 1))"
     $width = [Math]::Max(30, (Get-ReviewLoopConsoleWidth) - $firstPrefix.Length)
     $lines = @(Split-ReviewLoopWrappedText -Text $Message -Width $width)

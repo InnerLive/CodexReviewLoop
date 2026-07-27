@@ -784,6 +784,28 @@ Describe "Live terminal and streaming process observation" {
         $text | Should Match "last activity"
     }
 
+    It "rewrites consecutive heartbeats on one terminal line" {
+        $transcript = Join-Path $caseRoot "inline-heartbeats.log"
+        $module = Get-Module CodexReviewLoop
+        $rendered = & $module {
+            param($path)
+            Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 30 -ColorMode Never -TranscriptPath $path
+            Write-ReviewLoopStatus -Message "Reviewer running for 00:30" -Kind Progress -Inline
+            $activeAfterFirst = [bool]$script:ReviewLoopConsole.InlineActive
+            Write-ReviewLoopStatus -Message "Reviewer running for 01:00" -Kind Progress -Inline
+            Write-ReviewLoopStatus -Message "Reviewer completed" -Kind Success
+            "$activeAfterFirst|$([bool]$script:ReviewLoopConsole.InlineActive)"
+        } $transcript 6>&1
+
+        $rendered[0].ToString().StartsWith("`r") | Should Be $true
+        $rendered[1].ToString().StartsWith("`r") | Should Be $true
+        ($rendered | ForEach-Object { $_.ToString() }) -contains "True|False" | Should Be $true
+        $text = Get-Content -Raw -LiteralPath $transcript
+        $text | Should Match "Reviewer running for 00:30"
+        $text | Should Match "Reviewer running for 01:00"
+        $text | Should Match "Reviewer completed"
+    }
+
     It "formats elapsed time without rounding into future minutes or hours" {
         $module = Get-Module CodexReviewLoop
         $formatted = & $module {

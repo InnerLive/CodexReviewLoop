@@ -45,8 +45,8 @@ detailed adds the start and completion of successful internal commands.
 Internal reasoning is never displayed.
 
 .PARAMETER HeartbeatSeconds
-Interval for progress messages from long-running Codex roles and host gates.
-The default is 30 seconds. Set to 0 to disable heartbeats.
+Refresh interval for the in-place progress status shown for long-running Codex
+roles and host gates. The default is 30 seconds. Set to 0 to disable heartbeats.
 
 .PARAMETER ColorMode
 Controls color output:
