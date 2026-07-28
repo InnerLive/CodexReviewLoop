@@ -1,21 +1,11 @@
 Set-StrictMode -Version Latest
 
-function Write-ReviewLoopStatus {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
+function Stop-ReviewLoopBlocked {
+    param([Parameter(Mandatory = $true)][string]$Message)
 
-        [ValidateSet("Info", "Success", "Warning", "Error")]
-        [string]$Kind = "Info"
-    )
-
-    $prefix = switch ($Kind) {
-        "Success" { "[ok]" }
-        "Warning" { "[warn]" }
-        "Error" { "[error]" }
-        default { "[info]" }
-    }
-    Write-Host "$prefix $Message"
+    $exception = [System.InvalidOperationException]::new($Message)
+    $exception.Data["ReviewLoopStatus"] = "blocked"
+    throw $exception
 }
 
 function Resolve-ReviewLoopPath {
@@ -34,6 +24,17 @@ function Resolve-ReviewLoopPath {
     return $absolute
 }
 
+function Test-ReviewLoopRepositoryRelativePath {
+    param([AllowNull()][string]$Path)
+
+    $value = ([string]$Path).Trim()
+    return -not [string]::IsNullOrWhiteSpace($value) -and
+        -not [System.IO.Path]::IsPathRooted($value) -and
+        $value -notmatch '(^|[\\/])\.\.([\\/]|$)' -and
+        $value -notmatch '^~([\\/]|$)' -and
+        $value -notmatch '^[a-z][a-z0-9_.-]*:{1,2}'
+}
+
 function ConvertTo-ReviewLoopCanonicalText {
     param([AllowNull()][object]$Value)
 
@@ -44,8 +45,55 @@ function ConvertTo-ReviewLoopCanonicalText {
     return ([string]$Value).Trim().Replace("\", "/").ToLowerInvariant()
 }
 
+function ConvertFrom-ReviewLoopDirectCommand {
+    param([Parameter(Mandatory = $true)][string]$Command)
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $Command,
+        [ref]$tokens,
+        [ref]$errors)
+    if (@($errors).Count -gt 0 -or @($ast.EndBlock.Statements).Count -ne 1) {
+        return $null
+    }
+    $commands = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true))
+    if ($commands.Count -ne 1 -or @($commands[0].Redirections).Count -ne 0 -or
+        [string]$commands[0].InvocationOperator -ne "Unknown") {
+        return $null
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($element in @($commands[0].CommandElements)) {
+        if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            ($element -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                @($element.NestedExpressions).Count -eq 0)) {
+            [void]$parts.Add([string]$element.Value)
+        }
+        elseif ($element -is [System.Management.Automation.Language.ConstantExpressionAst]) {
+            [void]$parts.Add([string]$element.Value)
+        }
+        elseif ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+            [void]$parts.Add([string]$element.Extent.Text)
+        }
+        else {
+            return $null
+        }
+    }
+    if ($parts.Count -eq 0 -or @($parts | Where-Object { $_ -match "[`r`n]" }).Count -gt 0) {
+        return $null
+    }
+    return [pscustomobject]@{
+        FilePath = $parts[0]
+        Arguments = @($parts | Select-Object -Skip 1)
+    }
+}
+
 function Get-ReviewLoopSha256 {
-    param([Parameter(Mandatory = $true)][string]$Text)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
 
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
     $hash = [System.Security.Cryptography.SHA256]::HashData($bytes)
@@ -62,7 +110,16 @@ function ConvertTo-ReviewLoopRedactedText {
     $redacted = $Text
     $redacted = [regex]::Replace($redacted, "(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", "Bearer [redacted]")
     $redacted = [regex]::Replace($redacted, "\bsk-[A-Za-z0-9_-]{12,}", "[redacted-secret]")
-    $redacted = [regex]::Replace($redacted, "(?i)(access[_-]?token|authorization|secret)\s*[:=]\s*[^\s,;]+", '$1=[redacted]')
+    $redacted = [regex]::Replace(
+        $redacted,
+        '(?i)("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|api[_-]?key|client[_-]?secret|secret|password)"\s*:\s*")((?:\\.|[^"\\])*)(")',
+        '$1[redacted]$3'
+    )
+    $redacted = [regex]::Replace(
+        $redacted,
+        "(?i)\b(access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|api[_-]?key|client[_-]?secret|secret|password)(\s*[:=]\s*)[^\s,;""'{}\[\]]+",
+        '$1$2[redacted]'
+    )
     return $redacted
 }
 
@@ -135,7 +192,7 @@ function Get-ReviewLoopRepositoryRoot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     $candidate = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
-    $root = (& git -C $candidate rev-parse --show-toplevel 2>&1 | Out-String).Trim()
+    $root = (& git -C $candidate rev-parse --show-toplevel 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
         throw "RepoPath is not a Git repository: $candidate"
     }
@@ -148,6 +205,18 @@ function Test-ReviewLoopSamePath {
         [Parameter(Mandatory = $true)][string]$Right
     )
 
+    $leftPath = Get-ReviewLoopComparablePath -Path $Left
+    $rightPath = Get-ReviewLoopComparablePath -Path $Right
+    if ((Test-Path -LiteralPath $leftPath -PathType Container) -and
+        (Test-Path -LiteralPath $rightPath -PathType Container)) {
+        $leftRoot = (& git -C $leftPath rev-parse --show-toplevel 2>$null | Out-String).Trim()
+        $leftExit = $LASTEXITCODE
+        $rightRoot = (& git -C $rightPath rev-parse --show-toplevel 2>$null | Out-String).Trim()
+        if ($leftExit -eq 0 -and $LASTEXITCODE -eq 0) {
+            $leftPath = Get-ReviewLoopComparablePath -Path $leftRoot
+            $rightPath = Get-ReviewLoopComparablePath -Path $rightRoot
+        }
+    }
     $comparison = if ($IsWindows) {
         [System.StringComparison]::OrdinalIgnoreCase
     }
@@ -155,8 +224,8 @@ function Test-ReviewLoopSamePath {
         [System.StringComparison]::Ordinal
     }
     return [string]::Equals(
-        (Get-ReviewLoopComparablePath -Path $Left),
-        (Get-ReviewLoopComparablePath -Path $Right),
+        $leftPath,
+        $rightPath,
         $comparison)
 }
 
@@ -322,7 +391,7 @@ function New-ReviewLoopProfile {
     # Relative paths are resolved against the review loop script directory.
     LogRoot = $(ConvertTo-ReviewLoopPowerShellLiteral $logRoot)
 
-    # Two clean passes on an unchanged HEAD are the recommended completion gate.
+    # Two clean passes on an unchanged HEAD are the required completion gate.
     CleanPassesRequired = 2
 
     # Hard limits prevent endless review, fix, and architecture loops.
@@ -332,7 +401,7 @@ function New-ReviewLoopProfile {
     MaxArchitecturePaths = 15
     MaxProductionPaths = 8
 
-    # `$true creates a commit after successful verification and all host gates.
+    # The unattended loop always commits after successful verification and all host gates.
     AutoCommit = `$true
     CommitMessagePrefix = 'Review-Loop'
 
@@ -346,23 +415,22 @@ $($hostGates -join "`n")
     # Role settings:
     # - Model: a model ID supported by the installed Codex CLI.
     # - Thinking: low, medium, high, xhigh, or max.
-    # - Sandbox: read-only, workspace-write, or danger-full-access.
-    # Fixers require write access; all judging roles remain read-only.
+    # Sandboxes are enforced by the loop: fixers use workspace-write and every
+    # other role is read-only.
     Roles = @{
-        Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high'; Sandbox = 'read-only' }
-        Normalizer = @{ Model = 'gpt-5.6-luna'; Thinking = 'low'; Sandbox = 'read-only' }
-        TriggerJudge = @{ Model = 'gpt-5.6-luna'; Thinking = 'low'; Sandbox = 'read-only' }
-        TriggerConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low'; Sandbox = 'read-only' }
-        TriggerTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium'; Sandbox = 'read-only' }
-        Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'max'; Sandbox = 'read-only' }
-        ArchitectureCritic = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium'; Sandbox = 'read-only' }
-        ArchitectureVeto = @{ Model = 'gpt-5.6-sol'; Thinking = 'medium'; Sandbox = 'read-only' }
-        ArchitectureTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'high'; Sandbox = 'read-only' }
-        PointFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high'; Sandbox = 'danger-full-access' }
-        ArchitectureFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'max'; Sandbox = 'danger-full-access' }
-        FindingVerifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low'; Sandbox = 'read-only' }
-        VerifierConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low'; Sandbox = 'read-only' }
-        VerifierTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium'; Sandbox = 'read-only' }
+        Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
+        TriggerJudge = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
+        TriggerConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
+        TriggerTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
+        Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'max' }
+        ArchitectureCritic = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
+        ArchitectureVeto = @{ Model = 'gpt-5.6-sol'; Thinking = 'medium' }
+        ArchitectureTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'high' }
+        PointFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
+        ArchitectureFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'max' }
+        FindingVerifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
+        VerifierConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
+        VerifierTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
     }
 }
 "@
@@ -456,6 +524,9 @@ function Import-ReviewLoopConfig {
             $config[$entry.Key] = $entry.Value
         }
     }
+    if (-not [bool]$config.AutoCommit) {
+        throw "AutoCommit=false is incompatible with the unattended loop because it leaves a dirty worktree."
+    }
 
     $configuredLogRoot = [Environment]::ExpandEnvironmentVariables([string]$config.LogRoot)
     $config.LogRoot = if ([System.IO.Path]::IsPathRooted($configuredLogRoot)) {
@@ -466,6 +537,116 @@ function Import-ReviewLoopConfig {
     }
 
     return $config
+}
+
+function Assert-ReviewLoopConfigValues {
+    param([Parameter(Mandatory = $true)][hashtable]$Config)
+
+    foreach ($name in @("Name", "ReviewBase", "CommitMessagePrefix")) {
+        $value = [string]$Config[$name]
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -match "[`r`n]") {
+            throw "Configuration value '$name' must be one non-empty line."
+        }
+    }
+    if ([string]$Config.Name -in @(".", "..") -or
+        ([string]$Config.Name).IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw "Configuration value 'Name' must be a safe directory name."
+    }
+    if ($Config.Roles -isnot [System.Collections.IDictionary]) {
+        throw "Configuration value 'Roles' must be a hashtable."
+    }
+
+    $limits = @{
+        CleanPassesRequired = @(2, 2)
+        MaxReviewCycles = @(2, 100)
+        MaxFixAttempts = @(2, 2)
+        MaxArchitectureRevisions = @(1, 1)
+        MaxArchitecturePaths = @(1, 100)
+        MaxProductionPaths = @(1, 100)
+    }
+    foreach ($entry in $limits.GetEnumerator()) {
+        try {
+            $value = [int]$Config[$entry.Key]
+        }
+        catch {
+            throw "Configuration value '$($entry.Key)' must be an integer."
+        }
+        if ($value -lt $entry.Value[0] -or $value -gt $entry.Value[1]) {
+            $range = if ($entry.Value[0] -eq $entry.Value[1]) {
+                [string]$entry.Value[0]
+            }
+            else {
+                "$($entry.Value[0])..$($entry.Value[1])"
+            }
+            throw "Configuration value '$($entry.Key)' must be $range."
+        }
+        $Config[$entry.Key] = $value
+    }
+    if ([int]$Config.MaxReviewCycles -lt [int]$Config.CleanPassesRequired) {
+        throw "MaxReviewCycles must be at least CleanPassesRequired."
+    }
+    if ([int]$Config.MaxProductionPaths -gt [int]$Config.MaxArchitecturePaths) {
+        throw "MaxProductionPaths cannot exceed MaxArchitecturePaths."
+    }
+
+    $roles = @(
+        "Reviewer",
+        "TriggerJudge", "TriggerConfirm", "TriggerTieBreak",
+        "Architect", "ArchitectureCritic", "ArchitectureVeto", "ArchitectureTieBreak",
+        "PointFixer", "ArchitectureFixer",
+        "FindingVerifier", "VerifierConfirm", "VerifierTieBreak"
+    )
+    foreach ($role in $roles) {
+        $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $role
+        if ([string]$roleConfig.Thinking -notin @("low", "medium", "high", "xhigh", "max")) {
+            throw "Role '$role' contains unsupported Thinking '$($roleConfig.Thinking)'."
+        }
+    }
+
+    foreach ($gate in @($Config.HostGates)) {
+        if ($gate -isnot [System.Collections.IDictionary]) {
+            throw "Every HostGates entry must be a hashtable."
+        }
+        foreach ($name in @("Name", "FilePath", "Arguments")) {
+            if (-not $gate.Contains($name)) {
+                throw "Host gate is missing '$name'."
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$gate.Name) -or
+            [string]::IsNullOrWhiteSpace([string]$gate.FilePath)) {
+            throw "Host gate Name and FilePath must be non-empty."
+        }
+        if ($gate.Arguments -is [string] -or $null -eq $gate.Arguments) {
+            throw "Host gate '$($gate.Name)' Arguments must be a list."
+        }
+    }
+}
+
+function Get-ReviewLoopExecutionFingerprint {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    $files = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in @(
+        "codex-review-loop.ps1",
+        "CodexReviewLoop.psd1",
+        "CodexReviewLoop.psm1"
+    )) {
+        [void]$files.Add((Join-Path $script:ModuleRoot $name))
+    }
+    foreach ($directory in @("src", "prompts", "schemas")) {
+        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $script:ModuleRoot $directory) -File |
+            Sort-Object FullName)) {
+            [void]$files.Add($file.FullName)
+        }
+    }
+    [void]$files.Add((Resolve-ReviewLoopPath -Path $ConfigPath -MustExist))
+
+    $records = foreach ($file in $files) {
+        $absolute = Resolve-ReviewLoopPath -Path $file -MustExist
+        $relative = [System.IO.Path]::GetRelativePath($script:ModuleRoot, $absolute).Replace("\", "/")
+        "$relative`n$(Get-ReviewLoopSha256 ([System.IO.File]::ReadAllText($absolute)))"
+    }
+    return Get-ReviewLoopSha256 ($records -join "`n")
 }
 
 function Get-ReviewLoopRoleConfig {
@@ -479,7 +660,7 @@ function Get-ReviewLoopRoleConfig {
     }
 
     $roleConfig = $Config.Roles[$Role]
-    foreach ($key in @("Model", "Thinking", "Sandbox")) {
+    foreach ($key in @("Model", "Thinking")) {
         if (-not $roleConfig.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$roleConfig[$key])) {
             throw "Role '$Role' does not contain '$key'."
         }
@@ -493,9 +674,10 @@ function Get-ReviewLoopGitValue {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $value = & git -C $RepoPath @Arguments 2>&1
+    $value = & git -C $RepoPath @Arguments 2>$null
     if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') failed: $($value -join [Environment]::NewLine)"
+        $failure = & git -C $RepoPath @Arguments 2>&1
+        throw "git $($Arguments -join ' ') failed: $($failure -join [Environment]::NewLine)"
     }
     return (($value | Out-String).Trim())
 }
@@ -504,6 +686,53 @@ function Test-ReviewLoopGitClean {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     return [string]::IsNullOrWhiteSpace((Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("status", "--porcelain")))
+}
+
+function Get-ReviewLoopWorktreePatch {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $changed = @(& git -C $RepoPath diff --name-only --no-renames HEAD -- 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "git diff --name-only failed."
+    }
+    $untracked = @(& git -C $RepoPath ls-files --others --exclude-standard 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "git ls-files --others failed."
+    }
+    $untrackedSet = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $untracked) {
+        [void]$untrackedSet.Add([string]$path)
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @($changed + $untracked | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    } | Sort-Object -Unique)) {
+        $patch = & git -C $RepoPath diff --binary --no-ext-diff --no-renames `
+            --unified=80 HEAD -- ([string]$path) 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "git diff failed for path '$path'."
+        }
+        $text = ($patch | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($text) -and $untrackedSet.Contains([string]$path)) {
+            $patch = & git -C $RepoPath diff --binary --no-index --no-renames `
+                --unified=80 -- /dev/null ([string]$path) 2>$null
+            if ($LASTEXITCODE -notin @(0, 1)) {
+                throw "git diff failed for untracked path '$path'."
+            }
+            $text = ($patch | Out-String).Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            [void]$parts.Add($text)
+        }
+    }
+    return ($parts -join [Environment]::NewLine)
+}
+
+function Get-ReviewLoopWorktreeFingerprint {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+    return Get-ReviewLoopSha256 (Get-ReviewLoopWorktreePatch -RepoPath $RepoPath)
 }
 
 function ConvertTo-ReviewLoopJsonCompact {

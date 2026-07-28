@@ -20,3 +20,12 @@ profiles/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Common local credential files
+.env
+.env.*
+!.env.example
+.secrets/
+*.key
+*.pem
+*.pfx

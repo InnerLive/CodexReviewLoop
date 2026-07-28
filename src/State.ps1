@@ -187,20 +187,21 @@ function Merge-ReviewLoopFindings {
 
     foreach ($finding in $Findings) {
         $incoming = ConvertTo-ReviewLoopFindingRecord -Finding $finding -ReviewId $ReviewId -Head $Head
-        $existing = $records | Where-Object { [string]$_.Id -eq [string]$incoming.Id } | Select-Object -First 1
+        $existing = $records | Where-Object {
+            [string]$_.Id -eq [string]$incoming.Id
+        } | Select-Object -First 1
         if ($null -eq $existing) {
             [void]$records.Add($incoming)
             continue
         }
 
-        if ([string]$existing.Status -eq "resolved") {
+        if ([string]$existing.Status -in @("resolved", "superseded", "duplicate")) {
             $existing.Status = "open"
             $existing.RecurrenceCount = [int]$existing.RecurrenceCount + 1
+            $existing.FixAttempts = 0
+            $existing.FixerThreadId = ""
             $existing.Verification = $null
             $existing.ResolutionCommit = ""
-        }
-        elseif ([string]$existing.Status -in @("superseded", "duplicate")) {
-            continue
         }
         $existing.LastSeenReview = $ReviewId
         $existing.LastSeenHead = $Head
@@ -258,7 +259,7 @@ function Get-ReviewLoopTriggerCandidates {
         }
     }
 
-    return @($candidates | Sort-Object { $_.Finding.Id })
+    return @($candidates | Sort-Object { $_.Finding.Id } | Select-Object -First 20)
 }
 
 function New-ReviewLoopState {
@@ -267,7 +268,9 @@ function New-ReviewLoopState {
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$ReviewBase,
         [Parameter(Mandatory = $true)][string]$Speed,
-        [Parameter(Mandatory = $true)][string]$RunRoot
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [string]$ReviewBaseCommit = "",
+        [string]$ExecutionFingerprint = ""
     )
 
     $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
@@ -278,6 +281,8 @@ function New-ReviewLoopState {
         RepoPath = $repo
         Branch = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("branch", "--show-current")
         ReviewBase = $ReviewBase
+        ReviewBaseCommit = $ReviewBaseCommit
+        ExecutionFingerprint = $ExecutionFingerprint
         Speed = $Speed
         StartHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
         CurrentHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
@@ -292,6 +297,7 @@ function New-ReviewLoopState {
         ArchitectureRevision = 0
         ActiveStrategy = $null
         LastFixerResult = $null
+        PendingCommit = $null
         BlockedReason = ""
         RoleCalls = @()
         CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")
