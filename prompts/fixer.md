@@ -5,6 +5,9 @@ Rules:
 - Keep the correction bounded to the demonstrated root cause and invariant.
 - Do not broaden architecture or fix unrelated findings.
 - Add or strengthen a targeted regression test that fails before and passes after the correction.
+- Before finalizing, inspect the actual diff for regressions in directly affected cleanup, acknowledgement, rollback, retry, cancellation, ownership, and complexity lifecycles.
+- Keep retained state and repeated work bounded by current affected state. Necessary work proportional to the corrected value is acceptable.
+- On a resumed attempt, address every verifier regression in the supplied feedback together without reopening the original finding.
 - You may run any useful build or test command while working.
 - Return exactly one structured `targetedTest` for independent execution by the orchestrator.
 - `filePath` may name any repository-appropriate executable or wrapper. Put every argument in `arguments`; use `pwsh` with `-Command` explicitly when shell syntax is required.

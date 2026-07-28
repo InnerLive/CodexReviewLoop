@@ -287,9 +287,13 @@ function Get-ReviewLoopTriggerCandidates {
     $component = ConvertTo-ReviewLoopCanonicalText $Finding.Component
     $cause = ConvertTo-ReviewLoopCanonicalText $Finding.RootCause
     $invariant = ConvertTo-ReviewLoopCanonicalText $Finding.Invariant
+    $primaryPath = ConvertTo-ReviewLoopCanonicalText $Finding.Path
     $paths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in @($Finding.FixPaths)) {
-        $paths.Add((ConvertTo-ReviewLoopCanonicalText $path)) | Out-Null
+        $canonicalPath = ConvertTo-ReviewLoopCanonicalText $path
+        if (-not [string]::IsNullOrWhiteSpace($canonicalPath)) {
+            $paths.Add($canonicalPath) | Out-Null
+        }
     }
 
     $candidates = foreach ($candidate in @($Ledger.Findings)) {
@@ -300,13 +304,19 @@ function Get-ReviewLoopTriggerCandidates {
         $sameComponent = -not [string]::IsNullOrWhiteSpace($component) -and $component -eq (ConvertTo-ReviewLoopCanonicalText $candidate.Component)
         $sameCause = -not [string]::IsNullOrWhiteSpace($cause) -and $cause -eq (ConvertTo-ReviewLoopCanonicalText $candidate.RootCause)
         $sameInvariant = -not [string]::IsNullOrWhiteSpace($invariant) -and $invariant -eq (ConvertTo-ReviewLoopCanonicalText $candidate.Invariant)
-        $sameCluster = [string]$Finding.ClusterId -eq [string]$candidate.ClusterId
-        $overlap = @($candidate.FixPaths | Where-Object { $paths.Contains((ConvertTo-ReviewLoopCanonicalText $_)) }).Count -gt 0
+        $clusterId = [string]$Finding.ClusterId
+        $sameCluster = -not [string]::IsNullOrWhiteSpace($clusterId) -and
+            $clusterId -eq [string]$candidate.ClusterId
+        $candidatePrimaryPath = ConvertTo-ReviewLoopCanonicalText $candidate.Path
+        $overlap = @($candidate.FixPaths | Where-Object {
+            $candidateFixPath = ConvertTo-ReviewLoopCanonicalText $_
+            $paths.Contains($candidateFixPath) -and
+                -not ($candidateFixPath -eq $primaryPath -and
+                    $candidateFixPath -eq $candidatePrimaryPath)
+        }).Count -gt 0
 
-        # These are candidates only. Path overlap never decides the relationship.
-        if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster -or $overlap -or
-            (ConvertTo-ReviewLoopCanonicalText $Finding.Path) -eq
-                (ConvertTo-ReviewLoopCanonicalText $candidate.Path)) {
+        # These are candidates only. No signal decides the relationship by itself.
+        if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster -or $overlap) {
             $score = @($sameCause, $sameInvariant, $sameCluster, $sameComponent, $overlap |
                 Where-Object { $_ }).Count
             [pscustomobject]@{

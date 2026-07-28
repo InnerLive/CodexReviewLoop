@@ -365,30 +365,6 @@ Describe "Global CLI arguments" {
         }) | Should Be $true
     }
 
-    It "builds native review arguments" {
-        $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Mode Review -ReviewBase main
-        ($args -join " ") | Should Match 'review --base main$'
-        $args[-1] | Should Be "main"
-        ($args -contains "-") | Should Be $false
-    }
-
-    It "passes native review instructions through config instead of a positional prompt" {
-        $instructions = "Focus on races.`nPreserve `"quoted text`"."
-        $args = Get-CodexRoleArguments `
-            -RepoPath $repo.FullName -Model m -Thinking low `
-            -Mode Review -ReviewBase main -DeveloperInstructions $instructions
-        $joined = $args -join "`n"
-
-        $joined | Should Match "developer_instructions="
-        $joined | Should Match "Focus on races"
-        $args[-1] | Should Be "main"
-        ($args -contains "-") | Should Be $false
-    }
-
-    It "requires a review base" {
-        (Test-Throws { Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Mode Review }) | Should Be $true
-    }
-
     It "builds resume arguments with the same tier" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking medium -Speed fast -Mode Resume -ThreadId thread-1
         ($args -join " ") | Should Match 'service_tier="fast".*resume thread-1 -$'
@@ -552,12 +528,12 @@ Describe "Semantic trigger candidates" {
         @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 1
     }
 
-    It "selects the same path as a candidate without deciding its relation" {
+    It "does not select the same primary path without another semantic signal" {
         Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path same -Component one -RootCause x -Invariant a),
-            (New-TestFinding -Path same -Component two -RootCause y -Invariant b)
+            (New-TestFinding -Path same -Component one -RootCause x -Invariant a -FixPaths @("same")),
+            (New-TestFinding -Path same -Component two -RootCause y -Invariant b -FixPaths @("same"))
         ) -ReviewId r -Head h | Out-Null
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 1
+        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 0
     }
 
     It "excludes duplicate findings" {
@@ -588,7 +564,9 @@ Describe "Verifier evidence matching" {
             $fixer = [pscustomobject]@{ testExecution = [pscustomobject]@{ Passed = $true } }
             $verification = [pscustomobject]@{
                 verdict = "resolved"
+                patchSafety = "safe"
                 confidence = "high"
+                regressions = @()
                 evidence = @([pscustomobject]@{ path = "README.txt"; line = 1; claim = "fixed" })
             }
             Test-ReviewLoopResolvedWithTestEvidence `
@@ -609,7 +587,9 @@ Describe "Verifier evidence matching" {
                 }) `
                 -VerificationResult ([pscustomobject]@{
                     verdict = "resolved"
+                    patchSafety = "safe"
                     confidence = "high"
+                    regressions = @()
                     evidence = @([pscustomobject]@{ path = "README.txt"; line = 1; claim = "claimed" })
                 }) `
                 -RepoPath $repository
@@ -747,21 +727,6 @@ Describe "Fake Codex integration" {
         Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt "hello prompt" -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
         $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
         $record.prompt | Should Be "hello prompt"
-    }
-
-    It "keeps native review instructions out of the positional prompt" {
-        $call = Invoke-CodexCliRole `
-            -Role Reviewer -RepoPath $repo.FullName -Model model -Thinking high `
-            -Prompt "Focus on contract regressions." -LogRoot $logRoot `
-            -Mode Review -ReviewBase HEAD -CodexPath $fakeCodex
-        $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
-        $arguments = @($record.arguments)
-
-        $call.Success | Should Be $true
-        $record.prompt | Should Be ""
-        ($arguments -join "`n") | Should Match "developer_instructions=.*Focus on contract regressions"
-        $arguments[-1] | Should Be "HEAD"
-        ($arguments -contains "-") | Should Be $false
     }
 
     It "passes standard to the fake CLI" {
@@ -1313,8 +1278,8 @@ Describe "End-to-end orchestration with fake Codex" {
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"cache defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs","tests/A.Tests.cs"]}]}'
         $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt","fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $stillOpen = '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still open","evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $stillOpen = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $findingReview,
             $fixChanged, $stillOpen,
@@ -1355,14 +1320,14 @@ Describe "End-to-end orchestration with fake Codex" {
         $twoFindings = '{"schemaVersion":"1.0","classification":"findings","summary":"two","findings":[{"priority":"P1","title":"first","path":"src/A.cs","line":10,"component":"shared","rootCause":"cause-a","invariant":"invariant-a","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second","path":"src/B.cs","line":20,"component":"shared","rootCause":"cause-b","invariant":"invariant-b","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
         $firstId = Get-ReviewLoopFindingId `
             -Path "src/A.cs" -Component "shared" -RootCause "cause-a" -Invariant "invariant-a"
-        $triggerArchitecture = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
+        $triggerArchitecture = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
         $architectureId = Get-ReviewLoopFindingId `
             -Path "src/B.cs" -Component "shared" -RootCause "cause-b" -Invariant "invariant-b"
         $proposal = '{"schemaVersion":"1.0","recommendation":"consolidation","summary":"shared","sharedRootCause":"contract","minimalAlternative":"two points","findings":[{"findingId":"' + $firstId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"},{"findingId":"' + $architectureId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"}],"steps":[{"path":"src/Shared.cs","change":"centralize","productionCode":true,"findingIds":["' + $firstId + '","' + $architectureId + '"],"regressionTest":"test"}],"risks":[],"breaksPublicContract":false}'
         $approve = '{"schemaVersion":"1.0","decision":"approve","confidence":"high","rationale":"complete","coherentRootCause":true,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":true,"missingPaths":[],"requiredChanges":[]}'
         $reject = '{"schemaVersion":"1.0","decision":"reject_to_point_fix","confidence":"high","rationale":"artificial","coherentRootCause":false,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":false,"missingPaths":[],"requiredChanges":[]}'
         $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $twoFindings,
             $triggerArchitecture, $triggerArchitecture,
@@ -1395,13 +1360,13 @@ Describe "End-to-end orchestration with fake Codex" {
         $twoFindings = '{"schemaVersion":"1.0","classification":"findings","summary":"two","findings":[{"priority":"P1","title":"first","path":"src/A.cs","line":10,"component":"shared","rootCause":"cause-a","invariant":"invariant-a","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second","path":"src/B.cs","line":20,"component":"shared","rootCause":"cause-b","invariant":"invariant-b","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
         $firstId = Get-ReviewLoopFindingId `
             -Path "src/A.cs" -Component "shared" -RootCause "cause-a" -Invariant "invariant-a"
-        $triggerArchitecture = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
+        $triggerArchitecture = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
         $architectureId = Get-ReviewLoopFindingId `
             -Path "src/B.cs" -Component "shared" -RootCause "cause-b" -Invariant "invariant-b"
         $proposal = '{"schemaVersion":"1.0","recommendation":"consolidation","summary":"shared","sharedRootCause":"contract","minimalAlternative":"two points","findings":[{"findingId":"' + $firstId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"},{"findingId":"' + $architectureId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"}],"steps":[{"path":"src/Shared.cs","change":"centralize","productionCode":true,"findingIds":["' + $firstId + '","' + $architectureId + '"],"regressionTest":"test"}],"risks":[],"breaksPublicContract":false}'
         $revise = '{"schemaVersion":"1.0","decision":"revise","confidence":"high","rationale":"missing path","coherentRootCause":true,"allFindingsCovered":false,"allRequiredPathsCovered":false,"minimalEnough":true,"missingPaths":["src/Missing.cs"],"requiredChanges":["add missing path"]}'
         $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $twoFindings,
             $triggerArchitecture, $triggerArchitecture,
@@ -1470,9 +1435,9 @@ Describe "End-to-end orchestration with fake Codex" {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "dirty"
 
-        $stillOpen = '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still open","evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
+        $stillOpen = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
         $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $stillOpen, $fixChanged, $resolved,
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
@@ -1544,7 +1509,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "dirty"
 
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $resolved,
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',

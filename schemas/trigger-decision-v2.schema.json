@@ -3,7 +3,7 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "schemaVersion": { "type": "string", "const": "1.0" },
+    "schemaVersion": { "type": "string", "const": "2.0" },
     "decisions": {
       "type": "array",
       "items": {
@@ -17,12 +17,14 @@
               "same_root_cause",
               "same_contract_different_edge",
               "regression_from_fix",
-              "independent_same_file",
-              "resolved_or_obsolete",
+              "independent",
               "insufficient_evidence"
             ]
           },
-          "architectureRecommended": { "type": "boolean" },
+          "candidateStatus": {
+            "type": "string",
+            "enum": ["active", "resolved", "obsolete", "unknown"]
+          },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
           "rationale": { "type": "string" },
           "evidence": {
@@ -40,8 +42,12 @@
           }
         },
         "required": [
-          "candidateFindingId", "relation", "architectureRecommended",
-          "confidence", "rationale", "evidence"
+          "candidateFindingId",
+          "relation",
+          "candidateStatus",
+          "confidence",
+          "rationale",
+          "evidence"
         ]
       }
     }

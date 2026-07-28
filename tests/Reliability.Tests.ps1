@@ -135,10 +135,9 @@ Describe "Unattended reliability boundaries" {
         ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
     }
 
-    It "ignores personal config for exec review and resume" {
+    It "ignores personal config for exec and resume" {
         $calls = @(
             ,@(Get-CodexRoleArguments -RepoPath $repo -Model m -Thinking low)
-            ,@(Get-CodexRoleArguments -RepoPath $repo -Model m -Thinking low -Mode Review -ReviewBase HEAD)
             ,@(Get-CodexRoleArguments -RepoPath $repo -Model m -Thinking low -Mode Resume -ThreadId t)
         )
         foreach ($arguments in $calls) {
@@ -631,9 +630,9 @@ Describe "Unattended reliability boundaries" {
         $finding = $ledger.Findings[0]
         $candidates = @(Get-ReviewLoopTriggerCandidates -Finding $finding -Ledger $ledger)
         $candidateId = [string]$candidates[0].Finding.Id
-        $primary = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"shared","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
-        $medium = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"medium","rationale":"uncertain","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
-        $tie = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"confirmed","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
+        $primary = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"shared","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
+        $medium = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"medium","rationale":"uncertain","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
+        $tie = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"confirmed","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
         $sequence = Join-Path $caseRoot "trigger-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($primary, $medium, $tie)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
@@ -658,9 +657,9 @@ Describe "Unattended reliability boundaries" {
         $incoming = New-ReliabilityFinding
         $incoming.rootCause = "dependency changes are not observed"
         $incoming.invariant = "cached values must be invalidated when dependencies change"
-        $decision = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' +
+        $decision = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' +
             $existingId +
-            '","relation":"same_root_cause","architectureRecommended":false,"confidence":"high","rationale":"same defect expressed differently","evidence":[{"path":"README.txt","line":1,"claim":"same behavior"}]}]}'
+            '","relation":"same_root_cause","candidateStatus":"active","confidence":"high","rationale":"same defect expressed differently","evidence":[{"path":"README.txt","line":1,"claim":"same behavior"}]}]}'
         $sequence = Join-Path $caseRoot "identity-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($decision, $decision)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
@@ -694,11 +693,11 @@ Describe "Unattended reliability boundaries" {
         $incoming = New-ReliabilityFinding
         $incoming.rootCause = "unrelated parser validation"
         $incoming.invariant = "invalid syntax must be rejected"
-        $decision = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' +
+        $decision = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' +
             $existingId +
-            '","relation":"independent_same_file","architectureRecommended":false,"confidence":"high","rationale":"different contract","evidence":[{"path":"README.txt","line":1,"claim":"independent behavior"}]}]}'
+            '","relation":"independent","candidateStatus":"active","confidence":"high","rationale":"different contract","evidence":[{"path":"README.txt","line":1,"claim":"independent behavior"}]}]}'
         $sequence = Join-Path $caseRoot "independent-results.json"
-        Write-ReliabilityJsonArray -Path $sequence -Values @($decision, $decision)
+        Write-ReliabilityJsonArray -Path $sequence -Values @($decision)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
         $runRoot = Join-Path $caseRoot "independent-run"
         New-Item -ItemType Directory -Path $runRoot | Out-Null
@@ -717,6 +716,121 @@ Describe "Unattended reliability boundaries" {
             -ReviewId r2 -Head $state.CurrentHead | Out-Null
 
         @($ledger.Findings).Count | Should Be 2
+        @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })).Count | Should Be 1
+    }
+
+    It "assesses architecture for one active finding related to resolved history" {
+        $finding = [pscustomobject]@{
+            RecurrenceCount = 0
+            Relations = @([pscustomobject]@{
+                candidateFindingId = "F-history"
+                relation = "same_contract_different_edge"
+                candidateStatus = "resolved"
+                confidence = "high"
+                rationale = "same contract"
+                evidence = @()
+            })
+        }
+        $trigger = & (Get-Module CodexReviewLoop) {
+            param($value)
+            Get-ReviewLoopArchitectureTrigger -Findings @($value)
+        } $finding
+
+        $trigger.ArchitectureRecommended | Should Be $true
+        $trigger.Relation | Should Be "same_contract_different_edge"
+    }
+
+    It "rejects extra trigger decisions and strips nested relation history" {
+        $finding = [pscustomobject]@{
+            Id = "F-current"
+            Status = "open"
+            ResolutionCommit = ""
+            Path = "README.txt"
+            Line = 1
+            Component = "cache"
+            RootCause = "cause"
+            Invariant = "invariant"
+            Evidence = "evidence"
+            Reproduction = "reproduction"
+            FixPaths = @("README.txt")
+            Relations = @([pscustomobject]@{ candidateFindingId = "F-nested" })
+        }
+        $result = [pscustomobject]@{
+            decisions = @(
+                [pscustomobject]@{ candidateFindingId = "F-expected" },
+                [pscustomobject]@{ candidateFindingId = "F-nested" }
+            )
+        }
+        $module = Get-Module CodexReviewLoop
+        $payload = & $module {
+            param($value)
+            ConvertTo-ReviewLoopRelationFindingPayload -Finding $value
+        } $finding
+        $shapeValid = & $module {
+            param($value)
+            Test-ReviewLoopTriggerResultShape -Result $value -CandidateIds @("F-expected")
+        } $result
+
+        ($payload.PSObject.Properties.Name -contains "Relations") | Should Be $false
+        $shapeValid | Should Be $false
+    }
+
+    It "uses normal exec for the production reviewer and returns structured output once" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $runRoot = Join-Path $caseRoot "reviewer-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot -ReviewBaseCommit $head
+        $state.ReviewCycle = 1
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+
+        $review = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger, $repository, $logs, $fake)
+            Invoke-ReviewLoopReview -Config $profile -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -RepoPath $repository -Speed standard -RunRoot $logs -CodexPath $fake
+        } $config $state $statePath $ledger $repo $runRoot $fakeCodex
+
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $review.Result.classification | Should Be "clean"
+        $records.Count | Should Be 1
+        $records[0].callKind | Should Be "exec"
+        (@($records[0].arguments) -contains "review") | Should Be $false
+    }
+
+    It "rejects a resolved finding when the patch introduced regressions" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $runRoot = Join-Path $caseRoot "unsafe-verifier-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.ActiveClusterId = "unsafe-patch"
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $fixerCall = [pscustomobject]@{
+            StructuredResult = [pscustomobject]@{
+                testExecution = [pscustomobject]@{ Passed = $true }
+            }
+        }
+        $unsafe = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"regression_detected","confidence":"high","rationale":"original fixed but patch is unsafe","regressions":[{"title":"retained history","path":"README.txt","line":1,"invariant":"state remains bounded","rationale":"history grows without bound"},{"title":"repeated work","path":"README.txt","line":1,"invariant":"work follows current state","rationale":"all prior entries are rescanned"}],"evidence":[{"path":"README.txt","line":1,"claim":"the patch retains historical state"}]}'
+        $sequence = Join-Path $caseRoot "unsafe-verifier-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @($unsafe)
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+
+        $verification = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
+            Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
+                -FixerCall $fixer -Attempt 1 -CodexPath $fake
+        } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
+
+        $verification.Accepted | Should Be $false
+        $verification.Result.patchSafety | Should Be "regression_detected"
+        @($verification.Result.regressions).Count | Should Be 2
+        @($verification.Calls).Count | Should Be 1
     }
 
     It "returns inconclusive resolved adjudication without orchestrator test evidence" {
@@ -732,8 +846,8 @@ Describe "Unattended reliability boundaries" {
                 testExecution = [pscustomobject]@{ Passed = $false }
             }
         }
-        $primary = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"medium","rationale":"maybe","evidence":[{"path":"README.txt","line":1,"claim":"maybe fixed"}]}'
-        $wrong = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"claimed","evidence":[{"path":"README.txt","line":1,"claim":"claimed fixed"}]}'
+        $primary = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"medium","rationale":"maybe","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"maybe fixed"}]}'
+        $wrong = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"claimed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"claimed fixed"}]}'
         $sequence = Join-Path $caseRoot "verifier-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($primary, $wrong, $wrong)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
@@ -811,7 +925,7 @@ Describe "Unattended reliability boundaries" {
                 testExecution = [pscustomobject]@{ Passed = $true }
             }
         }
-        $result = '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still present","evidence":[{"path":"README.txt","line":1,"claim":"current path remains"}]}'
+        $result = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still present","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"current path remains"}]}'
         $sequence = Join-Path $caseRoot "large-verifier-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($result)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
@@ -1333,7 +1447,7 @@ Describe "Unattended reliability boundaries" {
         Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "partial"
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $fix = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         $resultSequence = Join-Path $caseRoot "results.json"
         Write-ReliabilityJsonArray -Path $resultSequence -Values @(
             $fix,

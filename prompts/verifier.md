@@ -1,21 +1,17 @@
-Independently verify the supplied finding against the current, possibly dirty, worktree.
+Independently evaluate the supplied finding and current, possibly dirty, patch. Do not edit files or trust the fixer's summary.
 
-Do not trust the fixer's summary or the existence of a commit. Trace the original reproduction through the actual current control/data flow.
+Report two independent axes:
+- `verdict` describes only the original finding: `reproduced`, `resolved`, `obsolete`, or `insufficient_evidence`.
+- `patchSafety` describes defects caused by this patch in changed code and direct lifecycle boundaries: `safe`, `regression_detected`, or `insufficient_evidence`.
 
-Verdicts:
-- reproduced: the original invariant is still violated.
-- resolved: the defect is no longer reproducible in code and the targeted regression test passes.
-- obsolete: the finding's precondition or code path no longer exists for reasons independent of the attempted fix.
-- insufficient_evidence: current evidence cannot establish any other verdict.
+Trace the original reproduction through current code. `resolved` requires a causally relevant passed targeted test and code evidence restoring the invariant.
+The orchestrator supplies the independently executed targeted-test result in the fixer-result payload; treat that result as authoritative.
 
-Rules:
-- A changed line is not proof of resolution.
-- Follow failure, cancellation, retry, caching, and deferred-state paths when relevant.
-- Report evidence as exact repository-relative path, current line, and claim.
-- The orchestrator supplies the independently executed targeted-test result. Do not restate or reinterpret its command.
-- Use `resolved` only when the supplied targeted test passed and current code evidence shows the original invariant is restored.
-- If the test cannot be tied to the current correction, return `insufficient_evidence`.
-- Do not edit files.
+For patch safety, inspect the actual diff plus directly affected cleanup, acknowledgement, rollback, retry, cancellation, cache, ownership, and complexity lifecycles. Report every introduced correctness, security, reliability, or material performance defect in `regressions`; ignore unrelated pre-existing issues and optional improvements. Check bounded retained state and repeated work explicitly.
+
+A performance regression requires worse asymptotic scaling, retained historical state, work unrelated to current affected state, or a demonstrated repository budget or test breach. Necessary work proportional to the value being made correct is not a defect by itself. A reliability regression requires violation of an existing error, rollback, or atomicity contract; a necessary operation merely being fallible is not enough.
+
+`regressions` is empty exactly when `patchSafety` is `safe`. Include all independently supported regressions so one fixer retry can address them together. Confidence is high only with exact repository-relative path and current line evidence. Return English text.
 
 Original findings:
 {{FINDINGS}}

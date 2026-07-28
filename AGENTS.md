@@ -50,11 +50,11 @@ the requirement.
 
 - All model interactions go through the locally installed and authenticated
   Codex CLI.
-- Never add a direct OpenAI HTTP/API path, an `OPENAI_API_KEY` dependency, or an
+- Never add a direct OpenAI HTTP/API path, an API credential dependency, or an
   API fallback.
-- The tool must remain repository-agnostic. Do not add PKonf product knowledge,
-  PKonf files, or any other reviewed repository as a runtime dependency.
-- Historical PKonf logs and findings may be used only as read-only regression
+- The tool must remain repository-agnostic. Do not add product knowledge, files
+  from a reviewed repository, or any reviewed repository as a runtime dependency.
+- Historical external logs and findings may be used only as read-only regression
   and prompt-evaluation evidence.
 - Public repository content is written in English.
 - The canonical implementation is the modular root CLI. Do not create a second
@@ -147,12 +147,12 @@ The current quality/cost allocation is intentional:
 | Trigger Judge | `gpt-5.6-luna` | `low` |
 | Trigger Confirmation | `gpt-5.6-sol` | `low` |
 | Trigger Tie-Break | `gpt-5.6-terra` | `medium` |
-| Architect | `gpt-5.6-sol` | `max` |
+| Architect | `gpt-5.6-sol` | `high` |
 | Architecture Critic | `gpt-5.6-terra` | `medium` |
 | Architecture Veto | `gpt-5.6-sol` | `medium` |
 | Architecture Tie-Break | `gpt-5.6-terra` | `high` |
 | Point Fixer | `gpt-5.6-sol` | `high` |
-| Architecture Fixer | `gpt-5.6-sol` | `max` |
+| Architecture Fixer | `gpt-5.6-sol` | `high` |
 | Finding Verifier | `gpt-5.6-luna` | `low` |
 | Verifier Confirmation | `gpt-5.6-sol` | `low` |
 | Verifier Tie-Break | `gpt-5.6-terra` | `medium` |
@@ -161,11 +161,12 @@ The Reviewer emits the versioned review schema directly. Do not add a separate
 normalization model call without measured evidence that the additional cost
 improves correctness.
 
-Luna handles well-structured classification. Sol confirms architecture-positive
-or uncertain trigger decisions and verifier results that lack sufficient direct
-evidence. Terra resolves one disagreement. Persistent disagreement becomes a
-useful blocked checkpoint rather than an arbitrary decision or an endless
-debate.
+Luna handles well-structured classification. A supported high-confidence
+independent trigger result is accepted without another model call. Sol confirms
+related, uncertain, or structurally invalid trigger decisions and verifier
+results that lack sufficient direct evidence. Terra resolves one disagreement.
+Persistent disagreement becomes a useful blocked checkpoint rather than an
+arbitrary decision or an endless debate.
 
 ## Review and finding invariants
 
@@ -195,10 +196,13 @@ findings. Every commit or other HEAD change resets the counter.
 
 Architecture is optional remediation, not a mandatory ceremony.
 
-- Trigger relations are semantic: shared root cause, shared contract with a
-  different edge, regression from a fix, independent same-file defects,
-  obsolete/resolved evidence, or insufficient evidence.
+- Trigger decisions keep semantic relation and prior-finding lifecycle status
+  separate. Relations are shared root cause, shared contract with a different
+  edge, regression from a fix, independent, or insufficient evidence. Prior
+  status is active, resolved, obsolete, or unknown.
 - A shared path alone never justifies architecture.
+- Related resolved history and explicit recurrence may trigger an architecture
+  assessment for one active finding; they never force an architecture change.
 - `point_fix/no_architecture` is a valid and often preferable result.
 - Proposals compare the minimal fix with consolidation and trace every proposed
   step to evidence, affected paths, and regression tests.
@@ -226,8 +230,11 @@ epochs, or interactive proposal review.
 - The orchestrator executes the targeted test independently and records its
   real exit code and log.
 - A verifier reads the current repository and receives actual test evidence.
-- A direct high-confidence resolution needs matching passing test evidence and
-  current path/line evidence; otherwise use confirmation/adjudication.
+- Verification separates resolution of the original finding from patch safety.
+  A direct high-confidence resolution needs matching passing test evidence,
+  current path/line evidence, a safe patch verdict, and no reported regressions;
+  otherwise use confirmation/adjudication or the remaining fixer attempt.
+- Send every supported patch regression back to the same fixer thread together.
 - If two attempts fail, block that cluster and continue independent clusters.
 - Run configured host gates after verification and before every commit.
 - Recheck the patch after gates, stage the exact tree, create the commit from
@@ -267,7 +274,7 @@ input, cached input, and output tokens.
 
 ## Reliability and process lifecycle
 
-- Use one central CLI adapter for Exec, Review, and Resume.
+- Use one central CLI adapter for Exec and Resume.
 - Pass speed, model, reasoning, output schema, and developer instructions on
   every call, including resumed threads.
 - Capture thread ID as soon as it appears.

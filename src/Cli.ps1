@@ -44,8 +44,7 @@ function Get-CodexRoleArguments {
         [Parameter(Mandatory = $true)][string]$Model,
         [Parameter(Mandatory = $true)][string]$Thinking,
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
-        [ValidateSet("Exec", "Review", "Resume")][string]$Mode = "Exec",
-        [string]$ReviewBase = "",
+        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
         [string]$ThreadId = "",
         [string]$DeveloperInstructions = "",
         [string]$SchemaPath = "",
@@ -89,14 +88,6 @@ function Get-CodexRoleArguments {
     }
 
     switch ($Mode) {
-        "Review" {
-            if ([string]::IsNullOrWhiteSpace($ReviewBase)) {
-                throw "ReviewBase is required for a review call."
-            }
-            [void]$arguments.Add("review")
-            [void]$arguments.Add("--base")
-            [void]$arguments.Add($ReviewBase)
-        }
         "Resume" {
             if ([string]::IsNullOrWhiteSpace($ThreadId)) {
                 throw "ThreadId is required for a resume call."
@@ -761,8 +752,7 @@ function Invoke-CodexCliRole {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [string]$SchemaPath = "",
-        [ValidateSet("Exec", "Review", "Resume")][string]$Mode = "Exec",
-        [string]$ReviewBase = "",
+        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
         [string]$ThreadId = "",
         [string]$CodexPath = "",
         [ValidateRange(1, 5)][int]$MaxAttempts = 3,
@@ -810,13 +800,7 @@ function Invoke-CodexCliRole {
     $currentMode = $Mode
     $currentThreadId = $ThreadId
     $currentPrompt = $Prompt
-    $effectiveDeveloperInstructions = if ($Mode -eq "Review" -and
-        [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
-        $Prompt
-    }
-    else {
-        $DeveloperInstructions
-    }
+    $effectiveDeveloperInstructions = $DeveloperInstructions
     $lastThreadId = $ThreadId
     $arguments = @()
 
@@ -830,7 +814,6 @@ function Invoke-CodexCliRole {
             -Thinking $Thinking `
             -Speed $Speed `
             -Mode $currentMode `
-            -ReviewBase $ReviewBase `
             -ThreadId $currentThreadId `
             -DeveloperInstructions $effectiveDeveloperInstructions `
             -SchemaPath $SchemaPath `
@@ -846,7 +829,7 @@ function Invoke-CodexCliRole {
                 -DisplayName $Role `
                 -StdoutPath $jsonlPath `
                 -StderrPath $stderrPath `
-                -InputText $(if ($currentMode -eq "Review") { $null } else { $currentPrompt }) `
+                -InputText $currentPrompt `
                 -EventKind Codex `
                 -AppendLogs:($attempt -gt 1) `
                 -TimeoutSeconds $TimeoutSeconds
@@ -1027,7 +1010,7 @@ The previous $Role turn was rejected for a technical reason: $failureReason
 Do not repeat completed investigation or edits. Correct the operational problem, inspect the current worktree, and return a valid final result for the original task.
 "@
         }
-        elseif ($Mode -ne "Review") {
+        else {
             $currentMode = $Mode
             $currentPrompt = @"
 The previous $Role process failed before a thread ID was available: $failureReason

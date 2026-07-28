@@ -3,13 +3,32 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "schemaVersion": { "type": "string", "const": "1.0" },
+    "schemaVersion": { "type": "string", "const": "2.0" },
     "verdict": {
       "type": "string",
       "enum": ["reproduced", "resolved", "obsolete", "insufficient_evidence"]
     },
+    "patchSafety": {
+      "type": "string",
+      "enum": ["safe", "regression_detected", "insufficient_evidence"]
+    },
     "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
     "rationale": { "type": "string" },
+    "regressions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" },
+          "path": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "invariant": { "type": "string" },
+          "rationale": { "type": "string" }
+        },
+        "required": ["title", "path", "line", "invariant", "rationale"]
+      }
+    },
     "evidence": {
       "type": "array",
       "items": {
@@ -25,7 +44,12 @@
     }
   },
   "required": [
-    "schemaVersion", "verdict", "confidence", "rationale",
+    "schemaVersion",
+    "verdict",
+    "patchSafety",
+    "confidence",
+    "rationale",
+    "regressions",
     "evidence"
   ]
 }

@@ -1,6 +1,6 @@
 # Codex Review Loop
 
-Codex Review Loop orchestrates native Codex reviews, semantic architecture
+Codex Review Loop orchestrates structured Codex reviews, semantic architecture
 decisions, bounded fix attempts, and independent verification exclusively
 through the locally installed Codex CLI.
 
@@ -69,18 +69,20 @@ flowchart TD
     passes -- Yes --> done([Complete])
     passes -- No --> review
 
-    clean -- No --> identity[Adjudicate identities<br/>and semantic clusters]
-    identity --> architecture{Architecture justified?}
-    architecture -- Yes --> gate[Proposal, critic, veto<br/>one revision at most]
-    architecture -- "No or uncertain" --> fix[Point fixer]
-    gate -- Approved --> fix
-    gate -- Rejected --> fix
+    clean -- No --> identity[Ledger identity<br/>relation + prior status]
+    identity --> architecture{Related history<br/>or recurrence?}
+    architecture -- Yes --> gate[Architect assessment<br/>critic + veto]
+    architecture -- No --> fix[Point fixer]
+    gate -- "Architecture approved" --> afix[Architecture fixer]
+    gate -- "Point fix / rejected" --> fix
 
-    fix --> test[Orchestrator runs<br/>the targeted test]
+    afix --> test[Orchestrator runs<br/>the targeted test]
+    fix --> test
     test --> verify[Independent verifier]
-    verify -- Resolved --> host[Host gates and atomic commit]
+    verify --> accepted{Original resolved<br/>and patch safe?}
+    accepted -- Yes --> host[Host gates and atomic commit]
     host --> review
-    verify -- "Open or uncertain" --> retry{Attempt remaining?}
+    accepted -- No --> retry{Attempt remaining?}
     retry -- Yes --> fix
     retry -- No --> blocked[Block this cluster]
     blocked --> more{Independent cluster?}
@@ -88,15 +90,21 @@ flowchart TD
     more -- No --> review
 ```
 
-The Reviewer emits the versioned review schema directly. Every new finding is
-compared with plausible ledger candidates by Luna and Sol. Terra adjudicates
-only disagreements. High-confidence `same_root_cause` results reuse the stable
-finding identity even when the wording changed; independent defects in the same
-file remain separate. The same durable relations form remediation clusters, so
-identity and architecture decisions cannot drift apart.
+The Reviewer emits the versioned review schema directly through normal
+`codex exec`; it does not run the native free-form review command and then
+spend another turn converting that output. Luna compares each new finding with
+plausible ledger candidates. A supported high-confidence independent result is
+accepted directly; related, uncertain, or structurally invalid results receive
+Sol confirmation, and Terra adjudicates only remaining disagreements. Relation
+and prior-finding status are separate fields, so fixed history can still reveal
+a recurring contract without being mistaken for a currently open finding.
+High-confidence `same_root_cause` results reuse the stable finding identity even
+when the wording changed. Independent defects in the same file remain separate.
 
-Architecture is optional. Uncertain, incomplete, excessive, or rejected
-architecture proposals fall back to a bounded point fix instead of stopping the
+Related active or resolved history and explicit recurrence trigger an
+architecture assessment, not an automatic architecture change. The Architect
+may choose `point_fix` or `no_architecture`. Uncertain, incomplete, excessive,
+or rejected proposals fall back to a bounded point fix instead of stopping the
 whole run. One proposal revision is allowed. Each semantic cluster has two
 automatic fix attempts and its own fixer thread. Attempt two and technical
 corrections resume that thread.
@@ -113,11 +121,14 @@ A fixer returns one structured targeted test:
 
 Any executable or repository wrapper is valid. The orchestrator resolves and
 runs it, records the actual exit code and log, and supplies that evidence to the
-verifier. The model cannot declare the test passed. A high-confidence resolved
-verdict also needs current path-and-line evidence. Uncertainty consumes the
-remaining fixer attempt; after two unsuccessful attempts only that cluster is
-blocked, and independent clusters continue. Configured host gates run before
-every commit.
+verifier. The model cannot declare the test passed. Verification reports two
+independent results: whether the original finding is resolved and whether the
+current patch introduced a regression. Acceptance requires both a
+high-confidence resolved verdict with current path-and-line evidence and a safe
+patch with no supported regressions. All detected regressions are returned to
+the same fixer thread together. Uncertainty consumes the remaining fixer
+attempt; after two unsuccessful attempts only that cluster is blocked, and
+independent clusters continue. Configured host gates run before every commit.
 
 There is no command allowlist or per-role sandbox setting. Codex may use the
 repository-specific commands it needs. Fixers are allowed to edit the

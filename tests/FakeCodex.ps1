@@ -117,9 +117,6 @@ for ($index = 0; $index -lt $arguments.Count; $index++) {
     if ($arguments[$index] -ceq "-C" -and $index + 1 -lt $arguments.Count) {
         $repoPath = $arguments[$index + 1]
     }
-    if ($arguments[$index] -eq "review") {
-        $callKind = "review"
-    }
     if ($arguments[$index] -eq "resume") {
         $callKind = "resume"
         if ($index + 1 -lt $arguments.Count) {
@@ -128,7 +125,6 @@ for ($index = 0; $index -lt $arguments.Count; $index++) {
     }
 }
 
-$isBaseReview = ($arguments -contains "review") -and ($arguments -contains "--base")
 if (-not [string]::IsNullOrWhiteSpace($logPath)) {
     $record = [pscustomobject]@{
         invocationId = [Guid]::NewGuid().ToString("N")
@@ -143,11 +139,6 @@ if (-not [string]::IsNullOrWhiteSpace($logPath)) {
         $logPath,
         (($record | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine),
         [System.Text.UTF8Encoding]::new($false))
-}
-
-if ($isBaseReview -and (($arguments -contains "-") -or -not [string]::IsNullOrEmpty($prompt))) {
-    [Console]::Error.WriteLine("error: the argument '--base <BRANCH>' cannot be used with '[PROMPT]'")
-    exit 2
 }
 
 if (-not [string]::IsNullOrWhiteSpace($stderrText) -and [string]::IsNullOrWhiteSpace($stderrDelayText)) {
@@ -185,8 +176,8 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
             "review-result-v1.schema.json" {
                 '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
             }
-            "trigger-decision-v1.schema.json" {
-                '{"schemaVersion":"1.0","decisions":[]}'
+            "trigger-decision-v2.schema.json" {
+                '{"schemaVersion":"2.0","decisions":[]}'
             }
             "architecture-proposal-v1.schema.json" {
                 '{"schemaVersion":"1.0","recommendation":"point_fix","summary":"point","sharedRootCause":"","minimalAlternative":"point","findings":[],"steps":[],"risks":[],"breaksPublicContract":false}'
@@ -197,8 +188,8 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
             "fixer-result-v1.schema.json" {
                 '{"schemaVersion":"1.0","outcome":"no_change","summary":"none","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test"],"rationale":"targeted regression"},"remainingRisk":""}'
             }
-            "verifier-result-v1.schema.json" {
-                '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still present","evidence":[]}'
+            "verifier-result-v2.schema.json" {
+                '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still present","regressions":[],"evidence":[]}'
             }
             default {
                 '{}'

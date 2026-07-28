@@ -372,12 +372,12 @@ $($hostGates -join "`n")
         TriggerJudge = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
         TriggerConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
         TriggerTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
-        Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'max' }
+        Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         ArchitectureCritic = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
         ArchitectureVeto = @{ Model = 'gpt-5.6-sol'; Thinking = 'medium' }
         ArchitectureTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'high' }
         PointFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        ArchitectureFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'max' }
+        ArchitectureFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         FindingVerifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
         VerifierConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
         VerifierTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }

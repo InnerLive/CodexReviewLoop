@@ -505,6 +505,17 @@ function Add-ReviewLoopReciprocalRelations {
                 -Path ([string]$finding.path) -Component ([string]$finding.component) `
                 -RootCause ([string]$finding.rootCause) -Invariant ([string]$finding.invariant)
         }
+        $record = $Ledger.Findings | Where-Object {
+            [string]$_.Id -eq $recordId
+        } | Select-Object -First 1
+        $recordStatus = if ($null -eq $record) { "unknown" } else {
+            switch ([string]$record.Status) {
+                { $_ -in @("pending", "open", "fixing", "blocked") } { "active"; break }
+                "resolved" { "resolved"; break }
+                { $_ -in @("superseded", "duplicate") } { "obsolete"; break }
+                default { "unknown" }
+            }
+        }
         foreach ($relation in @($finding.relations)) {
             $candidate = $Ledger.Findings | Where-Object {
                 [string]$_.Id -eq [string]$relation.candidateFindingId
@@ -518,7 +529,7 @@ function Add-ReviewLoopReciprocalRelations {
             $reverse = [pscustomobject]@{
                 candidateFindingId = $recordId
                 relation = [string]$relation.relation
-                architectureRecommended = [bool]$relation.architectureRecommended
+                candidateStatus = $recordStatus
                 confidence = [string]$relation.confidence
                 rationale = [string]$relation.rationale
                 evidence = @($relation.evidence)
@@ -878,8 +889,9 @@ function Invoke-ReviewLoopAttemptAssessment {
     $targetedTest = $FixerCall.StructuredResult.targetedTest
     $targetedCommand = "$($targetedTest.filePath) $(@($targetedTest.arguments) -join ' ')".Trim()
     $targetedState = if ([bool]$FixerCall.StructuredResult.testExecution.Passed) { "passed" } else { "failed" }
+    $regressionCount = @($verification.Result.regressions).Count
     Write-ReviewLoopStatus `
-        -Message "Verifier: $($verification.Result.verdict) · Confidence $($verification.Result.confidence) · $($verification.Basis) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
+        -Message "Verifier: $($verification.Result.verdict) · Patch $($verification.Result.patchSafety) ($regressionCount regressions) · Confidence $($verification.Result.confidence) · $($verification.Basis) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
         -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
     Assert-ReviewLoopRepositoryUnchanged `
@@ -901,7 +913,9 @@ function Invoke-ReviewLoopAttemptAssessment {
         return [pscustomobject]@{ Completed = $false; Feedback = $completion.Feedback; RetrySameAttempt = $false }
     }
 
-    if ([string]$verification.Result.verdict -eq "obsolete" -and (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+    if ([string]$verification.Result.verdict -eq "obsolete" -and
+        [string]$verification.Result.patchSafety -eq "safe" -and
+        (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
         Set-ReviewLoopFindingsStatus -Findings $Findings -Status "superseded"
         foreach ($finding in $Findings) {
             $finding.Verification = $verification.Result
@@ -914,7 +928,7 @@ function Invoke-ReviewLoopAttemptAssessment {
     return [pscustomobject]@{
         Completed = $false
         RetrySameAttempt = $false
-        Feedback = "Verifier returned $($verification.Result.verdict) with $($verification.Result.confidence) confidence: $($verification.Result.rationale)"
+        Feedback = "Verifier returned a non-accepted result. Address every supported issue together. Structured result: $(ConvertTo-ReviewLoopJsonCompact $verification.Result)"
     }
 }
 
@@ -1060,6 +1074,36 @@ function Invoke-ReviewLoopFixWorkflow {
     return $false
 }
 
+function Get-ReviewLoopArchitectureTrigger {
+    param([Parameter(Mandatory = $true)][object[]]$Findings)
+
+    $relations = @($Findings | ForEach-Object { @($_.Relations) } | Where-Object {
+        [string]$_.confidence -eq "high"
+    })
+    $relatedRelations = @("same_root_cause", "same_contract_different_edge", "regression_from_fix")
+    $architectureRelations = @($relations | Where-Object {
+        [string]$_.relation -in $relatedRelations -and
+        [string]$_.candidateStatus -in @("active", "resolved")
+    })
+    $recurrent = @($Findings | Where-Object {
+        [int](Get-ReviewLoopObjectProperty -Object $_ -Name "RecurrenceCount" -Default 0) -gt 0
+    }).Count -gt 0
+    $recommended = $architectureRelations.Count -gt 0 -or $recurrent
+    $relation = if ($architectureRelations.Count -gt 0) {
+        [string]$architectureRelations[0].relation
+    }
+    elseif ($recurrent) { "same_root_cause" }
+    else { "independent" }
+
+    return [pscustomobject]@{
+        ArchitectureRecommended = $recommended
+        Relation = $relation
+        Confidence = "high"
+        Rationale = "Reused independently adjudicated semantic relations and recurrence history."
+        Relations = $relations
+    }
+}
+
 function Invoke-ReviewLoopCluster {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -1082,22 +1126,8 @@ function Invoke-ReviewLoopCluster {
     Write-ReviewLoopRule -Title "Finding-Cluster $($State.ActiveClusterId)" -Kind Review
     Write-ReviewLoopStatus -Message "$($Findings.Count) Finding(s): $(@($Findings | ForEach-Object { $_.Title }) -join '; ')" -Kind Review
 
-    $groupIds = @($Findings | ForEach-Object { [string]$_.Id })
-    $relations = @($Findings | ForEach-Object { @($_.Relations) } | Where-Object {
-        [string]$_.candidateFindingId -in $groupIds -and
-        [string]$_.confidence -eq "high"
-    })
-    $architectureRecommended = $Findings.Count -gt 1 -and @($relations | Where-Object {
-        [bool]$_.architectureRecommended -and
-        [string]$_.relation -in @("same_root_cause", "same_contract_different_edge")
-    }).Count -gt 0
-    $trigger = [pscustomobject]@{
-        ArchitectureRecommended = $architectureRecommended
-        Relation = if ($architectureRecommended) { "same_contract_different_edge" } else { "independent_same_file" }
-        Confidence = "high"
-        Rationale = "Reused the independently adjudicated ledger relations."
-        Relations = $relations
-    }
+    $trigger = Get-ReviewLoopArchitectureTrigger -Findings $Findings
+    $relations = @($trigger.Relations)
     $adjudication = "reused Luna + Sol$(if (@($relations | Where-Object { [string]$_.rationale -match 'adjudicat' }).Count -gt 0) { ' + Terra' } else { '' })"
     $triggerKind = if ($trigger.ArchitectureRecommended) { "Architecture" } elseif ($trigger.Confidence -eq "high") { "Info" } else { "Warning" }
     Write-ReviewLoopStatus `
@@ -1153,7 +1183,11 @@ function Get-ReviewLoopSemanticFindingGroups {
                 } | ForEach-Object { [string]$_.Id })
                 @($current.Relations | Where-Object {
                     [string]$_.confidence -eq "high" -and
-                    [string]$_.relation -in @("same_root_cause", "same_contract_different_edge")
+                    [string]$_.relation -in @(
+                        "same_root_cause",
+                        "same_contract_different_edge",
+                        "regression_from_fix"
+                    )
                 } | ForEach-Object { [string]$_.candidateFindingId })
             ) | Sort-Object -Unique
             foreach ($neighborId in $neighborIds) {

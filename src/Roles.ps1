@@ -70,8 +70,7 @@ function Invoke-ConfiguredCodexRole {
         [Parameter(Mandatory = $true)][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [string]$SchemaName = "",
-        [ValidateSet("Exec", "Review", "Resume")][string]$Mode = "Exec",
-        [string]$ReviewBase = "",
+        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
         [string]$ThreadId = "",
         [string]$CodexPath = "",
         [string]$CallId = "",
@@ -97,7 +96,6 @@ function Invoke-ConfiguredCodexRole {
         LogRoot = $LogRoot
         SchemaPath = $schemaPath
         Mode = $Mode
-        ReviewBase = $ReviewBase
         ThreadId = $ThreadId
         CallId = $CallId
     }
@@ -105,12 +103,7 @@ function Invoke-ConfiguredCodexRole {
         $arguments.CodexPath = $CodexPath
     }
     $operationalInstructions = Get-ReviewLoopOperationalInstructions -Role $Role
-    $arguments.DeveloperInstructions = if ($Mode -eq "Review") {
-        "$operationalInstructions`n`n$Prompt"
-    }
-    else {
-        $operationalInstructions
-    }
+    $arguments.DeveloperInstructions = $operationalInstructions
     $mayEditRepository = $Role -in @("PointFixer", "ArchitectureFixer")
     $worktreeBefore = if ($mayEditRepository) {
         ""
@@ -243,7 +236,7 @@ function Invoke-ReviewLoopReview {
             invariant = $_.Invariant
         }
     })
-    $nativePrompt = @"
+    $reviewPrompt = @"
 Review the complete branch diff against commit $($State.ReviewBaseCommit).
 Report only discrete, actionable correctness, security, reliability, or material performance defects.
 Ignore style-only cleanup and optional architecture ideas. Verify each finding against current code.
@@ -251,27 +244,27 @@ Keep investigation scoped to changed hunks, their direct dependencies, and relev
 For a recurrence of an existing defect, reuse its path, component, rootCause, and invariant text verbatim
 so its ledger identity remains stable. Existing identity catalog:
 $(ConvertTo-ReviewLoopJsonCompact $identityCatalog)
+Return the final review only in the supplied structured schema. Do not emit a native review summary as the final answer.
 "@
-    $native = Invoke-ConfiguredCodexRole `
+    $reviewCall = Invoke-ConfiguredCodexRole `
         -Config $Config `
         -Role "Reviewer" `
         -RepoPath $RepoPath `
         -Speed $Speed `
-        -Prompt $nativePrompt `
+        -Prompt $reviewPrompt `
         -LogRoot $RunRoot `
         -SchemaName "review-result-v1.schema.json" `
-        -Mode Review `
-        -ReviewBase ([string]$State.ReviewBaseCommit) `
+        -Mode Exec `
         -CodexPath $CodexPath `
-        -CallId ("review-{0:d2}-native" -f $cycle) `
+        -CallId ("review-{0:d2}" -f $cycle) `
         -State $State `
         -StatePath $StatePath
-    Assert-ReviewLoopRoleSuccess $native
+    Assert-ReviewLoopRoleSuccess $reviewCall
     for ($validationAttempt = 1; $validationAttempt -le 3; $validationAttempt++) {
         $validationError = $null
         try {
-            Normalize-ReviewLoopReviewResult -Result $native.StructuredResult
-            Assert-ReviewLoopReviewResult -Result $native.StructuredResult
+            Normalize-ReviewLoopReviewResult -Result $reviewCall.StructuredResult
+            Assert-ReviewLoopReviewResult -Result $reviewCall.StructuredResult
         }
         catch {
             $validationError = $_.Exception.Message
@@ -280,25 +273,25 @@ $(ConvertTo-ReviewLoopJsonCompact $identityCatalog)
             break
         }
         if ($validationAttempt -ge 3 -or
-            [string]::IsNullOrWhiteSpace([string]$native.ThreadId)) {
+            [string]::IsNullOrWhiteSpace([string]$reviewCall.ThreadId)) {
             throw "Reviewer result remained semantically invalid after correction: $validationError"
         }
         Write-ReviewLoopStatus -Message "Reviewer result needs a structural correction: $validationError" -Kind Warning
-        $native = Invoke-ConfiguredCodexRole `
+        $reviewCall = Invoke-ConfiguredCodexRole `
             -Config $Config -Role "Reviewer" -RepoPath $RepoPath -Speed $Speed `
             -Prompt "Correct only the structured review result: $validationError. Preserve the completed review and return the full corrected result." `
             -LogRoot $RunRoot -SchemaName "review-result-v1.schema.json" `
-            -Mode Resume -ThreadId ([string]$native.ThreadId) -CodexPath $CodexPath `
+            -Mode Resume -ThreadId ([string]$reviewCall.ThreadId) -CodexPath $CodexPath `
             -CallId ("review-{0:d2}-correction-{1}" -f $cycle, $validationAttempt) `
             -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $native
+        Assert-ReviewLoopRoleSuccess $reviewCall
     }
 
     $headAfter = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
     if ($headAfter -ne $head -or -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
         Stop-ReviewLoopBlocked -Message "Repository HEAD or worktree changed during the read-only review."
     }
-    $result = $native.StructuredResult
+    $result = $reviewCall.StructuredResult
     $findingCount = @($result.findings).Count
 
     if ([string]$result.classification -eq "clean") {
@@ -321,7 +314,7 @@ $(ConvertTo-ReviewLoopJsonCompact $identityCatalog)
     return [pscustomobject]@{
         ReviewId = "review-{0:d2}" -f $cycle
         Head = $head
-        Call = $native
+        Call = $reviewCall
         Result = $result
     }
 }
@@ -368,6 +361,80 @@ function Test-ReviewLoopPathLineEvidence {
     return $false
 }
 
+function ConvertTo-ReviewLoopRelationFindingPayload {
+    param([Parameter(Mandatory = $true)][object]$Finding)
+
+    return [pscustomobject][ordered]@{
+        id = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Id" -Default "")
+        status = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Status" -Default "unknown")
+        resolutionCommit = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "ResolutionCommit" -Default "")
+        path = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Path" -Default "")
+        line = [int](Get-ReviewLoopObjectProperty -Object $Finding -Name "Line" -Default 0)
+        component = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Component" -Default "")
+        rootCause = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "RootCause" -Default "")
+        invariant = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Invariant" -Default "")
+        evidence = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Evidence" -Default "")
+        reproduction = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Reproduction" -Default "")
+        fixPaths = @((Get-ReviewLoopObjectProperty -Object $Finding -Name "FixPaths" -Default @()))
+    }
+}
+
+function Get-ReviewLoopTriggerDecision {
+    param(
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string]$CandidateId
+    )
+
+    $matches = @($Result.decisions | Where-Object {
+        [string]$_.candidateFindingId -eq $CandidateId
+    })
+    if ($matches.Count -ne 1) {
+        return $null
+    }
+    return $matches[0]
+}
+
+function Test-ReviewLoopTriggerResultShape {
+    param(
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string[]]$CandidateIds
+    )
+
+    $decisions = @($Result.decisions)
+    $actualIds = @($decisions | ForEach-Object {
+        [string]$_.candidateFindingId
+    })
+    return $decisions.Count -eq $CandidateIds.Count -and
+        @($actualIds | Sort-Object -Unique).Count -eq $CandidateIds.Count -and
+        @($actualIds | Where-Object { $_ -notin $CandidateIds }).Count -eq 0 -and
+        @($CandidateIds | Where-Object { $_ -notin $actualIds }).Count -eq 0
+}
+
+function Test-ReviewLoopTriggerDecisionSupported {
+    param(
+        [AllowNull()][object]$Decision,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    return $null -ne $Decision -and
+        [string]$Decision.confidence -eq "high" -and
+        ([string]$Decision.relation -eq "insufficient_evidence" -or
+            (Test-ReviewLoopPathLineEvidence -Decision $Decision -RepoPath $RepoPath))
+}
+
+function New-ReviewLoopUnsupportedTriggerDecision {
+    param([Parameter(Mandatory = $true)][string]$CandidateId)
+
+    return [pscustomobject][ordered]@{
+        candidateFindingId = $CandidateId
+        relation = "insufficient_evidence"
+        candidateStatus = "unknown"
+        confidence = "low"
+        rationale = "Independent judges did not produce one supported high-confidence decision."
+        evidence = @()
+    }
+}
+
 function Invoke-ReviewLoopTriggerJudge {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -388,20 +455,26 @@ function Invoke-ReviewLoopTriggerJudge {
             Relation = "insufficient_evidence"
             Confidence = "high"
             Rationale = "No semantic candidates in the ledger."
-            Decision = [pscustomobject]@{ schemaVersion = "1.0"; decisions = @() }
+            Decision = [pscustomobject]@{ schemaVersion = "2.0"; decisions = @() }
             Relations = @()
             Calls = @()
         }
     }
 
+    $relatedRelations = @(
+        "same_root_cause",
+        "same_contract_different_edge",
+        "regression_from_fix"
+    )
     $calls = [System.Collections.Generic.List[object]]::new()
     $relations = [System.Collections.Generic.List[object]]::new()
+    $currentPayload = ConvertTo-ReviewLoopRelationFindingPayload -Finding $Finding
     for ($offset = 0; $offset -lt $candidateList.Count; $offset += 20) {
         $batch = @($candidateList | Select-Object -Skip $offset -First 20)
         $candidatePayload = @($batch | ForEach-Object {
             [pscustomobject]@{
                 candidateFindingId = [string]$_.Finding.Id
-                finding = $_.Finding
+                finding = ConvertTo-ReviewLoopRelationFindingPayload -Finding $_.Finding
                 semanticSignals = [pscustomobject]@{
                     sameComponent = $_.SameComponent
                     sameRootCause = $_.SameRootCause
@@ -411,53 +484,105 @@ function Invoke-ReviewLoopTriggerJudge {
                 }
             }
         })
+        $batchIds = @($candidatePayload | ForEach-Object {
+            [string]$_.candidateFindingId
+        })
         $prompt = Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
-            CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $Finding
+            CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
             CANDIDATES = ConvertTo-ReviewLoopJsonCompact $candidatePayload
         }
         $primary = Invoke-ConfiguredCodexRole `
             -Config $Config -Role "TriggerJudge" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $prompt -LogRoot $RunRoot -SchemaName "trigger-decision-v1.schema.json" `
+            -Prompt $prompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
             -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-primary" -State $State -StatePath $StatePath
         Assert-ReviewLoopRoleSuccess $primary
         [void]$calls.Add($primary)
-        $confirmPrompt = "$prompt`n`nIndependently classify every candidate. Do not copy the first judge."
+
+        $primaryShapeValid = Test-ReviewLoopTriggerResultShape `
+            -Result $primary.StructuredResult -CandidateIds $batchIds
+        $confirmIds = [System.Collections.Generic.List[string]]::new()
+        foreach ($id in $batchIds) {
+            $decision = if ($primaryShapeValid) {
+                Get-ReviewLoopTriggerDecision -Result $primary.StructuredResult -CandidateId $id
+            }
+            else {
+                $null
+            }
+            $supported = Test-ReviewLoopTriggerDecisionSupported `
+                -Decision $decision -RepoPath $RepoPath
+            if ($supported -and [string]$decision.relation -eq "independent" -and
+                [string]$decision.candidateStatus -ne "unknown") {
+                [void]$relations.Add($decision)
+            }
+            else {
+                [void]$confirmIds.Add($id)
+            }
+        }
+        if ($confirmIds.Count -eq 0) {
+            continue
+        }
+
+        $confirmPayload = @($candidatePayload | Where-Object {
+            [string]$_.candidateFindingId -in $confirmIds
+        })
+        $confirmPrompt = @"
+$(Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
+    CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
+    CANDIDATES = ConvertTo-ReviewLoopJsonCompact $confirmPayload
+})
+
+Independently classify these related, uncertain, or structurally invalid primary cases. Do not copy the first judge.
+"@
         $confirm = Invoke-ConfiguredCodexRole `
             -Config $Config -Role "TriggerConfirm" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $confirmPrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v1.schema.json" `
+            -Prompt $confirmPrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
             -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-confirm" -State $State -StatePath $StatePath
         Assert-ReviewLoopRoleSuccess $confirm
         [void]$calls.Add($confirm)
 
+        $confirmShapeValid = Test-ReviewLoopTriggerResultShape `
+            -Result $confirm.StructuredResult -CandidateIds $confirmIds.ToArray()
         $unresolvedIds = [System.Collections.Generic.List[string]]::new()
-        foreach ($candidate in $batch) {
-            $id = [string]$candidate.Finding.Id
-            $left = @($primary.StructuredResult.decisions | Where-Object {
-                [string]$_.candidateFindingId -eq $id
-            } | Select-Object -First 1)
-            $right = @($confirm.StructuredResult.decisions | Where-Object {
-                [string]$_.candidateFindingId -eq $id
-            } | Select-Object -First 1)
-            if ($left.Count -eq 1 -and $right.Count -eq 1 -and
-                [string]$left[0].relation -eq [string]$right[0].relation -and
-                [bool]$left[0].architectureRecommended -eq [bool]$right[0].architectureRecommended -and
-                [string]$left[0].confidence -eq "high" -and
-                [string]$right[0].confidence -eq "high" -and
-                ([string]$right[0].relation -eq "insufficient_evidence" -or
-                    (Test-ReviewLoopPathLineEvidence -Decision $right[0] -RepoPath $RepoPath))) {
-                [void]$relations.Add($right[0])
+        foreach ($id in $confirmIds) {
+            $left = if ($primaryShapeValid) {
+                Get-ReviewLoopTriggerDecision -Result $primary.StructuredResult -CandidateId $id
+            }
+            else {
+                $null
+            }
+            $right = if ($confirmShapeValid) {
+                Get-ReviewLoopTriggerDecision -Result $confirm.StructuredResult -CandidateId $id
+            }
+            else {
+                $null
+            }
+            $leftSupported = Test-ReviewLoopTriggerDecisionSupported `
+                -Decision $left -RepoPath $RepoPath
+            $rightSupported = Test-ReviewLoopTriggerDecisionSupported `
+                -Decision $right -RepoPath $RepoPath
+            if ($leftSupported -and $rightSupported -and
+                [string]$left.relation -eq [string]$right.relation -and
+                [string]$left.candidateStatus -eq [string]$right.candidateStatus) {
+                [void]$relations.Add($right)
+            }
+            elseif (-not $leftSupported -and $rightSupported -and
+                [string]$right.relation -eq "independent") {
+                [void]$relations.Add($right)
             }
             else {
                 [void]$unresolvedIds.Add($id)
             }
         }
-        if ($unresolvedIds.Count -gt 0) {
-            $tiePayload = @($candidatePayload | Where-Object {
-                [string]$_.candidateFindingId -in $unresolvedIds
-            })
-            $tiePrompt = @"
+        if ($unresolvedIds.Count -eq 0) {
+            continue
+        }
+
+        $tiePayload = @($candidatePayload | Where-Object {
+            [string]$_.candidateFindingId -in $unresolvedIds
+        })
+        $tiePrompt = @"
 $(Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
-    CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $Finding
+    CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
     CANDIDATES = ConvertTo-ReviewLoopJsonCompact $tiePayload
 })
 
@@ -467,50 +592,55 @@ $(ConvertTo-ReviewLoopJsonCompact $primary.StructuredResult)
 Sol decisions:
 $(ConvertTo-ReviewLoopJsonCompact $confirm.StructuredResult)
 
-Adjudicate every supplied disagreement once. Prefer insufficient_evidence over an unsupported merge.
+Adjudicate every supplied disagreement once. Keep relation and candidate status independent.
 "@
-            $tie = Invoke-ConfiguredCodexRole `
-                -Config $Config -Role "TriggerTieBreak" -RepoPath $RepoPath -Speed $Speed `
-                -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v1.schema.json" `
-                -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-tie" -State $State -StatePath $StatePath
-            Assert-ReviewLoopRoleSuccess $tie
-            [void]$calls.Add($tie)
-            foreach ($id in $unresolvedIds) {
-                $final = @($tie.StructuredResult.decisions | Where-Object {
-                    [string]$_.candidateFindingId -eq $id
-                } | Select-Object -First 1)
-                if ($final.Count -eq 1 -and [string]$final[0].confidence -eq "high" -and
-                    ([string]$final[0].relation -eq "insufficient_evidence" -or
-                        (Test-ReviewLoopPathLineEvidence -Decision $final[0] -RepoPath $RepoPath))) {
-                    [void]$relations.Add($final[0])
-                }
-                else {
-                    [void]$relations.Add([pscustomobject]@{
-                        candidateFindingId = $id
-                        relation = "insufficient_evidence"
-                        architectureRecommended = $false
-                        confidence = "low"
-                        rationale = "Independent judges did not produce a supported high-confidence relation."
-                        evidence = @()
-                    })
-                }
+        $tie = Invoke-ConfiguredCodexRole `
+            -Config $Config -Role "TriggerTieBreak" -RepoPath $RepoPath -Speed $Speed `
+            -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
+            -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-tie" -State $State -StatePath $StatePath
+        Assert-ReviewLoopRoleSuccess $tie
+        [void]$calls.Add($tie)
+        $tieShapeValid = Test-ReviewLoopTriggerResultShape `
+            -Result $tie.StructuredResult -CandidateIds $unresolvedIds.ToArray()
+        foreach ($id in $unresolvedIds) {
+            $final = if ($tieShapeValid) {
+                Get-ReviewLoopTriggerDecision -Result $tie.StructuredResult -CandidateId $id
+            }
+            else {
+                $null
+            }
+            if (Test-ReviewLoopTriggerDecisionSupported -Decision $final -RepoPath $RepoPath) {
+                [void]$relations.Add($final)
+            }
+            else {
+                [void]$relations.Add((New-ReviewLoopUnsupportedTriggerDecision -CandidateId $id))
             }
         }
     }
 
     $architecture = @($relations | Where-Object {
-        [bool]$_.architectureRecommended -and
-        [string]$_.relation -in @("same_root_cause", "same_contract_different_edge")
+        [string]$_.relation -in $relatedRelations -and
+        [string]$_.candidateStatus -in @("active", "resolved")
     }).Count -gt 0
     $summary = @($relations | Group-Object relation | ForEach-Object {
         "$($_.Name)=$($_.Count)"
     }) -join ", "
     return [pscustomobject]@{
         ArchitectureRecommended = $architecture
-        Relation = if ($architecture) { "same_contract_different_edge" } else { "independent_same_file" }
-        Confidence = if (@($relations | Where-Object { [string]$_.confidence -ne "high" }).Count -eq 0) { "high" } else { "low" }
+        Relation = if ($architecture) {
+            [string](@($relations | Where-Object {
+                [string]$_.relation -in $relatedRelations
+            } | Select-Object -First 1).relation)
+        }
+        else { "independent" }
+        Confidence = if (@($relations | Where-Object {
+            [string]$_.confidence -ne "high"
+        }).Count -eq 0) { "high" } else { "low" }
         Rationale = $summary
-        Decision = [pscustomobject]@{ schemaVersion = "1.0"; decisions = $relations.ToArray() }
+        Decision = [pscustomobject]@{
+            schemaVersion = "2.0"
+            decisions = $relations.ToArray()
+        }
         Relations = $relations.ToArray()
         Calls = $calls.ToArray()
     }
@@ -765,10 +895,39 @@ function Test-ReviewLoopResolvedWithTestEvidence {
     )
 
     return [string]$VerificationResult.verdict -eq "resolved" -and
+        [string]$VerificationResult.patchSafety -eq "safe" -and
+        @($VerificationResult.regressions).Count -eq 0 -and
         [string]$VerificationResult.confidence -eq "high" -and
         (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath) -and
         [bool](Get-ReviewLoopObjectProperty `
             -Object $FixerResult.testExecution -Name "Passed" -Default $false)
+}
+
+function Test-ReviewLoopRejectedVerification {
+    param(
+        [Parameter(Mandatory = $true)][object]$VerificationResult,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $regressions = @($VerificationResult.regressions)
+    $patchRegression = [string]$VerificationResult.patchSafety -eq "regression_detected" -and
+        $regressions.Count -gt 0
+    return [string]$VerificationResult.confidence -eq "high" -and
+        (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath) -and
+        ([string]$VerificationResult.verdict -eq "reproduced" -or $patchRegression)
+}
+
+function Test-ReviewLoopSafeObsoleteVerification {
+    param(
+        [Parameter(Mandatory = $true)][object]$VerificationResult,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    return [string]$VerificationResult.verdict -eq "obsolete" -and
+        [string]$VerificationResult.patchSafety -eq "safe" -and
+        @($VerificationResult.regressions).Count -eq 0 -and
+        [string]$VerificationResult.confidence -eq "high" -and
+        (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath)
 }
 
 function Invoke-ReviewLoopVerifier {
@@ -791,7 +950,7 @@ function Invoke-ReviewLoopVerifier {
     }
     $primary = Invoke-ConfiguredCodexRole `
         -Config $Config -Role "FindingVerifier" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v1.schema.json" `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
         -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-primary" -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $primary
     $result = $primary.StructuredResult
@@ -806,9 +965,7 @@ function Invoke-ReviewLoopVerifier {
             Basis = "Luna + matching fixer test evidence"
         }
     }
-    if ([string]$result.verdict -eq "reproduced" -and
-        [string]$result.confidence -eq "high" -and
-        (Test-ReviewLoopPathLineEvidence -Decision $result -RepoPath $RepoPath)) {
+    if (Test-ReviewLoopRejectedVerification -VerificationResult $result -RepoPath $RepoPath) {
         return [pscustomobject]@{
             Accepted = $false
             Result = $result
@@ -819,14 +976,17 @@ function Invoke-ReviewLoopVerifier {
 
     $confirm = Invoke-ConfiguredCodexRole `
         -Config $Config -Role "VerifierConfirm" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v1.schema.json" `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
         -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-confirm" -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $confirm
     $confirmed = $confirm.StructuredResult
     if ([string]$confirmed.verdict -eq [string]$result.verdict -and
+        [string]$confirmed.patchSafety -eq [string]$result.patchSafety -and
         [string]$confirmed.confidence -eq "high" -and
-        (([string]$confirmed.verdict -in @("reproduced", "obsolete") -and
-            (Test-ReviewLoopPathLineEvidence -Decision $confirmed -RepoPath $RepoPath)) -or
+        ((Test-ReviewLoopRejectedVerification `
+                -VerificationResult $confirmed -RepoPath $RepoPath) -or
+            (Test-ReviewLoopSafeObsoleteVerification `
+                -VerificationResult $confirmed -RepoPath $RepoPath) -or
             (Test-ReviewLoopResolvedWithTestEvidence `
                 -FixerResult $FixerCall.StructuredResult `
                 -VerificationResult $confirmed `
@@ -842,34 +1002,38 @@ function Invoke-ReviewLoopVerifier {
     $tiePrompt = "$prompt`n`nLuna verification:`n$(ConvertTo-ReviewLoopJsonCompact $result)`n`nSol verification:`n$(ConvertTo-ReviewLoopJsonCompact $confirmed)`n`nAdjudicate the disagreement once."
     $tie = Invoke-ConfiguredCodexRole `
         -Config $Config -Role "VerifierTieBreak" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "verifier-result-v1.schema.json" `
+        -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
         -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-tie" -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $tie
     $final = $tie.StructuredResult
-    if ([string]$final.confidence -ne "high" -or
-        [string]$final.verdict -eq "insufficient_evidence" -or
-        -not (Test-ReviewLoopPathLineEvidence -Decision $final -RepoPath $RepoPath)) {
-        return [pscustomobject]@{
-            Accepted = $false
-            Result = $final
-            Calls = @($primary, $confirm, $tie)
-            Basis = "Terra adjudication remained inconclusive"
-        }
-    }
-    if ([string]$final.verdict -eq "resolved" -and
-        -not (Test-ReviewLoopResolvedWithTestEvidence `
+    $finalSupported = (Test-ReviewLoopResolvedWithTestEvidence `
             -FixerResult $FixerCall.StructuredResult `
             -VerificationResult $final `
-            -RepoPath $RepoPath)) {
+            -RepoPath $RepoPath) -or
+        (Test-ReviewLoopRejectedVerification `
+            -VerificationResult $final -RepoPath $RepoPath) -or
+        (Test-ReviewLoopSafeObsoleteVerification `
+            -VerificationResult $final -RepoPath $RepoPath)
+    if (-not $finalSupported) {
+        $inconclusiveBasis = if ([string]$final.verdict -eq "resolved") {
+            "Resolved verdict lacked orchestrator-owned test evidence or a safe patch"
+        }
+        else {
+            "Terra adjudication remained inconclusive"
+        }
         return [pscustomobject]@{
             Accepted = $false
             Result = $final
             Calls = @($primary, $confirm, $tie)
-            Basis = "Resolved verdict lacked orchestrator-owned test evidence"
+            Basis = $inconclusiveBasis
         }
     }
+    $finalAccepted = Test-ReviewLoopResolvedWithTestEvidence `
+        -FixerResult $FixerCall.StructuredResult `
+        -VerificationResult $final `
+        -RepoPath $RepoPath
     return [pscustomobject]@{
-        Accepted = [string]$final.verdict -eq "resolved"
+        Accepted = $finalAccepted
         Result = $final
         Calls = @($primary, $confirm, $tie)
         Basis = "Terra adjudication"

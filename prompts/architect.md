@@ -9,6 +9,7 @@ Requirements:
 - Each step names the findings it resolves.
 - Do not combine findings solely by feature area, filename, or architectural taste.
 - Preserve existing public contracts unless a contract break is explicitly reported.
+- Treat resolved historical trigger candidates as evidence only; map and change only the supplied active findings.
 
 Finding cluster:
 {{FINDINGS}}
