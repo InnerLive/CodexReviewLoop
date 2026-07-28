@@ -186,7 +186,7 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
                 '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
             }
             "trigger-decision-v1.schema.json" {
-                '{"schemaVersion":"1.0","relation":"independent_same_file","architectureRecommended":false,"confidence":"high","rationale":"independent","evidence":[]}'
+                '{"schemaVersion":"1.0","decisions":[]}'
             }
             "architecture-proposal-v1.schema.json" {
                 '{"schemaVersion":"1.0","recommendation":"point_fix","summary":"point","sharedRootCause":"","minimalAlternative":"point","findings":[],"steps":[],"risks":[],"breaksPublicContract":false}'
@@ -195,10 +195,10 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
                 '{"schemaVersion":"1.0","decision":"reject_to_point_fix","confidence":"high","rationale":"bounded","coherentRootCause":false,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":false,"missingPaths":[],"requiredChanges":[]}'
             }
             "fixer-result-v1.schema.json" {
-                '{"schemaVersion":"1.0","outcome":"no_change","summary":"none","changedPaths":[],"targetedTests":[],"remainingRisk":""}'
+                '{"schemaVersion":"1.0","outcome":"no_change","summary":"none","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test"],"rationale":"targeted regression"},"remainingRisk":""}'
             }
             "verifier-result-v1.schema.json" {
-                '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still present","evidence":[],"targetedTest":{"command":"","passed":false,"evidence":""}}'
+                '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still present","evidence":[]}'
             }
             default {
                 '{}'
@@ -257,6 +257,7 @@ foreach ($commandPlan in $commandPlans) {
         -Default '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''Get-Location''')
     $commandExit = [int](Get-FakePlanValue -Plan $commandPlan -Name "exitCode" -Default 0)
     $commandOutput = [string](Get-FakePlanValue -Plan $commandPlan -Name "output" -Default "")
+    $commandStatus = [string](Get-FakePlanValue -Plan $commandPlan -Name "status" -Default "completed")
     $commandDelayText = [string](Get-FakePlanValue `
         -Plan $commandPlan `
         -Name "delayMs" `
@@ -284,6 +285,7 @@ foreach ($commandPlan in $commandPlans) {
             command = $commandName
             exit_code = $commandExit
             aggregated_output = $commandOutput
+            status = $commandStatus
         }
     }
     [Console]::Out.WriteLine(($completedEvent | ConvertTo-Json -Depth 6 -Compress))

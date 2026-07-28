@@ -4,27 +4,47 @@
   "additionalProperties": false,
   "properties": {
     "schemaVersion": { "type": "string", "const": "1.0" },
-    "relation": {
-      "type": "string",
-      "enum": [
-        "same_root_cause",
-        "same_contract_different_edge",
-        "regression_from_fix",
-        "independent_same_file",
-        "resolved_or_obsolete",
-        "insufficient_evidence"
-      ]
-    },
-    "architectureRecommended": { "type": "boolean" },
-    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-    "rationale": { "type": "string" },
-    "evidence": {
+    "decisions": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "candidateFindingId": { "type": "string" },
+          "relation": {
+            "type": "string",
+            "enum": [
+              "same_root_cause",
+              "same_contract_different_edge",
+              "regression_from_fix",
+              "independent_same_file",
+              "resolved_or_obsolete",
+              "insufficient_evidence"
+            ]
+          },
+          "architectureRecommended": { "type": "boolean" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "rationale": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": { "type": "string" },
+                "line": { "type": "integer", "minimum": 1 },
+                "claim": { "type": "string" }
+              },
+              "required": ["path", "line", "claim"]
+            }
+          }
+        },
+        "required": [
+          "candidateFindingId", "relation", "architectureRecommended",
+          "confidence", "rationale", "evidence"
+        ]
+      }
     }
   },
-  "required": [
-    "schemaVersion", "relation", "architectureRecommended",
-    "confidence", "rationale", "evidence"
-  ]
+  "required": ["schemaVersion", "decisions"]
 }

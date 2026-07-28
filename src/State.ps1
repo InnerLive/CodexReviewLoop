@@ -46,7 +46,7 @@ function New-ReviewLoopLedger {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     return [pscustomobject][ordered]@{
-        SchemaVersion = "1.0"
+        SchemaVersion = "2.0"
         RepoPath = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
         Revision = 0
         Findings = @()
@@ -58,7 +58,7 @@ function New-ReviewLoopLedger {
 function Test-ReviewLoopLedger {
     param([Parameter(Mandatory = $true)][object]$Ledger)
 
-    if ([string]$Ledger.SchemaVersion -ne "1.0") {
+    if ([string]$Ledger.SchemaVersion -ne "2.0") {
         throw "Unknown ledger version: $($Ledger.SchemaVersion)"
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -79,6 +79,38 @@ function Test-ReviewLoopLedger {
     return $true
 }
 
+function ConvertTo-ReviewLoopLedgerV2 {
+    param([Parameter(Mandatory = $true)][object]$Ledger)
+
+    if ([string]$Ledger.SchemaVersion -eq "2.0") {
+        return $Ledger
+    }
+    if ([string]$Ledger.SchemaVersion -ne "1.0") {
+        throw "Unknown ledger version: $($Ledger.SchemaVersion)"
+    }
+    foreach ($finding in @($Ledger.Findings)) {
+        if ($finding.PSObject.Properties.Name -notcontains "Relations") {
+            $finding | Add-Member -NotePropertyName Relations -NotePropertyValue @()
+        }
+        if ($finding.PSObject.Properties.Name -notcontains "IdentityHistory") {
+            $finding | Add-Member -NotePropertyName IdentityHistory -NotePropertyValue @(
+                [pscustomobject]@{
+                    Path = [string]$finding.Path
+                    Component = [string]$finding.Component
+                    RootCause = [string]$finding.RootCause
+                    Invariant = [string]$finding.Invariant
+                    SeenAt = [string]$finding.UpdatedAt
+                }
+            )
+        }
+        if ($finding.PSObject.Properties.Name -notcontains "LastBlockedHead") {
+            $finding | Add-Member -NotePropertyName LastBlockedHead -NotePropertyValue ""
+        }
+    }
+    $Ledger.SchemaVersion = "2.0"
+    return $Ledger
+}
+
 function Read-ReviewLoopLedger {
     [CmdletBinding()]
     param(
@@ -92,7 +124,7 @@ function Read-ReviewLoopLedger {
         }
         return New-ReviewLoopLedger -RepoPath $RepoPath
     }
-    $ledger = Read-ReviewLoopJson -Path $Path
+    $ledger = ConvertTo-ReviewLoopLedgerV2 (Read-ReviewLoopJson -Path $Path)
     Test-ReviewLoopLedger -Ledger $ledger | Out-Null
     return $ledger
 }
@@ -118,11 +150,17 @@ function ConvertTo-ReviewLoopFindingRecord {
         [Parameter(Mandatory = $true)][string]$Head
     )
 
-    $id = Get-ReviewLoopFindingId `
-        -Path ([string]$Finding.path) `
-        -Component ([string]$Finding.component) `
-        -RootCause ([string]$Finding.rootCause) `
-        -Invariant ([string]$Finding.invariant)
+    $matchedId = [string](Get-ReviewLoopObjectProperty `
+        -Object $Finding -Name "matchedFindingId" -Default "")
+    $id = if ([string]::IsNullOrWhiteSpace($matchedId)) {
+        Get-ReviewLoopFindingId `
+            -Path ([string]$Finding.path) `
+            -Component ([string]$Finding.component) `
+            -RootCause ([string]$Finding.rootCause) `
+            -Invariant ([string]$Finding.invariant)
+    } else {
+        $matchedId
+    }
     $clusterId = Get-ReviewLoopClusterId `
         -Component ([string]$Finding.component) `
         -RootCause ([string]$Finding.rootCause) `
@@ -156,6 +194,15 @@ function ConvertTo-ReviewLoopFindingRecord {
         SuggestedFix = [string]$Finding.suggestedFix
         SuggestedTest = [string]$Finding.suggestedTest
         FixPaths = $fixPaths.ToArray()
+        Relations = @((Get-ReviewLoopObjectProperty `
+            -Object $Finding -Name "relations" -Default @()))
+        IdentityHistory = @([pscustomobject]@{
+            Path = ([string]$Finding.path).Replace("\", "/")
+            Component = [string]$Finding.component
+            RootCause = [string]$Finding.rootCause
+            Invariant = [string]$Finding.invariant
+            SeenAt = [DateTimeOffset]::UtcNow.ToString("O")
+        })
         FirstSeenReview = $ReviewId
         LastSeenReview = $ReviewId
         FirstSeenHead = $Head
@@ -166,6 +213,7 @@ function ConvertTo-ReviewLoopFindingRecord {
         Verification = $null
         ResolutionCommit = ""
         BlockedReason = ""
+        LastBlockedHead = ""
         CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")
         UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     }
@@ -213,6 +261,15 @@ function Merge-ReviewLoopFindings {
         $existing.SuggestedFix = $incoming.SuggestedFix
         $existing.SuggestedTest = $incoming.SuggestedTest
         $existing.FixPaths = $incoming.FixPaths
+        $existing.Relations = @(
+            @($existing.Relations) + @($incoming.Relations) |
+                Group-Object { "$($_.CandidateFindingId)|$($_.Relation)" } |
+                ForEach-Object { $_.Group | Select-Object -Last 1 }
+        )
+        $existing.IdentityHistory = @(
+            @($existing.IdentityHistory) + @($incoming.IdentityHistory) |
+                Sort-Object SeenAt
+        )
         $existing.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     }
 
@@ -246,8 +303,12 @@ function Get-ReviewLoopTriggerCandidates {
         $sameCluster = [string]$Finding.ClusterId -eq [string]$candidate.ClusterId
         $overlap = @($candidate.FixPaths | Where-Object { $paths.Contains((ConvertTo-ReviewLoopCanonicalText $_)) }).Count -gt 0
 
-        # Path overlap is evidence only. At least one semantic property must match.
-        if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster) {
+        # These are candidates only. Path overlap never decides the relationship.
+        if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster -or $overlap -or
+            (ConvertTo-ReviewLoopCanonicalText $Finding.Path) -eq
+                (ConvertTo-ReviewLoopCanonicalText $candidate.Path)) {
+            $score = @($sameCause, $sameInvariant, $sameCluster, $sameComponent, $overlap |
+                Where-Object { $_ }).Count
             [pscustomobject]@{
                 Finding = $candidate
                 SameComponent = $sameComponent
@@ -255,11 +316,15 @@ function Get-ReviewLoopTriggerCandidates {
                 SameInvariant = $sameInvariant
                 SameCluster = $sameCluster
                 OverlappingFixPaths = $overlap
+                Score = $score
             }
         }
     }
 
-    return @($candidates | Sort-Object { $_.Finding.Id } | Select-Object -First 20)
+    return @($candidates | Sort-Object `
+        @{ Expression = "Score"; Descending = $true },
+        @{ Expression = { $_.Finding.UpdatedAt }; Descending = $true },
+        @{ Expression = { $_.Finding.Id }; Descending = $false })
 }
 
 function New-ReviewLoopState {

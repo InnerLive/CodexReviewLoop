@@ -11,18 +11,14 @@ Verdicts:
 Rules:
 - A changed line is not proof of resolution.
 - Follow failure, cancellation, retry, caching, and deferred-state paths when relevant.
-- Report exact file/line or test evidence.
-- This role is read-only. Do not run build or test commands.
-- Use `resolved` only with a passing targeted-test result supplied by the fixer that is clearly bound to the current correction.
-- When reusing fixer evidence, copy its exact command and result into `targetedTest`; do not describe it as an independent verifier execution.
-- If no suitable test exists or the supplied test evidence cannot be tied to the current correction, return `insufficient_evidence`.
+- Report evidence as exact repository-relative path, current line, and claim.
+- The orchestrator supplies the independently executed targeted-test result. Do not restate or reinterpret its command.
+- Use `resolved` only when the supplied targeted test passed and current code evidence shows the original invariant is restored.
+- If the test cannot be tied to the current correction, return `insufficient_evidence`.
 - Do not edit files.
 
 Original findings:
 {{FINDINGS}}
 
-Fixer result:
+Fixer result and orchestrator-owned targeted-test execution:
 {{FIXER_RESULT}}
-
-Current diff:
-{{DIFF}}

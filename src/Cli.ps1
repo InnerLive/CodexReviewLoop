@@ -44,7 +44,6 @@ function Get-CodexRoleArguments {
         [Parameter(Mandatory = $true)][string]$Model,
         [Parameter(Mandatory = $true)][string]$Thinking,
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
-        [ValidateSet("read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "read-only",
         [ValidateSet("Exec", "Review", "Resume")][string]$Mode = "Exec",
         [string]$ReviewBase = "",
         [string]$ThreadId = "",
@@ -57,6 +56,8 @@ function Get-CodexRoleArguments {
     [void]$arguments.Add("exec")
     [void]$arguments.Add("--json")
     [void]$arguments.Add("--ignore-user-config")
+    [void]$arguments.Add("--ignore-rules")
+    [void]$arguments.Add("--dangerously-bypass-approvals-and-sandbox")
     [void]$arguments.Add("-C")
     [void]$arguments.Add((Resolve-ReviewLoopPath -Path $RepoPath -MustExist))
     [void]$arguments.Add("-m")
@@ -69,14 +70,6 @@ function Get-CodexRoleArguments {
     if ($Speed -eq "fast") {
         [void]$arguments.Add("--enable")
         [void]$arguments.Add("fast_mode")
-    }
-
-    if ($Sandbox -eq "danger-full-access") {
-        [void]$arguments.Add("--dangerously-bypass-approvals-and-sandbox")
-    }
-    else {
-        [void]$arguments.Add("--sandbox")
-        [void]$arguments.Add($Sandbox)
     }
 
     if (-not [string]::IsNullOrWhiteSpace($SchemaPath)) {
@@ -328,13 +321,6 @@ function Clear-ReviewLoopModelHelperEnvironment {
     }
 }
 
-function Test-ReviewLoopModelOwnedTestCommand {
-    param([Parameter(Mandatory = $true)][string]$Command)
-
-    $payload = Get-ReviewLoopCommandPayload -Command $Command
-    return $null -ne (ConvertFrom-ReviewLoopTargetedCommand -Command $payload)
-}
-
 function Update-ReviewLoopCodexActivity {
     param(
         [Parameter(Mandatory = $true)][string]$Line,
@@ -342,15 +328,12 @@ function Update-ReviewLoopCodexActivity {
     )
 
     foreach ($property in @(
-        "EventErrorCount", "EventStreamLossCount", "PolicyViolationCount",
-        "MalformedEventCount"
+        "AdvisoryErrorCount", "EventStreamLossCount", "MalformedEventCount",
+        "TurnFailedCount", "DeclinedCommandCount", "FailedCommandCount"
     )) {
         if ($Activity.PSObject.Properties.Name -notcontains $property) {
             $Activity | Add-Member -NotePropertyName $property -NotePropertyValue 0
         }
-    }
-    if ($Activity.PSObject.Properties.Name -notcontains "PolicyViolationReason") {
-        $Activity | Add-Member -NotePropertyName PolicyViolationReason -NotePropertyValue ""
     }
     if ($Activity.PSObject.Properties.Name -notcontains "Usage") {
         $Activity | Add-Member -NotePropertyName Usage -NotePropertyValue ([pscustomobject]@{
@@ -363,7 +346,7 @@ function Update-ReviewLoopCodexActivity {
     }
     catch {
         $Activity.MalformedEventCount = [int]$Activity.MalformedEventCount + 1
-        Write-ReviewLoopStatus -Message "Codex emitted malformed JSONL; the role trace will be rejected." -Kind Warning -Indent 1
+        Write-ReviewLoopStatus -Message "Codex emitted malformed JSONL; observability for this role is incomplete." -Kind Warning -Indent 1
         if (Test-ReviewLoopOutputLevel -Minimum detailed) {
             Write-ReviewLoopStatus -Message $Line -Kind Muted -Indent 1
         }
@@ -400,15 +383,8 @@ function Update-ReviewLoopCodexActivity {
         $Activity.ActionCount = [int]$Activity.ActionCount + 1
         if ($itemType -eq "command_execution") {
             $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "command")
-            if (Test-ReviewLoopModelOwnedTestCommand -Command $command) {
-                $Activity.PolicyViolationCount = [int]$Activity.PolicyViolationCount + 1
-                $Activity.PolicyViolationReason = ConvertTo-ReviewLoopRedactedText (
-                    "Model role attempted an orchestrator-owned test command: $command"
-                )
-                Write-ReviewLoopStatus -Message $Activity.PolicyViolationReason -Kind Error -Indent 1
-            }
-            elseif (Test-ReviewLoopOutputLevel -Minimum balanced) {
-                Write-ReviewLoopStatus -Message "CLI: $command" -Kind Muted -Indent 1
+            if (Test-ReviewLoopOutputLevel -Minimum balanced) {
+                Write-ReviewLoopStatus -Message "Agent command: $command" -Kind Muted -Indent 1
             }
         }
     }
@@ -419,19 +395,34 @@ function Update-ReviewLoopCodexActivity {
             $output = [string](Get-ReviewLoopObjectProperty -Object $item -Name "aggregated_output" -Default "")
             if (Test-ReviewLoopCommandReturnedNoResult -Command $command -ExitCode $exitCode -Output $output) {
                 if (Test-ReviewLoopOutputLevel -Minimum detailed) {
-                    Write-ReviewLoopStatus -Message "CLI returned no results: $command" -Kind Muted -Indent 1
+                    Write-ReviewLoopStatus -Message "Agent search returned no results: $command" -Kind Muted -Indent 1
                 }
             }
             else {
-                Write-ReviewLoopStatus -Message "CLI command failed (exit code $exitCode): $command" -Kind Warning -Indent 1
-                foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text $output -MaxLines 4)) {
-                    Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 2
+                $status = [string](Get-ReviewLoopObjectProperty -Object $item -Name "status" -Default "")
+                $declined = $status -eq "declined" -or $output -match "(?i)rejected:\s+blocked by policy"
+                if ($declined) {
+                    $Activity.DeclinedCommandCount = [int]$Activity.DeclinedCommandCount + 1
+                    if (Test-ReviewLoopOutputLevel -Minimum balanced) {
+                        Write-ReviewLoopStatus -Message "Agent command was declined by Codex policy; role continues: $command" -Kind Warning -Indent 1
+                    }
+                }
+                else {
+                    $Activity.FailedCommandCount = [int]$Activity.FailedCommandCount + 1
+                    if (Test-ReviewLoopOutputLevel -Minimum balanced) {
+                        Write-ReviewLoopStatus -Message "Agent command failed; role continues (exit code $exitCode): $command" -Kind Warning -Indent 1
+                    }
+                }
+                if (Test-ReviewLoopOutputLevel -Minimum balanced) {
+                    foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text $output -MaxLines 4)) {
+                        Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 2
+                    }
                 }
             }
         }
         elseif (Test-ReviewLoopOutputLevel -Minimum detailed) {
             $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "command")
-            Write-ReviewLoopStatus -Message "CLI completed: $command" -Kind Muted -Indent 1
+            Write-ReviewLoopStatus -Message "Agent command completed: $command" -Kind Muted -Indent 1
         }
     }
     elseif ($itemType -eq "error" -or $type -in @("error", "turn.failed")) {
@@ -439,7 +430,11 @@ function Update-ReviewLoopCodexActivity {
         if ([string]::IsNullOrWhiteSpace($message)) {
             $message = [string](Get-ReviewLoopObjectProperty -Object $event -Name "message" -Default "Codex reported an error.")
         }
-        if ($message -match "(?i)^in-process app-server event stream lagged; dropped \d+ events\b") {
+        if ($type -eq "turn.failed") {
+            $Activity.TurnFailedCount = [int]$Activity.TurnFailedCount + 1
+            Write-ReviewLoopStatus -Message $message -Kind Error -Indent 1
+        }
+        elseif ($message -match "(?i)^in-process app-server event stream lagged; dropped \d+ events\b") {
             $Activity.EventStreamLossCount = [int]$Activity.EventStreamLossCount + 1
             Write-ReviewLoopStatus -Message $message -Kind Warning -Indent 1
         }
@@ -449,8 +444,8 @@ function Update-ReviewLoopCodexActivity {
             }
         }
         else {
-            $Activity.EventErrorCount = [int]$Activity.EventErrorCount + 1
-            Write-ReviewLoopStatus -Message $message -Kind Error -Indent 1
+            $Activity.AdvisoryErrorCount = [int]$Activity.AdvisoryErrorCount + 1
+            Write-ReviewLoopStatus -Message $message -Kind Warning -Indent 1
         }
     }
 }
@@ -567,11 +562,12 @@ function Invoke-ReviewLoopObservedProcess {
         ActionCount = 0
         ThreadId = ""
         LastActivity = [DateTimeOffset]::UtcNow
-        EventErrorCount = 0
+        AdvisoryErrorCount = 0
         EventStreamLossCount = 0
-        PolicyViolationCount = 0
-        PolicyViolationReason = ""
         MalformedEventCount = 0
+        TurnFailedCount = 0
+        DeclinedCommandCount = 0
+        FailedCommandCount = 0
         Usage = [pscustomobject]@{
             InputTokens = 0L
             CachedInputTokens = 0L
@@ -583,7 +579,6 @@ function Invoke-ReviewLoopObservedProcess {
     $exitCode = -1
     $wasStarted = $false
     $timedOut = $false
-    $policyStopped = $false
     $stdinClosed = $false
     $inputWriteFailed = $false
     $inputWriteFailureReason = ""
@@ -623,7 +618,7 @@ function Invoke-ReviewLoopObservedProcess {
                     [void]$stdinTask.GetAwaiter().GetResult()
                 }
                 catch {
-                    if (-not $timedOut -and -not $policyStopped) {
+                    if (-not $timedOut) {
                         $inputWriteFailed = $true
                         $inputWriteFailureReason = ConvertTo-ReviewLoopRedactedText $_.Exception.Message
                         $stderrWriter.WriteLine($inputWriteFailureReason)
@@ -670,12 +665,6 @@ function Invoke-ReviewLoopObservedProcess {
             }
 
             $now = [DateTimeOffset]::UtcNow
-            if (-not $policyStopped -and [int]$activity.PolicyViolationCount -gt 0) {
-                if (-not (Stop-ReviewLoopProcessTree -Process $process)) {
-                    throw "$DisplayName process tree could not be stopped after a command-policy violation."
-                }
-                $policyStopped = $true
-            }
             if (-not $timedOut -and $TimeoutSeconds -gt 0 -and
                 ($now - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
                 $timedOut = $true
@@ -749,11 +738,12 @@ function Invoke-ReviewLoopObservedProcess {
         ActionCount = [int]$activity.ActionCount
         ThreadId = [string]$activity.ThreadId
         TimedOut = $timedOut
-        EventErrorCount = [int]$activity.EventErrorCount
+        AdvisoryErrorCount = [int]$activity.AdvisoryErrorCount
         EventStreamLossCount = [int]$activity.EventStreamLossCount
-        PolicyViolationCount = [int]$activity.PolicyViolationCount
-        PolicyViolationReason = [string]$activity.PolicyViolationReason
         MalformedEventCount = [int]$activity.MalformedEventCount
+        TurnFailedCount = [int]$activity.TurnFailedCount
+        DeclinedCommandCount = [int]$activity.DeclinedCommandCount
+        FailedCommandCount = [int]$activity.FailedCommandCount
         InputWriteFailed = $inputWriteFailed
         InputWriteFailureReason = $inputWriteFailureReason
         Usage = $activity.Usage
@@ -768,7 +758,6 @@ function Invoke-CodexCliRole {
         [Parameter(Mandatory = $true)][string]$Model,
         [Parameter(Mandatory = $true)][string]$Thinking,
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
-        [ValidateSet("read-only", "workspace-write", "danger-full-access")][string]$Sandbox = "read-only",
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [string]$SchemaPath = "",
@@ -783,6 +772,12 @@ function Invoke-CodexCliRole {
     )
 
     $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    $worktreeWasCleanAtStart = try {
+        Test-ReviewLoopGitClean -RepoPath $repo
+    }
+    catch {
+        $null
+    }
     $logDirectory = Resolve-ReviewLoopPath -Path $LogRoot
     [System.IO.Directory]::CreateDirectory($logDirectory) | Out-Null
     $executable = Resolve-CodexCliExecutable -CodexPath $CodexPath
@@ -834,7 +829,6 @@ function Invoke-CodexCliRole {
             -Model $Model `
             -Thinking $Thinking `
             -Speed $Speed `
-            -Sandbox $Sandbox `
             -Mode $currentMode `
             -ReviewBase $ReviewBase `
             -ThreadId $currentThreadId `
@@ -903,30 +897,15 @@ function Invoke-CodexCliRole {
         }) -join [Environment]::NewLine).Trim() }
         $finalText = ""
         $structured = $null
-        if ($null -ne $observed -and [int]$observed.PolicyViolationCount -gt 0) {
-            $exitCode = 5
-            $failureKind = "model_owned_test"
-            $failureReason = [string]$observed.PolicyViolationReason
-        }
-        elseif ($null -ne $observed -and [bool]$observed.InputWriteFailed) {
+        if ($null -ne $observed -and [bool]$observed.InputWriteFailed) {
             $exitCode = 5
             $failureKind = "input_write_error"
             $failureReason = "Codex closed its input pipe before the role prompt was fully delivered: $($observed.InputWriteFailureReason)"
         }
-        elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.MalformedEventCount -gt 0) {
+        elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.TurnFailedCount -gt 0) {
             $exitCode = 5
-            $failureKind = "malformed_event_stream"
-            $failureReason = "$($observed.MalformedEventCount) malformed Codex JSONL event(s) occurred; the role trace was rejected."
-        }
-        elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.EventErrorCount -gt 0) {
-            $exitCode = 5
-            $failureKind = "role_event_error"
-            $failureReason = "$($observed.EventErrorCount) Codex error event(s) occurred; the role result was rejected."
-        }
-        elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.EventStreamLossCount -gt 0) {
-            $exitCode = 5
-            $failureKind = "event_stream_loss"
-            $failureReason = "Codex dropped app-server events; the incomplete role trace was rejected."
+            $failureKind = "turn_failed"
+            $failureReason = "Codex reported turn.failed even though the process exited successfully."
         }
         elseif ($exitCode -eq 0) {
             $finalText = [string]$sanitizedResult.Text
@@ -1003,13 +982,10 @@ function Invoke-CodexCliRole {
             "timeout",
             "invalid_output",
             "invalid_structured_output",
-            "role_event_error",
-            "event_stream_loss",
-            "model_owned_test",
             "input_write_error",
-            "malformed_event_stream"
+            "turn_failed"
         )
-        if ($retryable -and $Sandbox -ne "read-only" -and
+        if ($retryable -and $worktreeWasCleanAtStart -eq $true -and
             [string]::IsNullOrWhiteSpace($lastThreadId) -and
             -not (Test-ReviewLoopGitClean -RepoPath $repo)) {
             $retryable = $false

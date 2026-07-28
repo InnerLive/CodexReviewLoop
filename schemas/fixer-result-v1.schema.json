@@ -10,23 +10,23 @@
       "type": "array",
       "items": { "type": "string" }
     },
-    "targetedTests": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "command": { "type": "string" },
-          "passed": { "type": "boolean" },
-          "evidence": { "type": "string" }
+    "targetedTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filePath": { "type": "string" },
+        "arguments": {
+          "type": "array",
+          "items": { "type": "string" }
         },
-        "required": ["command", "passed", "evidence"]
-      }
+        "rationale": { "type": "string" }
+      },
+      "required": ["filePath", "arguments", "rationale"]
     },
     "remainingRisk": { "type": "string" }
   },
   "required": [
     "schemaVersion", "outcome", "summary", "changedPaths",
-    "targetedTests", "remainingRisk"
+    "targetedTest", "remainingRisk"
   ]
 }

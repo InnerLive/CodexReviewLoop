@@ -47,8 +47,6 @@ function New-ReliabilityConfig {
     MaxReviewCycles = 6
     MaxFixAttempts = 2
     MaxArchitectureRevisions = 1
-    MaxArchitecturePaths = 15
-    MaxProductionPaths = 8
     AutoCommit = `$true
     CommitMessagePrefix = 'Reliability'
     HostGates = @()
@@ -61,8 +59,8 @@ function New-ReliabilityConfig {
         ArchitectureCritic = @{ Model = 'fake'; Thinking = 'medium' }
         ArchitectureVeto = @{ Model = 'fake'; Thinking = 'medium' }
         ArchitectureTieBreak = @{ Model = 'fake'; Thinking = 'high' }
-        PointFixer = @{ Model = 'fake'; Thinking = 'high'; Sandbox = 'danger-full-access' }
-        ArchitectureFixer = @{ Model = 'fake'; Thinking = 'max'; Sandbox = 'danger-full-access' }
+        PointFixer = @{ Model = 'fake'; Thinking = 'high' }
+        ArchitectureFixer = @{ Model = 'fake'; Thinking = 'max' }
         FindingVerifier = @{ Model = 'fake'; Thinking = 'low' }
         VerifierConfirm = @{ Model = 'fake'; Thinking = 'low' }
         VerifierTieBreak = @{ Model = 'fake'; Thinking = 'medium' }
@@ -145,11 +143,16 @@ Describe "Unattended reliability boundaries" {
         )
         foreach ($arguments in $calls) {
             @($arguments | Where-Object { $_ -eq "--ignore-user-config" }).Count | Should Be 1
+            @($arguments | Where-Object { $_ -eq "--ignore-rules" }).Count | Should Be 1
+            @($arguments | Where-Object { $_ -eq "--dangerously-bypass-approvals-and-sandbox" }).Count | Should Be 1
+            @($arguments | Where-Object { $_ -eq "--sandbox" }).Count | Should Be 0
         }
     }
 
-    It "enforces loop-owned sandboxes despite profile values" {
+    It "ignores legacy per-role sandbox keys and keeps every role unattended" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.Roles.Reviewer.Sandbox = "read-only"
+        $config.Roles.PointFixer.Sandbox = "workspace-write"
         $module = Get-Module CodexReviewLoop
         & $module {
             param($profile, $repository, $logs, $fake)
@@ -161,39 +164,34 @@ Describe "Unattended reliability boundaries" {
 
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
-        (@($records[0].arguments) -contains "workspace-write") | Should Be $true
-        (@($records[0].arguments) -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $false
-        (@($records[1].arguments) -contains "read-only") | Should Be $true
+        (@($records[0].arguments) -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
+        (@($records[1].arguments) -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
+        @($records | Where-Object { @($_.arguments) -contains "--sandbox" }).Count | Should Be 0
     }
 
-    It "allows analysis commands and blocks orchestrator-owned tests" {
-        $module = Get-Module CodexReviewLoop
-        $allowed = @(
-            "git diff --check",
-            "git blame -L 850,1260 -- src/CoreRuntime/Representations/RepresentationCoordinator.cs",
-            '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''git blame -L 850,1260 -- src/CoreRuntime/Representations/RepresentationCoordinator.cs''',
-            "rg -F -e cache .",
-            "Get-Content -LiteralPath .\README.txt -TotalCount 20"
-        )
-        foreach ($command in $allowed) {
-            (& $module {
-                param($value)
-                Test-ReviewLoopModelOwnedTestCommand -Command $value
-            } $command) | Should Be $false
+    It "rejects worktree changes made by an analysis role with full command access" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "review-result-v1.schema.json"
+        $message = ""
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($profile, $repository, $logs, $fake)
+                Invoke-ConfiguredCodexRole -Config $profile -Role Reviewer -RepoPath $repository `
+                    -Speed standard -Prompt review -LogRoot $logs -CodexPath $fake `
+                    -SchemaName "review-result-v1.schema.json"
+            } $config $repo $logRoot $fakeCodex | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
         }
 
-        $forbidden = @(
-            "dotnet test .\review-loop-test.proj",
-            "dotnet vstest .\tests.dll",
-            "pytest -q",
-            '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''dotnet test .\review-loop-test.proj'''
-        )
-        foreach ($command in $forbidden) {
-            (& $module {
-                param($value)
-                Test-ReviewLoopModelOwnedTestCommand -Command $value
-            } $command) | Should Be $true
-        }
+        $message | Should Match "changed the repository worktree"
+        (& git -C $repo status --porcelain=v1) | Should Not BeNullOrEmpty
+    }
+
+    It "contains no model command allowlist" {
+        (Get-Content -Raw -LiteralPath (Join-Path $root "src\Cli.ps1")) |
+            Should Not Match "Test-ReviewLoopModelOwnedTestCommand|command-policy violation"
     }
 
     It "removes inherited helper-program configuration from model processes" {
@@ -209,7 +207,7 @@ Describe "Unattended reliability boundaries" {
         $startInfo.Environment.ContainsKey("GIT_EXTERNAL_DIFF") | Should Be $false
     }
 
-    It "keeps a failed analysis command inside the successful Codex turn" {
+    It "keeps a failed analysis command inside the successful Codex turn and out of compact output" {
         $planPath = Join-Path $caseRoot "invocations.json"
         Write-ReliabilityJsonArray -Path $planPath -Values @(
             [pscustomobject]@{
@@ -238,8 +236,9 @@ Describe "Unattended reliability boundaries" {
             ForEach-Object { $_ | ConvertFrom-Json })
         $records[0].callKind | Should Be "exec"
         $transcriptText = Get-Content -Raw -LiteralPath $transcript
-        $transcriptText | Should Match "CLI command failed"
-        $transcriptText | Should Match "tests\\missing.cs"
+        $transcriptText | Should Not Match "Agent command failed"
+        $transcriptText | Should Not Match "tests\\missing.cs"
+        (Get-Content -Raw -LiteralPath $call.JsonlPath) | Should Match "tests\\\\missing.cs"
         $allJsonLinesValid = $true
         foreach ($line in @(Get-Content -LiteralPath $call.JsonlPath | Where-Object { $_ })) {
             try {
@@ -252,7 +251,37 @@ Describe "Unattended reliability boundaries" {
         $allJsonLinesValid | Should Be $true
     }
 
-    It "stops model-owned tests and retries on the same thread" {
+    It "keeps a Codex policy decline out of compact output" {
+        $planPath = Join-Path $caseRoot "invocations.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{
+                threadId = "same-thread"
+                commands = @([pscustomobject]@{
+                    command = '"C:\Program Files\PowerShell\7\pwsh.exe" -Command "git blame -L 1,2 README.txt"'
+                    exitCode = -1
+                    status = "declined"
+                    output = "rejected: blocked by policy"
+                })
+            }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+        $transcript = Join-Path $logRoot "terminal.log"
+        & (Get-Module CodexReviewLoop) {
+            param($path)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
+        } $transcript
+
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
+
+        $call.Success | Should Be $true
+        $text = Get-Content -Raw -LiteralPath $transcript
+        $text | Should Not Match "declined by Codex policy"
+        (Get-Content -Raw -LiteralPath $call.JsonlPath) | Should Match '"status":"declined"'
+    }
+
+    It "allows model-owned tests to finish in the same turn" {
         $planPath = Join-Path $caseRoot "invocations.json"
         Write-ReliabilityJsonArray -Path $planPath -Values @(
             [pscustomobject]@{
@@ -260,11 +289,9 @@ Describe "Unattended reliability boundaries" {
                 commands = @([pscustomobject]@{
                     command = "dotnet test .\review-loop-test.proj"
                     exitCode = 0
-                    output = "must never complete"
-                    delayMs = 5000
+                    output = "completed"
                 })
-            },
-            [pscustomobject]@{ threadId = "policy-thread"; commands = @() }
+            }
         )
         $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
 
@@ -272,14 +299,12 @@ Describe "Unattended reliability boundaries" {
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 2
 
         $call.Success | Should Be $true
-        @($call.Attempts).Count | Should Be 2
-        $call.Attempts[0].FailureKind | Should Be "model_owned_test"
+        @($call.Attempts).Count | Should Be 1
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
-        $records[1].callKind | Should Be "resume"
-        $records[1].resumeThreadId | Should Be "policy-thread"
+        $records[0].callKind | Should Be "exec"
         (Get-Content -Raw -LiteralPath $call.JsonlPath) |
-            Should Not Match '"type":"item.completed".*"command":"dotnet test'
+            Should Match '"type":"item.completed".*"command":"dotnet test'
     }
 
     It "accepts rg no-match without retrying" {
@@ -312,8 +337,8 @@ Describe "Unattended reliability boundaries" {
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
 
-        $call.Success | Should Be $false
-        $call.FailureKind | Should Be "role_event_error"
+        $call.Success | Should Be $true
+        $call.FailureKind | Should Be "none"
         $jsonl = Get-Content -Raw -LiteralPath $call.JsonlPath
         $jsonl | Should Not Match "plain-secret-value-123456"
         $jsonl | Should Not Match "json-secret-value-123456"
@@ -331,6 +356,37 @@ Describe "Unattended reliability boundaries" {
             }
         }
         $validJsonLines | Should Be $true
+    }
+
+    It "accepts malformed auxiliary events when the final result is valid" {
+        $planPath = Join-Path $caseRoot "malformed-events.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{ rawEvents = @("not-json"); commands = @() }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
+
+        $call.Success | Should Be $true
+        $call.FailureKind | Should Be "none"
+    }
+
+    It "rejects an explicit turn failure even when the process exits zero" {
+        $planPath = Join-Path $caseRoot "turn-failed-events.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{
+                rawEvents = @('{"type":"turn.failed","message":"turn failed"}')
+                commands = @()
+            }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
+
+        $call.Success | Should Be $false
+        $call.FailureKind | Should Be "turn_failed"
     }
 
     It "redacts structured result files before returning or checkpointing them" {
@@ -412,7 +468,7 @@ Describe "Unattended reliability boundaries" {
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "review-result-v1.schema.json"
 
         $call = Invoke-CodexCliRole -Role PointFixer -RepoPath $repo -Model model -Thinking high `
-            -Sandbox workspace-write -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex `
             -MaxAttempts 2 -SchemaPath (Join-Path $root "schemas\review-result-v1.schema.json")
 
         $call.Success | Should Be $false
@@ -453,26 +509,23 @@ Describe "Unattended reliability boundaries" {
         (Get-Item -LiteralPath $stdoutPath).Length | Should BeGreaterThan 500000
     }
 
-    It "allows only direct recognized test-runner commands" {
+    It "executes an arbitrary structured targeted test" {
+        $pwsh = (Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1).Source
+        $fixer = [pscustomobject]@{
+            targetedTest = [pscustomobject]@{
+                filePath = $pwsh
+                arguments = @("-NoProfile", "-Command", "exit 0")
+                rationale = "repository-specific regression wrapper"
+            }
+        }
         $module = Get-Module CodexReviewLoop
-        $accepted = & $module {
-            @(
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "dotnet test .\x.csproj --no-restore")
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "python -m pytest -k cache")
-            )
-        }
-        @($accepted | Where-Object { $_ }).Count | Should Be 2
-
-        $rejected = & $module {
-            @(
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "Write-Output ok")
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "Invoke-Expression 'Remove-Item x'")
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "python -c 'print(1)'")
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "dotnet test x > result.txt")
-                $null -ne (ConvertFrom-ReviewLoopTargetedCommand "dotnet --version")
-            )
-        }
-        @($rejected | Where-Object { $_ }).Count | Should Be 0
+        $result = & $module {
+            param($value, $repository, $logs)
+            Invoke-ReviewLoopTargetedTests -FixerResult $value -RepoPath $repository `
+                -RunRoot $logs -ClusterId custom -Attempt 1
+        } $fixer $repo $logRoot
+        $result.Success | Should Be $true
+        $fixer.testExecution.Passed | Should Be $true
     }
 
     It "includes staged and untracked files in verifier evidence" {
@@ -488,7 +541,7 @@ Describe "Unattended reliability boundaries" {
         $patch | Should Match "untracked change"
     }
 
-    It "keeps paraphrased findings separate unless their stable identity matches" {
+    It "keeps raw paraphrases provisional until semantic adjudication" {
         $head = & git -C $repo rev-parse HEAD
         $ledger = New-ReviewLoopLedger -RepoPath $repo
         $first = New-ReliabilityFinding
@@ -511,29 +564,9 @@ Describe "Unattended reliability boundaries" {
         @($ledger.Findings | Where-Object { [string]$_.LastSeenReview -eq "r2" }).Count | Should Be 1
     }
 
-    It "keeps point-fix production changes inside the active finding scope" {
-        $state = [pscustomobject]@{ ActiveStrategy = $null }
-        $finding = New-ReliabilityFinding
-        $module = Get-Module CodexReviewLoop
-
-        { & $module {
-            param($loopState, $activeFinding)
-            Assert-ReviewLoopFixScope -State $loopState -Findings @($activeFinding) `
-                -ChangedPaths @("tests/new-regression.test.cs")
-        } $state $finding } | Should Not Throw
-
-        $failure = $null
-        try {
-            & $module {
-                param($loopState, $activeFinding)
-                Assert-ReviewLoopFixScope -State $loopState -Findings @($activeFinding) `
-                    -ChangedPaths @("src/Unrelated.cs")
-            } $state $finding
-        }
-        catch {
-            $failure = $_
-        }
-        $failure.Exception.Data["ReviewLoopStatus"] | Should Be "blocked"
+    It "does not require reviewer-predicted fix paths" {
+        (Get-Content -Raw -LiteralPath (Join-Path $root "src\Loop.ps1")) |
+            Should Not Match "Assert-ReviewLoopFixScope|outside the active finding paths"
     }
 
     It "requires a complete high-confidence architecture approval" {
@@ -597,9 +630,10 @@ Describe "Unattended reliability boundaries" {
             -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
         $finding = $ledger.Findings[0]
         $candidates = @(Get-ReviewLoopTriggerCandidates -Finding $finding -Ledger $ledger)
-        $primary = '{"schemaVersion":"1.0","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"shared","evidence":["README.txt:1"]}'
-        $medium = '{"schemaVersion":"1.0","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"medium","rationale":"uncertain","evidence":["README.txt:1"]}'
-        $tie = '{"schemaVersion":"1.0","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"confirmed","evidence":["README.txt:1"]}'
+        $candidateId = [string]$candidates[0].Finding.Id
+        $primary = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"shared","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
+        $medium = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"medium","rationale":"uncertain","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
+        $tie = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' + $candidateId + '","relation":"same_contract_different_edge","architectureRecommended":true,"confidence":"high","rationale":"confirmed","evidence":[{"path":"README.txt","line":1,"claim":"shared contract"}]}]}'
         $sequence = Join-Path $caseRoot "trigger-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($primary, $medium, $tie)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
@@ -615,7 +649,77 @@ Describe "Unattended reliability boundaries" {
         @($decision.Calls).Count | Should Be 3
     }
 
-    It "rejects resolved adjudication without matching orchestrator test evidence" {
+    It "reuses a stable finding identity after paraphrased reviewer output" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $existingId = [string]$ledger.Findings[0].Id
+        $incoming = New-ReliabilityFinding
+        $incoming.rootCause = "dependency changes are not observed"
+        $incoming.invariant = "cached values must be invalidated when dependencies change"
+        $decision = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' +
+            $existingId +
+            '","relation":"same_root_cause","architectureRecommended":false,"confidence":"high","rationale":"same defect expressed differently","evidence":[{"path":"README.txt","line":1,"claim":"same behavior"}]}]}'
+        $sequence = Join-Path $caseRoot "identity-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @($decision, $decision)
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+        $runRoot = Join-Path $caseRoot "identity-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $resolved = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger, $finding, $repository, $logs, $fake)
+            @(Resolve-ReviewLoopFindingRelations `
+                -Config $profile -State $loopState -StatePath $loopStatePath -Ledger $loopLedger `
+                -Findings @($finding) -RepoPath $repository -Speed standard `
+                -RunRoot $logs -CodexPath $fake)
+        } $config $state $statePath $ledger $incoming $repo $runRoot $fakeCodex
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings $resolved `
+            -ReviewId r2 -Head $state.CurrentHead | Out-Null
+
+        @($ledger.Findings).Count | Should Be 1
+        $ledger.Findings[0].Id | Should Be $existingId
+        @($ledger.Findings[0].IdentityHistory).Count | Should Be 2
+    }
+
+    It "keeps independent findings in the same file separate after adjudication" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $existingId = [string]$ledger.Findings[0].Id
+        $incoming = New-ReliabilityFinding
+        $incoming.rootCause = "unrelated parser validation"
+        $incoming.invariant = "invalid syntax must be rejected"
+        $decision = '{"schemaVersion":"1.0","decisions":[{"candidateFindingId":"' +
+            $existingId +
+            '","relation":"independent_same_file","architectureRecommended":false,"confidence":"high","rationale":"different contract","evidence":[{"path":"README.txt","line":1,"claim":"independent behavior"}]}]}'
+        $sequence = Join-Path $caseRoot "independent-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @($decision, $decision)
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+        $runRoot = Join-Path $caseRoot "independent-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $resolved = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger, $finding, $repository, $logs, $fake)
+            @(Resolve-ReviewLoopFindingRelations `
+                -Config $profile -State $loopState -StatePath $loopStatePath -Ledger $loopLedger `
+                -Findings @($finding) -RepoPath $repository -Speed standard `
+                -RunRoot $logs -CodexPath $fake)
+        } $config $state $statePath $ledger $incoming $repo $runRoot $fakeCodex
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings $resolved `
+            -ReviewId r2 -Head $state.CurrentHead | Out-Null
+
+        @($ledger.Findings).Count | Should Be 2
+    }
+
+    It "returns inconclusive resolved adjudication without orchestrator test evidence" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $runRoot = Join-Path $caseRoot "verifier-run"
         New-Item -ItemType Directory -Path $runRoot | Out-Null
@@ -623,39 +727,25 @@ Describe "Unattended reliability boundaries" {
         $state.ActiveClusterId = "verifier-evidence"
         $statePath = Join-Path $runRoot "run-v1.json"
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
-        $command = "dotnet test .\review-loop-test.proj --no-restore"
-        $wrongCommand = "dotnet test .\different.proj --no-restore"
         $fixerCall = [pscustomobject]@{
             StructuredResult = [pscustomobject]@{
-                targetedTests = @([pscustomobject]@{
-                    command = $command
-                    passed = $true
-                    evidence = "orchestrator exit code 0"
-                })
+                testExecution = [pscustomobject]@{ Passed = $false }
             }
         }
-        $primary = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"medium","rationale":"maybe","evidence":["README.txt:1"],"targetedTest":{"command":"dotnet test .\\review-loop-test.proj --no-restore","passed":true,"evidence":"passed"}}'
-        $wrong = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"claimed","evidence":["README.txt:1"],"targetedTest":{"command":"dotnet test .\\different.proj --no-restore","passed":true,"evidence":"claimed"}}'
+        $primary = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"medium","rationale":"maybe","evidence":[{"path":"README.txt","line":1,"claim":"maybe fixed"}]}'
+        $wrong = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"claimed","evidence":[{"path":"README.txt","line":1,"claim":"claimed fixed"}]}'
         $sequence = Join-Path $caseRoot "verifier-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($primary, $wrong, $wrong)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
 
-        $failure = $null
-        try {
-            & (Get-Module CodexReviewLoop) {
-                param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
-                Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
-                    -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
-                    -FixerCall $fixer -Attempt 1 -CodexPath $fake
-            } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex | Out-Null
-        }
-        catch {
-            $failure = $_
-        }
-
-        $failure | Should Not BeNullOrEmpty
-        $failure.Exception.Data["ReviewLoopStatus"] | Should Be "blocked"
-        $failure.Exception.Message | Should Match "verifier_evidence_mismatch"
+        $verification = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
+            Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
+                -FixerCall $fixer -Attempt 1 -CodexPath $fake
+        } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
+        $verification.Accepted | Should Be $false
+        $verification.Basis | Should Match "lacked orchestrator-owned test evidence"
     }
 
     It "keeps the worktree fingerprint stable when verified files are staged" {
@@ -706,7 +796,8 @@ Describe "Unattended reliability boundaries" {
         $tree | Should Not Be (& git -C $repo rev-parse "HEAD^{tree}")
     }
 
-    It "blocks verification when the patch exceeds its evidence limit" {
+    It "verifies large patches from the worktree without an inline size limit" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
         Set-Content -LiteralPath (Join-Path $repo "oversized.txt") `
             -Value ([string]::new("x", 121000)) -NoNewline
         $runRoot = Join-Path $caseRoot "run"
@@ -717,30 +808,20 @@ Describe "Unattended reliability boundaries" {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         $fixerCall = [pscustomobject]@{
             StructuredResult = [pscustomobject]@{
-                targetedTests = @([pscustomobject]@{
-                    command = "dotnet test .\review-loop-test.proj --no-restore --nologo"
-                    passed = $true
-                    evidence = "passed"
-                })
+                testExecution = [pscustomobject]@{ Passed = $true }
             }
         }
-
-        $failure = $null
-        try {
-            & (Get-Module CodexReviewLoop) {
-                param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer)
-                Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
-                    -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
-                    -FixerCall $fixer -Attempt 1 -CodexPath ""
-            } @{} $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall | Out-Null
-        }
-        catch {
-            $failure = $_
-        }
-
-        $failure | Should Not BeNullOrEmpty
-        $failure.Exception.Data["ReviewLoopStatus"] | Should Be "blocked"
-        $failure.Exception.Message | Should Match "verifier limit is 120000"
+        $result = '{"schemaVersion":"1.0","verdict":"reproduced","confidence":"high","rationale":"still present","evidence":[{"path":"README.txt","line":1,"claim":"current path remains"}]}'
+        $sequence = Join-Path $caseRoot "large-verifier-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @($result)
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+        $verification = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
+            Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
+                -FixerCall $fixer -Attempt 1 -CodexPath $fake
+        } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
+        $verification.Result.verdict | Should Be "reproduced"
     }
 
     It "resolves an already-fixed finding without an empty commit" {
@@ -922,11 +1003,11 @@ Describe "Unattended reliability boundaries" {
                 outcome = "changed"
                 summary = "candidate fix"
                 changedPaths = @()
-                targetedTests = @([pscustomobject]@{
-                    command = "dotnet test .\review-loop-test.proj --no-restore --nologo"
-                    passed = $false
-                    evidence = "not run; orchestrator-owned"
-                })
+                targetedTest = [pscustomobject]@{
+                    filePath = "dotnet"
+                    arguments = @("test", ".\review-loop-test.proj", "--no-restore", "--nologo")
+                    rationale = "targeted regression"
+                }
                 remainingRisk = ""
             }
         }
@@ -1089,26 +1170,112 @@ Describe "Unattended reliability boundaries" {
         $selected | Should BeNullOrEmpty
     }
 
-    It "isolates ledgers and runs by branch and pinned review base" {
+    It "isolates ledgers by branch while keeping a moving review base stable" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.ReviewBase = "main"
         $module = Get-Module CodexReviewLoop
         $mainRoot = & $module {
             param($profile, $repository)
-            (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository).ProfileRoot
+            (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository `
+                -ReviewBaseCommit ("a" * 40)).ProfileRoot
+        } $config $repo
+        $advancedBaseRoot = & $module {
+            param($profile, $repository)
+            (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository `
+                -ReviewBaseCommit ("b" * 40)).ProfileRoot
         } $config $repo
         $initialBranch = & git -C $repo branch --show-current
         & git -C $repo switch -q -c reliability-other
         try {
             $otherRoot = & $module {
                 param($profile, $repository)
-                (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository).ProfileRoot
+                (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository `
+                    -ReviewBaseCommit ("b" * 40)).ProfileRoot
             } $config $repo
         }
         finally {
             & git -C $repo switch -q $initialBranch
         }
 
+        $advancedBaseRoot | Should Be $mainRoot
         $otherRoot | Should Not Be $mainRoot
+    }
+
+    It "does not resume an active checkpoint from a legacy run location" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $paths = & (Get-Module CodexReviewLoop) {
+            param($profile, $repository)
+            New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+        } $config $repo
+        $stableName = Split-Path -Leaf $paths.StableProfileRoot
+        $legacyName = $stableName.Substring(0, $stableName.Length - 8) + "deadbeef"
+        $legacyRoot = Join-Path (Split-Path -Parent $paths.StableProfileRoot) $legacyName
+        $legacyRun = Join-Path $legacyRoot "99999999-legacy-active"
+        New-Item -ItemType Directory -Path $legacyRun -Force | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+        $legacyState = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $legacyRun -ReviewBaseCommit $head
+        $legacyState.Status = "running"
+        $legacyState.Stage = "reviewing"
+        Write-ReviewLoopState -Path (Join-Path $legacyRun "run-v1.json") -State $legacyState | Out-Null
+        $sequence = Join-Path $caseRoot "legacy-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @(
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.RunRoot | Should Not Be $legacyRun
+        (Split-Path -Parent $result.RunRoot) | Should Be $paths.StableProfileRoot
+        (Read-ReviewLoopState -Path (Join-Path $legacyRun "run-v1.json")).Status | Should Be "running"
+    }
+
+    It "imports legacy findings but clears interrupted execution state" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $initialPaths = & (Get-Module CodexReviewLoop) {
+            param($profile, $repository)
+            New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+        } $config $repo
+        $stableName = Split-Path -Leaf $initialPaths.StableProfileRoot
+        $legacyName = $stableName.Substring(0, $stableName.Length - 8) + "cafebabe"
+        $legacyRoot = Join-Path (Split-Path -Parent $initialPaths.StableProfileRoot) $legacyName
+        $legacyRun = Join-Path $legacyRoot "99999999-legacy-fixing"
+        New-Item -ItemType Directory -Path $legacyRun -Force | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+        $legacyState = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $legacyRun -ReviewBaseCommit $head
+        Write-ReviewLoopState -Path (Join-Path $legacyRun "run-v1.json") -State $legacyState | Out-Null
+        $legacyLedger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $legacyLedger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId legacy -Head $head | Out-Null
+        $legacyFinding = $legacyLedger.Findings[0]
+        $legacyFinding.Status = "fixing"
+        $legacyFinding.FixAttempts = 2
+        $legacyFinding.FixerThreadId = "stale-thread"
+        $legacyFinding.BlockedReason = "interrupted"
+        Write-ReviewLoopLedger -Path (Join-Path $legacyRoot "ledger-v1.json") `
+            -Ledger $legacyLedger | Out-Null
+        $paths = & (Get-Module CodexReviewLoop) {
+            param($profile, $repository)
+            New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+        } $config $repo
+
+        & (Get-Module CodexReviewLoop) {
+            param($candidatePaths, $repository, $branch)
+            Import-ReviewLoopLegacyLedgers -Paths $candidatePaths -RepoPath $repository `
+                -Branch $branch -ReviewBase HEAD
+        } $paths $repo (& git -C $repo branch --show-current)
+        $imported = Read-ReviewLoopLedger -Path $paths.LedgerPath -RepoPath $repo
+
+        @($imported.Findings).Count | Should Be 1
+        $imported.Findings[0].Status | Should Be "open"
+        $imported.Findings[0].FixAttempts | Should Be 0
+        $imported.Findings[0].FixerThreadId | Should BeNullOrEmpty
+        $imported.Findings[0].BlockedReason | Should BeNullOrEmpty
     }
 
     It "uses the final fixer attempt after a crash before that call" {
@@ -1151,11 +1318,11 @@ Describe "Unattended reliability boundaries" {
                 outcome = "changed"
                 summary = "old attempt"
                 changedPaths = @("interrupted.txt")
-                targetedTests = @([pscustomobject]@{
-                    command = "dotnet test .\review-loop-test.proj --no-restore --nologo"
-                    passed = $true
-                    evidence = "old"
-                })
+                targetedTest = [pscustomobject]@{
+                    filePath = "dotnet"
+                    arguments = @("test", ".\review-loop-test.proj", "--no-restore", "--nologo")
+                    rationale = "targeted regression"
+                }
                 remainingRisk = ""
             }
         }
@@ -1165,8 +1332,8 @@ Describe "Unattended reliability boundaries" {
         ) -Value '{"type":"thread.started","thread_id":"reliability-thread"}' -Encoding UTF8
         Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "partial"
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
-        $fix = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":[],"targetedTests":[{"command":"dotnet test .\\review-loop-test.proj --no-restore --nologo","passed":false,"evidence":"not run; orchestrator-owned"}],"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":["README.txt:1"],"targetedTest":{"command":"dotnet test .\\review-loop-test.proj --no-restore --nologo","passed":true,"evidence":"passed"}}'
+        $fix = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
+        $resolved = '{"schemaVersion":"1.0","verdict":"resolved","confidence":"high","rationale":"fixed","evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         $resultSequence = Join-Path $caseRoot "results.json"
         Write-ReliabilityJsonArray -Path $resultSequence -Values @(
             $fix,

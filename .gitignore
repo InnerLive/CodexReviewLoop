@@ -4,6 +4,7 @@ eval-results/
 profiles/
 **/terminal.log
 **/ledger-v1.json
+**/ledger-v2.json
 **/run-v1.json
 *.jsonl
 *.stderr.txt

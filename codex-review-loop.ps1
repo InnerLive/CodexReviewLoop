@@ -39,9 +39,10 @@ Starts a new run instead of using the most recent resumable checkpoint.
 
 .PARAMETER OutputMode
 Controls the level of terminal detail:
-compact shows phases, decisions, findings, and failures (default);
-balanced adds concise internal CLI activity;
-detailed adds the start and completion of successful internal commands.
+compact shows phases, decisions, findings, and role or loop failures while hiding
+internal agent-command diagnostics (default);
+balanced adds internal agent-command starts and failures;
+detailed also adds successful completions and no-result searches.
 Internal reasoning is never displayed.
 
 .PARAMETER HeartbeatSeconds

@@ -45,53 +45,6 @@ function ConvertTo-ReviewLoopCanonicalText {
     return ([string]$Value).Trim().Replace("\", "/").ToLowerInvariant()
 }
 
-function ConvertFrom-ReviewLoopDirectCommand {
-    param([Parameter(Mandatory = $true)][string]$Command)
-
-    $tokens = $null
-    $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
-        $Command,
-        [ref]$tokens,
-        [ref]$errors)
-    if (@($errors).Count -gt 0 -or @($ast.EndBlock.Statements).Count -ne 1) {
-        return $null
-    }
-    $commands = @($ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.CommandAst]
-    }, $true))
-    if ($commands.Count -ne 1 -or @($commands[0].Redirections).Count -ne 0 -or
-        [string]$commands[0].InvocationOperator -ne "Unknown") {
-        return $null
-    }
-
-    $parts = [System.Collections.Generic.List[string]]::new()
-    foreach ($element in @($commands[0].CommandElements)) {
-        if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
-            ($element -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
-                @($element.NestedExpressions).Count -eq 0)) {
-            [void]$parts.Add([string]$element.Value)
-        }
-        elseif ($element -is [System.Management.Automation.Language.ConstantExpressionAst]) {
-            [void]$parts.Add([string]$element.Value)
-        }
-        elseif ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
-            [void]$parts.Add([string]$element.Extent.Text)
-        }
-        else {
-            return $null
-        }
-    }
-    if ($parts.Count -eq 0 -or @($parts | Where-Object { $_ -match "[`r`n]" }).Count -gt 0) {
-        return $null
-    }
-    return [pscustomobject]@{
-        FilePath = $parts[0]
-        Arguments = @($parts | Select-Object -Skip 1)
-    }
-}
-
 function Get-ReviewLoopSha256 {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
 
@@ -398,9 +351,6 @@ function New-ReviewLoopProfile {
     MaxReviewCycles = 12
     MaxFixAttempts = 2
     MaxArchitectureRevisions = 1
-    MaxArchitecturePaths = 15
-    MaxProductionPaths = 8
-
     # The unattended loop always commits after successful verification and all host gates.
     AutoCommit = `$true
     CommitMessagePrefix = 'Review-Loop'
@@ -415,8 +365,8 @@ $($hostGates -join "`n")
     # Role settings:
     # - Model: a model ID supported by the installed Codex CLI.
     # - Thinking: low, medium, high, xhigh, or max.
-    # Sandboxes are enforced by the loop: fixers use workspace-write and every
-    # other role is read-only.
+    # Every role runs unattended with approvals, sandboxing, and Codex exec rules
+    # bypassed. Repository invariants and verification are enforced by this tool.
     Roles = @{
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         TriggerJudge = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
@@ -514,8 +464,6 @@ function Import-ReviewLoopConfig {
         MaxReviewCycles = 12
         MaxFixAttempts = 2
         MaxArchitectureRevisions = 1
-        MaxArchitecturePaths = 15
-        MaxProductionPaths = 8
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
     }
@@ -561,8 +509,6 @@ function Assert-ReviewLoopConfigValues {
         MaxReviewCycles = @(2, 100)
         MaxFixAttempts = @(2, 2)
         MaxArchitectureRevisions = @(1, 1)
-        MaxArchitecturePaths = @(1, 100)
-        MaxProductionPaths = @(1, 100)
     }
     foreach ($entry in $limits.GetEnumerator()) {
         try {
@@ -585,10 +531,6 @@ function Assert-ReviewLoopConfigValues {
     if ([int]$Config.MaxReviewCycles -lt [int]$Config.CleanPassesRequired) {
         throw "MaxReviewCycles must be at least CleanPassesRequired."
     }
-    if ([int]$Config.MaxProductionPaths -gt [int]$Config.MaxArchitecturePaths) {
-        throw "MaxProductionPaths cannot exceed MaxArchitecturePaths."
-    }
-
     $roles = @(
         "Reviewer",
         "TriggerJudge", "TriggerConfirm", "TriggerTieBreak",

@@ -71,15 +71,86 @@ function New-ReviewLoopRunPaths {
     $repositoryKey = (Get-ReviewLoopSha256 (
         ConvertTo-ReviewLoopCanonicalText $canonicalRepo
     )).Substring(0, 8)
-    $baseKey = (Get-ReviewLoopSha256 $ReviewBaseCommit).Substring(0, 8)
+    $baseKey = (Get-ReviewLoopSha256 (
+        ConvertTo-ReviewLoopCanonicalText ([string]$Config.ReviewBase)
+    )).Substring(0, 8)
     $profileRoot = Join-Path $logRoot "$($Config.Name)-$repositoryKey-$safeBranch-$baseKey"
     [System.IO.Directory]::CreateDirectory($profileRoot) | Out-Null
+    $legacyRoots = @(
+        Get-ChildItem -LiteralPath $logRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.FullName -ne $profileRoot -and
+                $_.Name.StartsWith("$($Config.Name)-$repositoryKey-$safeBranch-")
+            } |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object { $_.FullName }
+    )
     return [pscustomobject]@{
+        StableProfileRoot = $profileRoot
         ProfileRoot = $profileRoot
         RunRoot = ""
         StatePath = ""
-        LedgerPath = Join-Path $profileRoot "ledger-v1.json"
+        LedgerPath = Join-Path $profileRoot "ledger-v2.json"
+        LegacyProfileRoots = $legacyRoots
     }
+}
+
+function Import-ReviewLoopLegacyLedgers {
+    param(
+        [Parameter(Mandatory = $true)][object]$Paths,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [Parameter(Mandatory = $true)][string]$ReviewBase
+    )
+
+    if (Test-Path -LiteralPath $Paths.LedgerPath) {
+        return
+    }
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($root in @($Paths.LegacyProfileRoots)) {
+        $matchingState = @(Get-ChildItem -LiteralPath $root -Recurse -Filter "run-v1.json" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | ForEach-Object {
+                try { Read-ReviewLoopState -Path $_.FullName } catch { $null }
+            } | Where-Object {
+                $null -ne $_ -and [string]$_.RepoPath -eq $RepoPath -and
+                [string]$_.Branch -eq $Branch -and [string]$_.ReviewBase -eq $ReviewBase
+            } | Select-Object -First 1)
+        if ($matchingState.Count -eq 0) {
+            continue
+        }
+        $legacyPath = @(
+            Join-Path $root "ledger-v2.json"
+            Join-Path $root "ledger-v1.json"
+        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace([string]$legacyPath)) {
+            continue
+        }
+        $legacy = Read-ReviewLoopLedger -Path $legacyPath -RepoPath $RepoPath
+        foreach ($finding in @($legacy.Findings)) {
+            [void]$records.Add($finding)
+        }
+    }
+    if ($records.Count -eq 0) {
+        return
+    }
+    $ledger = New-ReviewLoopLedger -RepoPath $RepoPath
+    $ledger.Findings = @($records | Group-Object Id | ForEach-Object {
+        $ordered = @($_.Group | Sort-Object UpdatedAt)
+        $selected = $ordered[-1]
+        $selected.CreatedAt = [string]($ordered | Sort-Object CreatedAt | Select-Object -First 1).CreatedAt
+        $selected.RecurrenceCount = [int](($ordered | Measure-Object RecurrenceCount -Maximum).Maximum)
+        if ([string]$selected.Status -in @("fixing", "blocked")) {
+            $selected.Status = "open"
+            $selected.FixAttempts = 0
+            $selected.FixerThreadId = ""
+            $selected.BlockedReason = ""
+            $selected.LastBlockedHead = ""
+            $selected.Verification = $null
+        }
+        $selected
+    } | Sort-Object Id)
+    Write-ReviewLoopLedger -Path $Paths.LedgerPath -Ledger $ledger | Out-Null
+    Write-ReviewLoopStatus -Message "Imported $($ledger.Findings.Count) finding(s) into the stable ledger: $($Paths.LedgerPath)" -Kind Info
 }
 
 function Initialize-ReviewLoopRunPaths {
@@ -261,66 +332,6 @@ function Invoke-ReviewLoopHostGates {
     return [pscustomobject]@{ Success = $true; Results = $results.ToArray(); Failure = $null }
 }
 
-function ConvertFrom-ReviewLoopTargetedCommand {
-    param([Parameter(Mandatory = $true)][string]$Command)
-
-    $parsed = ConvertFrom-ReviewLoopDirectCommand -Command $Command
-    if ($null -eq $parsed -or @($parsed.Arguments | Where-Object {
-        $_ -match "[`r`n]" -or $_ -in @("--help", "-h", "--version")
-    }).Count -gt 0) {
-        return $null
-    }
-
-    $runner = [System.IO.Path]::GetFileNameWithoutExtension([string]$parsed.FilePath).ToLowerInvariant()
-    $arguments = @($parsed.Arguments)
-    $isTest = switch ($runner) {
-        "dotnet" { $arguments.Count -gt 0 -and $arguments[0] -in @("test", "vstest") }
-        { $_ -in @("pytest", "ctest", "phpunit") } { $true }
-        { $_ -in @("cargo", "go", "swift", "npm", "pnpm", "yarn", "bun") } {
-            $arguments.Count -gt 0 -and $arguments[0] -eq "test"
-        }
-        { $_ -in @("mvn", "mvnw", "gradle", "gradlew") } {
-            @($arguments | Where-Object { $_ -match "(?i)^test($|[^a-z])" }).Count -gt 0
-        }
-        { $_ -in @("python", "python3") } {
-            $arguments.Count -gt 1 -and $arguments[0] -eq "-m" -and $arguments[1] -eq "pytest"
-        }
-        default { $false }
-    }
-    if (-not $isTest) {
-        return $null
-    }
-    return $parsed
-}
-
-function Test-ReviewLoopTrustedTargetedExecutable {
-    param(
-        [Parameter(Mandatory = $true)][string]$RepoPath,
-        [Parameter(Mandatory = $true)][string]$FilePath
-    )
-
-    if (-not [System.IO.Path]::IsPathRooted($FilePath) -and
-        -not $FilePath.Contains("\") -and -not $FilePath.Contains("/")) {
-        return $true
-    }
-    try {
-        $resolved = Resolve-ReviewLoopHostExecutable -RepoPath $RepoPath -FilePath $FilePath
-        $relative = [System.IO.Path]::GetRelativePath($RepoPath, $resolved).Replace("\", "/")
-        if ($relative -eq ".." -or $relative.StartsWith("../")) {
-            return $false
-        }
-        & git -C $RepoPath cat-file -e "HEAD:$relative" 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            return $false
-        }
-        & git -C $RepoPath diff --quiet HEAD -- $relative 2>$null
-        return $LASTEXITCODE -eq 0
-    }
-    catch {
-        return $false
-    }
-}
-
 function Invoke-ReviewLoopTargetedTests {
     param(
         [Parameter(Mandatory = $true)][object]$FixerResult,
@@ -330,52 +341,55 @@ function Invoke-ReviewLoopTargetedTests {
         [Parameter(Mandatory = $true)][int]$Attempt
     )
 
-    $tests = @($FixerResult.targetedTests)
-    if ($tests.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$tests[0].command)) {
+    $test = $FixerResult.targetedTest
+    if ($null -eq $test -or
+        [string]::IsNullOrWhiteSpace([string]$test.filePath) -or
+        $test.arguments -is [string]) {
         return [pscustomobject]@{
             Success = $false
-            Feedback = "The fixer must return exactly one non-empty targeted test command."
+            Correctable = $true
+            Feedback = "The fixer must return one structured targetedTest with filePath and an arguments list."
             Results = @()
         }
     }
 
-    $test = $tests[0]
-    $command = [string]$test.command
-    $parsedCommand = ConvertFrom-ReviewLoopTargetedCommand -Command $command
-    if ($null -eq $parsedCommand -or
-        -not (Test-ReviewLoopTrustedTargetedExecutable `
-            -RepoPath $RepoPath -FilePath ([string]$parsedCommand.FilePath))) {
-        $test.passed = $false
-        $test.evidence = "Rejected by the orchestrator: use one direct recognized test runner; repository-local wrappers must be tracked and unchanged."
+    $arguments = @($test.arguments | ForEach-Object { [string]$_ })
+    try {
+        Resolve-ReviewLoopHostExecutable -RepoPath $RepoPath -FilePath ([string]$test.filePath) | Out-Null
+    }
+    catch {
         return [pscustomobject]@{
             Success = $false
-            Feedback = "$($test.evidence) Command: $command"
+            Correctable = $true
+            Feedback = "The targeted test executable '$($test.filePath)' could not be resolved: $($_.Exception.Message)"
             Results = @()
         }
     }
 
     $gate = @{
         Name = "Targeted regression test"
-        FilePath = [string]$parsedCommand.FilePath
-        Arguments = @($parsedCommand.Arguments)
+        FilePath = [string]$test.filePath
+        Arguments = $arguments
     }
     $result = Invoke-ReviewLoopHostGate `
         -RepoPath $RepoPath `
         -Gate $gate `
         -RunRoot $RunRoot `
         -ClusterId "$ClusterId-fix-$Attempt"
-    $test.passed = [bool]$result.Success
-    $test.evidence = if ($result.Success) {
-        "Executed by the orchestrator; exit code 0. Log: $($result.LogPath)"
-    }
-    else {
-        "Executed by the orchestrator; exit code $($result.ExitCode). Log: $($result.LogPath)"
-    }
+    $FixerResult | Add-Member -Force -NotePropertyName testExecution -NotePropertyValue ([pscustomobject]@{
+        FilePath = [string]$result.FilePath
+        Arguments = @($result.Arguments)
+        Passed = [bool]$result.Success
+        ExitCode = [int]$result.ExitCode
+        Evidence = "Executed independently by the orchestrator. Log: $($result.LogPath)"
+        LogPath = [string]$result.LogPath
+    })
     return [pscustomobject]@{
         Success = [bool]$result.Success
+        Correctable = $false
         Feedback = if ($result.Success) { "" } else {
             $excerpt = @(Get-ReviewLoopTextExcerpt -Text $result.Output -MaxLines 6) -join " "
-            "Targeted regression test failed. Command: $command. $($test.evidence) $excerpt"
+            "Targeted regression test failed: $($test.filePath) $($arguments -join ' '). Exit code $($result.ExitCode). $excerpt"
         }
         Results = @($result)
     }
@@ -414,44 +428,107 @@ function Update-ReviewLoopFixerResultFromWorktree {
     return $changedPaths
 }
 
-function Assert-ReviewLoopFixScope {
+function Resolve-ReviewLoopFindingRelations {
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
         [Parameter(Mandatory = $true)][object]$State,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
-        [Parameter(Mandatory = $true)][string[]]$ChangedPaths
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Speed,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [string]$CodexPath = ""
     )
 
-    $strategy = $State.ActiveStrategy
-    $allowed = if ($null -ne $strategy -and [bool]$strategy.Approved) {
-        @($strategy.Proposal.steps | ForEach-Object {
-            ConvertTo-ReviewLoopCanonicalText ([string]$_.path)
-        } | Sort-Object -Unique)
-    }
-    else {
-        @($Findings | ForEach-Object {
-            ConvertTo-ReviewLoopCanonicalText ([string]$_.Path)
-            @($_.FixPaths) | ForEach-Object {
-                ConvertTo-ReviewLoopCanonicalText ([string]$_)
+    $resolved = [System.Collections.Generic.List[object]]::new()
+    $candidateLedger = [pscustomobject]@{ Findings = @($Ledger.Findings) }
+    foreach ($finding in @($Findings)) {
+        $incoming = ConvertTo-ReviewLoopFindingRecord `
+            -Finding $finding -ReviewId "incoming" -Head ([string]$State.CurrentHead)
+        $incoming.Id = "incoming-" + (Get-ReviewLoopSha256 (
+            "$($incoming.Path)`n$($incoming.Component)`n$($incoming.RootCause)`n$($incoming.Invariant)"
+        )).Substring(0, 20)
+        $candidates = @(Get-ReviewLoopTriggerCandidates -Finding $incoming -Ledger $candidateLedger)
+        $decision = Invoke-ReviewLoopTriggerJudge `
+            -Config $Config -State $State -StatePath $StatePath `
+            -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot `
+            -Finding $incoming -Candidates $candidates -CodexPath $CodexPath
+        $sameRoot = @($decision.Relations | Where-Object {
+            [string]$_.relation -eq "same_root_cause" -and [string]$_.confidence -eq "high"
+        })
+        $matchedId = ""
+        if ($sameRoot.Count -gt 0) {
+            $sameIds = @($sameRoot | ForEach-Object { [string]$_.candidateFindingId })
+            $matches = @($candidateLedger.Findings | Where-Object {
+                [string]$_.Id -in $sameIds
+            } | Sort-Object CreatedAt, Id)
+            if ($matches.Count -gt 0) {
+                $matchedId = [string]$matches[0].Id
+                foreach ($duplicate in @($matches | Select-Object -Skip 1)) {
+                    if ([string]$duplicate.Status -notin @("duplicate", "superseded")) {
+                        $duplicate.Status = "duplicate"
+                        $duplicate.BlockedReason = "Semantically identical to $matchedId."
+                        $duplicate.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+                    }
+                }
             }
-        } | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        } | Sort-Object -Unique)
+        }
+        $relations = @($decision.Relations | Where-Object {
+            [string]$_.candidateFindingId -ne $matchedId
+        })
+        $finding | Add-Member -Force -NotePropertyName matchedFindingId -NotePropertyValue $matchedId
+        $finding | Add-Member -Force -NotePropertyName relations -NotePropertyValue $relations
+        [void]$resolved.Add($finding)
+        $provisional = ConvertTo-ReviewLoopFindingRecord `
+            -Finding $finding -ReviewId "incoming" -Head ([string]$State.CurrentHead)
+        if (@($candidateLedger.Findings | Where-Object {
+            [string]$_.Id -eq [string]$provisional.Id
+        }).Count -eq 0) {
+            $candidateLedger.Findings = @($candidateLedger.Findings) + $provisional
+        }
     }
-    $allowImplicitTestPaths = $null -eq $strategy -or -not [bool]$strategy.Approved
-    $unexpected = @($ChangedPaths | Where-Object {
-        $path = ConvertTo-ReviewLoopCanonicalText $_
-        $isTestPath = $path -match '(^|/)(tests?|specs?|__tests__)(/|$)' -or
-            (Split-Path -Leaf $path) -match '(?i)(^test[_-]|[_-]test\.|\.tests?\.|\.spec\.)'
-        $path -notin $allowed -and -not ($allowImplicitTestPaths -and $isTestPath)
-    })
-    if ($unexpected.Count -gt 0) {
-        $scopeName = if ($null -ne $strategy -and [bool]$strategy.Approved) {
-            "approved architecture proposal"
+    return $resolved.ToArray()
+}
+
+function Add-ReviewLoopReciprocalRelations {
+    param(
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][object[]]$Findings
+    )
+
+    foreach ($finding in @($Findings)) {
+        $recordId = [string](Get-ReviewLoopObjectProperty `
+            -Object $finding -Name "matchedFindingId" -Default "")
+        if ([string]::IsNullOrWhiteSpace($recordId)) {
+            $recordId = Get-ReviewLoopFindingId `
+                -Path ([string]$finding.path) -Component ([string]$finding.component) `
+                -RootCause ([string]$finding.rootCause) -Invariant ([string]$finding.invariant)
         }
-        else {
-            "active finding paths"
+        foreach ($relation in @($finding.relations)) {
+            $candidate = $Ledger.Findings | Where-Object {
+                [string]$_.Id -eq [string]$relation.candidateFindingId
+            } | Select-Object -First 1
+            if ($null -eq $candidate -or [string]$candidate.Id -eq $recordId) {
+                continue
+            }
+            if ($candidate.PSObject.Properties.Name -notcontains "Relations") {
+                $candidate | Add-Member -NotePropertyName Relations -NotePropertyValue @()
+            }
+            $reverse = [pscustomobject]@{
+                candidateFindingId = $recordId
+                relation = [string]$relation.relation
+                architectureRecommended = [bool]$relation.architectureRecommended
+                confidence = [string]$relation.confidence
+                rationale = [string]$relation.rationale
+                evidence = @($relation.evidence)
+            }
+            $candidate.Relations = @(
+                @($candidate.Relations | Where-Object {
+                    [string]$_.candidateFindingId -ne $recordId
+                }) + $reverse
+            )
         }
-        Stop-ReviewLoopBlocked -Message "Fixer changed path(s) outside the ${scopeName}: $($unexpected -join ', ')."
     }
 }
 
@@ -753,10 +830,6 @@ function Invoke-ReviewLoopAttemptAssessment {
     $changedPaths = @(Update-ReviewLoopFixerResultFromWorktree `
         -FixerResult $FixerCall.StructuredResult `
         -RepoPath $RepoPath)
-    if ($changedPaths.Count -gt [int]$Config.MaxArchitecturePaths) {
-        Stop-ReviewLoopBlocked -Message "Fixer changed $($changedPaths.Count) paths; the hard limit is $($Config.MaxArchitecturePaths)."
-    }
-    Assert-ReviewLoopFixScope -State $State -Findings $Findings -ChangedPaths $changedPaths
     $worktreeSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
     if ([string]$worktreeSnapshot.Head -ne [string]$State.CurrentHead) {
         Stop-ReviewLoopBlocked -Message "Repository HEAD changed during the fixer role."
@@ -790,7 +863,11 @@ function Invoke-ReviewLoopAttemptAssessment {
         -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "The targeted test"
     if (-not $tests.Success) {
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "test_failed"
-        return [pscustomobject]@{ Completed = $false; Feedback = $tests.Feedback }
+        return [pscustomobject]@{
+            Completed = $false
+            Feedback = $tests.Feedback
+            RetrySameAttempt = [bool]$tests.Correctable
+        }
     }
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "tested"
 
@@ -798,8 +875,9 @@ function Invoke-ReviewLoopAttemptAssessment {
         -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
         -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
         -Attempt $Attempt -CodexPath $CodexPath
-    $targetedCommand = [string]$verification.Result.targetedTest.command
-    $targetedState = if ([bool]$verification.Result.targetedTest.passed) { "passed" } else { "failed" }
+    $targetedTest = $FixerCall.StructuredResult.targetedTest
+    $targetedCommand = "$($targetedTest.filePath) $(@($targetedTest.arguments) -join ' ')".Trim()
+    $targetedState = if ([bool]$FixerCall.StructuredResult.testExecution.Passed) { "passed" } else { "failed" }
     Write-ReviewLoopStatus `
         -Message "Verifier: $($verification.Result.verdict) · Confidence $($verification.Result.confidence) · $($verification.Basis) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
         -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
@@ -820,7 +898,7 @@ function Invoke-ReviewLoopAttemptAssessment {
             throw $completion.Feedback
         }
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "gate_failed"
-        return [pscustomobject]@{ Completed = $false; Feedback = $completion.Feedback }
+        return [pscustomobject]@{ Completed = $false; Feedback = $completion.Feedback; RetrySameAttempt = $false }
     }
 
     if ([string]$verification.Result.verdict -eq "obsolete" -and (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
@@ -835,6 +913,7 @@ function Invoke-ReviewLoopAttemptAssessment {
 
     return [pscustomobject]@{
         Completed = $false
+        RetrySameAttempt = $false
         Feedback = "Verifier returned $($verification.Result.verdict) with $($verification.Result.confidence) confidence: $($verification.Result.rationale)"
     }
 }
@@ -868,6 +947,7 @@ function Invoke-ReviewLoopFixWorkflow {
 
     $feedback = "None."
     $retryCurrentAttempt = $Recover -and $attempt -gt 0
+    $technicalCorrections = 0
     $storedAttempt = [int](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "Attempt" -Default -1)
     $storedSuccess = [bool](Get-ReviewLoopObjectProperty `
@@ -904,7 +984,14 @@ function Invoke-ReviewLoopFixWorkflow {
                 -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
             if ($assessment.Completed) { return $true }
             $feedback = [string]$assessment.Feedback
-            $retryCurrentAttempt = $false
+            if ([bool](Get-ReviewLoopObjectProperty -Object $assessment -Name "RetrySameAttempt" -Default $false) -and
+                $technicalCorrections -lt 2) {
+                $technicalCorrections++
+                $retryCurrentAttempt = $true
+            }
+            else {
+                $retryCurrentAttempt = $false
+            }
         }
     }
     elseif ($retryCurrentAttempt) {
@@ -955,12 +1042,22 @@ function Invoke-ReviewLoopFixWorkflow {
             -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
         if ($assessment.Completed) { return $true }
         $feedback = [string]$assessment.Feedback
+        if ([bool](Get-ReviewLoopObjectProperty -Object $assessment -Name "RetrySameAttempt" -Default $false) -and
+            $technicalCorrections -lt 2) {
+            $technicalCorrections++
+            $retryCurrentAttempt = $true
+        }
     }
 
     $reason = "Finding cluster remained open after $attempt fix attempts."
     Set-ReviewLoopFindingsStatus -Findings $Findings -Status "blocked" -Reason $reason
+    foreach ($finding in $Findings) {
+        $finding.LastBlockedHead = [string]$State.CurrentHead
+    }
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
-    Stop-ReviewLoopBlocked -Message $reason
+    Write-ReviewLoopStatus -Message "$reason Independent clusters will continue." -Kind Error
+    Clear-ReviewLoopActiveCluster -State $State -StatePath $StatePath -Stage "cluster_blocked"
+    return $false
 }
 
 function Invoke-ReviewLoopCluster {
@@ -977,24 +1074,31 @@ function Invoke-ReviewLoopCluster {
         [string]$CodexPath = ""
     )
 
-    $State.ActiveClusterId = [string]$Findings[0].ClusterId
+    $clusterKey = @($Findings | ForEach-Object { [string]$_.Id } | Sort-Object) -join "`n"
+    $State.ActiveClusterId = "C-" + (Get-ReviewLoopSha256 $clusterKey).Substring(0, 16)
     $State.ActiveFindingIds = @($Findings | ForEach-Object { [string]$_.Id })
     $State.ArchitectureRevision = 0
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "cluster_selected"
     Write-ReviewLoopRule -Title "Finding-Cluster $($State.ActiveClusterId)" -Kind Review
     Write-ReviewLoopStatus -Message "$($Findings.Count) Finding(s): $(@($Findings | ForEach-Object { $_.Title }) -join '; ')" -Kind Review
 
-    $primary = $Findings[0]
-    $candidates = @(Get-ReviewLoopTriggerCandidates -Finding $primary -Ledger $Ledger)
-    $trigger = Invoke-ReviewLoopTriggerJudge `
-        -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
-        -Speed $Speed -RunRoot $RunRoot -Finding $primary -Candidates $candidates -CodexPath $CodexPath
-    $adjudication = switch (@($trigger.Calls).Count) {
-        0 { "without a model call" }
-        1 { "Luna" }
-        2 { "Luna + Sol confirmation" }
-        default { "Luna + Sol + Terra-Tie-Break" }
+    $groupIds = @($Findings | ForEach-Object { [string]$_.Id })
+    $relations = @($Findings | ForEach-Object { @($_.Relations) } | Where-Object {
+        [string]$_.candidateFindingId -in $groupIds -and
+        [string]$_.confidence -eq "high"
+    })
+    $architectureRecommended = $Findings.Count -gt 1 -and @($relations | Where-Object {
+        [bool]$_.architectureRecommended -and
+        [string]$_.relation -in @("same_root_cause", "same_contract_different_edge")
+    }).Count -gt 0
+    $trigger = [pscustomobject]@{
+        ArchitectureRecommended = $architectureRecommended
+        Relation = if ($architectureRecommended) { "same_contract_different_edge" } else { "independent_same_file" }
+        Confidence = "high"
+        Rationale = "Reused the independently adjudicated ledger relations."
+        Relations = $relations
     }
+    $adjudication = "reused Luna + Sol$(if (@($relations | Where-Object { [string]$_.rationale -match 'adjudicat' }).Count -gt 0) { ' + Terra' } else { '' })"
     $triggerKind = if ($trigger.ArchitectureRecommended) { "Architecture" } elseif ($trigger.Confidence -eq "high") { "Info" } else { "Warning" }
     Write-ReviewLoopStatus `
         -Message "Trigger: $($trigger.Relation) · Confidence $($trigger.Confidence) · $adjudication" `
@@ -1023,6 +1127,46 @@ function Invoke-ReviewLoopCluster {
         -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath | Out-Null
 }
 
+function Get-ReviewLoopSemanticFindingGroups {
+    param([Parameter(Mandatory = $true)][object]$Ledger)
+
+    $open = @(Get-ReviewLoopOpenFindings -Ledger $Ledger)
+    $byId = @{}
+    foreach ($finding in $open) {
+        $byId[[string]$finding.Id] = $finding
+    }
+    $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $groups = [System.Collections.Generic.List[object]]::new()
+    foreach ($seed in $open) {
+        if (-not $visited.Add([string]$seed.Id)) {
+            continue
+        }
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $group = [System.Collections.Generic.List[object]]::new()
+        $queue.Enqueue($seed)
+        while ($queue.Count -gt 0) {
+            $current = $queue.Dequeue()
+            [void]$group.Add($current)
+            $neighborIds = @(
+                @($open | Where-Object {
+                    [string]$_.ClusterId -eq [string]$current.ClusterId
+                } | ForEach-Object { [string]$_.Id })
+                @($current.Relations | Where-Object {
+                    [string]$_.confidence -eq "high" -and
+                    [string]$_.relation -in @("same_root_cause", "same_contract_different_edge")
+                } | ForEach-Object { [string]$_.candidateFindingId })
+            ) | Sort-Object -Unique
+            foreach ($neighborId in $neighborIds) {
+                if ($byId.ContainsKey($neighborId) -and $visited.Add($neighborId)) {
+                    $queue.Enqueue($byId[$neighborId])
+                }
+            }
+        }
+        [void]$groups.Add([pscustomobject]@{ Findings = $group.ToArray() })
+    }
+    return $groups.ToArray()
+}
+
 function Invoke-ReviewLoopOpenClusters {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -1036,10 +1180,8 @@ function Invoke-ReviewLoopOpenClusters {
         [string]$CodexPath = ""
     )
 
-    $groups = @(Get-ReviewLoopOpenFindings -Ledger $Ledger |
-        Group-Object ClusterId | Sort-Object Name)
-    foreach ($group in $groups) {
-        $activeGroup = @($group.Group | Where-Object {
+    foreach ($group in @(Get-ReviewLoopSemanticFindingGroups -Ledger $Ledger)) {
+        $activeGroup = @($group.Findings | Where-Object {
             [string]$_.Status -in @("pending", "open", "fixing")
         })
         if ($activeGroup.Count -eq 0) {
@@ -1160,7 +1302,7 @@ function Invoke-ReviewLoopCore {
     $resumed = $false
     $resumedFromFailure = $false
     if (-not $NewRun) {
-        $active = Get-ReviewLoopLatestActiveStatePath -ProfileRoot $paths.ProfileRoot
+        $active = Get-ReviewLoopLatestActiveStatePath -ProfileRoot $paths.StableProfileRoot
         if (-not [string]::IsNullOrWhiteSpace($active)) {
             $statePath = $active
             $state = Read-ReviewLoopState -Path $statePath
@@ -1263,6 +1405,9 @@ function Invoke-ReviewLoopCore {
         -ColorMode $ColorMode `
         -TranscriptPath $terminalPath
 
+    Import-ReviewLoopLegacyLedgers `
+        -Paths $paths -RepoPath $repo -Branch $branch `
+        -ReviewBase ([string]$config.ReviewBase)
     $ledger = Read-ReviewLoopLedger -Path $paths.LedgerPath -RepoPath $repo
     if ($NewRun) {
         foreach ($finding in @($ledger.Findings | Where-Object {
@@ -1318,10 +1463,6 @@ function Invoke-ReviewLoopCore {
         Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
             "rev-parse", "--verify", "$($state.ReviewBaseCommit)^{commit}"
         ) | Out-Null
-        $blockedAtStart = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" })
-        if ($blockedAtStart.Count -gt 0) {
-            Stop-ReviewLoopBlocked -Message "Ledger contains $($blockedAtStart.Count) blocked findings."
-        }
         $resumedCluster = Resume-ReviewLoopInterruptedFix `
             -Config $config -State $state -StatePath $statePath `
             -Ledger $ledger -LedgerPath $paths.LedgerPath `
@@ -1347,14 +1488,39 @@ function Invoke-ReviewLoopCore {
                 $state.ReviewCycle = [int]$state.ReviewCycle + 1
             }
             $state.CurrentHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
+            $reopened = @($ledger.Findings | Where-Object {
+                [string]$_.Status -eq "blocked" -and
+                [string]$_.LastBlockedHead -ne [string]$state.CurrentHead
+            })
+            foreach ($finding in $reopened) {
+                $finding.Status = "open"
+                $finding.FixAttempts = 0
+                $finding.FixerThreadId = ""
+                $finding.BlockedReason = ""
+                $finding.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+            }
+            if ($reopened.Count -gt 0) {
+                Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
+                Write-ReviewLoopStatus -Message "Reopened $($reopened.Count) blocked finding(s) because HEAD changed." -Kind Warning
+            }
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewing"
             Write-ReviewLoopRule -Title ("Review cycle {0}/{1}" -f $state.ReviewCycle, $config.MaxReviewCycles) -Kind Review
             $review = Invoke-ReviewLoopReview `
                 -Config $config -State $state -StatePath $statePath -Ledger $ledger -RepoPath $repo `
                 -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
-            Merge-ReviewLoopFindings `
-                -Ledger $ledger -Findings @($review.Result.findings) `
-                -ReviewId $review.ReviewId -Head $review.Head | Out-Null
+            $adjudicatedFindings = @()
+            if (@($review.Result.findings).Count -gt 0) {
+                $adjudicatedFindings = @(Resolve-ReviewLoopFindingRelations `
+                    -Config $config -State $state -StatePath $statePath -Ledger $ledger `
+                    -Findings @($review.Result.findings) -RepoPath $repo -Speed $Speed `
+                    -RunRoot $paths.RunRoot -CodexPath $CodexPath)
+            }
+            if ($adjudicatedFindings.Count -gt 0) {
+                Merge-ReviewLoopFindings `
+                    -Ledger $ledger -Findings $adjudicatedFindings `
+                    -ReviewId $review.ReviewId -Head $review.Head | Out-Null
+                Add-ReviewLoopReciprocalRelations -Ledger $ledger -Findings $adjudicatedFindings
+            }
             Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewed"
             if ((Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")) -ne
@@ -1363,14 +1529,14 @@ function Invoke-ReviewLoopCore {
             }
 
             $blocked = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" })
-            if ($blocked.Count -gt 0) {
-                Stop-ReviewLoopBlocked -Message "Ledger contains $($blocked.Count) blocked findings."
-            }
             $open = @(Get-ReviewLoopOpenFindings -Ledger $ledger)
             if ([string]$review.Result.classification -eq "findings" -and $open.Count -eq 0) {
                 Stop-ReviewLoopBlocked -Message "Reviewer returned findings, but the ledger exposed none as open; refusing a zero-progress review loop."
             }
             if ($open.Count -eq 0 -and [string]$review.Result.classification -eq "clean") {
+                if ($blocked.Count -gt 0) {
+                    Stop-ReviewLoopBlocked -Message "All independent work completed, but $($blocked.Count) finding(s) remain blocked on the current HEAD."
+                }
                 if ([string]$state.CleanHead -eq [string]$review.Head) {
                     $state.CleanPasses = [int]$state.CleanPasses + 1
                 }

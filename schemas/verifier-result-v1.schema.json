@@ -12,21 +12,20 @@
     "rationale": { "type": "string" },
     "evidence": {
       "type": "array",
-      "items": { "type": "string" }
-    },
-    "targetedTest": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "command": { "type": "string" },
-        "passed": { "type": "boolean" },
-        "evidence": { "type": "string" }
-      },
-      "required": ["command", "passed", "evidence"]
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "claim": { "type": "string" }
+        },
+        "required": ["path", "line", "claim"]
+      }
     }
   },
   "required": [
     "schemaVersion", "verdict", "confidence", "rationale",
-    "evidence", "targetedTest"
+    "evidence"
   ]
 }
