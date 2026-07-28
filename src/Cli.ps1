@@ -328,77 +328,11 @@ function Clear-ReviewLoopModelHelperEnvironment {
     }
 }
 
-function Test-ReviewLoopForbiddenRoleCommand {
+function Test-ReviewLoopModelOwnedTestCommand {
     param([Parameter(Mandatory = $true)][string]$Command)
 
     $payload = Get-ReviewLoopCommandPayload -Command $Command
-    if ($null -ne (ConvertFrom-ReviewLoopTargetedCommand -Command $payload)) {
-        return $true
-    }
-    $parsed = ConvertFrom-ReviewLoopDirectCommand -Command $payload
-    if ($null -eq $parsed) {
-        return $true
-    }
-    $runner = [System.IO.Path]::GetFileNameWithoutExtension([string]$parsed.FilePath).ToLowerInvariant()
-    $arguments = @($parsed.Arguments | ForEach-Object { [string]$_ })
-
-    if ($runner -eq "git") {
-        $gitArguments = @($arguments | ForEach-Object { $_.ToLowerInvariant() })
-        $forbiddenGitOptions = @(
-            "-C", "-c", "--config-env", "--exec-path", "--git-dir", "--work-tree",
-            "-o", "--ext-diff", "--textconv", "--filters", "--open-files-in-pager"
-        )
-        if (@($gitArguments | Where-Object {
-            $_ -in $forbiddenGitOptions -or
-            $_ -match '^(?:-[cC].+|-[oO].+)$' -or
-            $_ -match '^--(?:config-env|exec-path|git-dir|work-tree|ext-diff|textconv|filters|open-files-in-pager)='
-        }).Count -gt 0) {
-            return $true
-        }
-        $allowedGlobalOptions = @(
-            "--no-pager", "--no-optional-locks", "--literal-pathspecs",
-            "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs"
-        )
-        $subcommandIndex = 0
-        while ($subcommandIndex -lt $gitArguments.Count -and
-            $gitArguments[$subcommandIndex] -in $allowedGlobalOptions) {
-            $subcommandIndex++
-        }
-        if ($subcommandIndex -ge $gitArguments.Count) {
-            return $true
-        }
-        $readOnlyVerbs = @(
-            "blame", "cat-file", "describe", "diff", "for-each-ref", "grep",
-            "log", "ls-files", "ls-tree", "merge-base", "name-rev", "rev-parse",
-            "show", "status"
-        )
-        return $gitArguments[$subcommandIndex] -notin $readOnlyVerbs
-    }
-
-    if ($runner -in @("rg", "ripgrep") -and @($arguments | Where-Object {
-        $_ -in @("--pre", "--hostname-bin", "--search-zip", "-z") -or
-        $_ -match '^--(?:pre|hostname-bin)=' -or
-        $_ -match '^-[a-z]*z[a-z]*$'
-    }).Count -gt 0) {
-        return $true
-    }
-    if ($runner -in @("rg", "ripgrep")) {
-        return $false
-    }
-
-    $allowedRunners = @(
-        "apply_patch", "apply-patch",
-        "rg", "ripgrep", "tree", "where",
-        "get-childitem", "get-content", "get-filehash", "get-item",
-        "get-location", "get-command", "resolve-path",
-        "test-path", "compare-object", "measure-object", "select-object",
-        "format-list", "format-table", "out-string", "write-output",
-        "dir", "ls", "type", "pwd", "echo"
-    )
-    if ($runner -notin $allowedRunners) {
-        return $true
-    }
-    return $false
+    return $null -ne (ConvertFrom-ReviewLoopTargetedCommand -Command $payload)
 }
 
 function Update-ReviewLoopCodexActivity {
@@ -408,8 +342,8 @@ function Update-ReviewLoopCodexActivity {
     )
 
     foreach ($property in @(
-        "CommandFailureCount", "EventErrorCount", "EventStreamLossCount",
-        "PolicyViolationCount", "MalformedEventCount"
+        "EventErrorCount", "EventStreamLossCount", "PolicyViolationCount",
+        "MalformedEventCount"
     )) {
         if ($Activity.PSObject.Properties.Name -notcontains $property) {
             $Activity | Add-Member -NotePropertyName $property -NotePropertyValue 0
@@ -466,10 +400,10 @@ function Update-ReviewLoopCodexActivity {
         $Activity.ActionCount = [int]$Activity.ActionCount + 1
         if ($itemType -eq "command_execution") {
             $command = [string](Get-ReviewLoopObjectProperty -Object $item -Name "command" -Default "command")
-            if (Test-ReviewLoopForbiddenRoleCommand -Command $command) {
+            if (Test-ReviewLoopModelOwnedTestCommand -Command $command) {
                 $Activity.PolicyViolationCount = [int]$Activity.PolicyViolationCount + 1
                 $Activity.PolicyViolationReason = ConvertTo-ReviewLoopRedactedText (
-                    "Model role attempted a command outside the unattended allowlist: $command"
+                    "Model role attempted an orchestrator-owned test command: $command"
                 )
                 Write-ReviewLoopStatus -Message $Activity.PolicyViolationReason -Kind Error -Indent 1
             }
@@ -489,7 +423,6 @@ function Update-ReviewLoopCodexActivity {
                 }
             }
             else {
-                $Activity.CommandFailureCount = [int]$Activity.CommandFailureCount + 1
                 Write-ReviewLoopStatus -Message "CLI command failed (exit code $exitCode): $command" -Kind Warning -Indent 1
                 foreach ($excerpt in @(Get-ReviewLoopTextExcerpt -Text $output -MaxLines 4)) {
                     Write-ReviewLoopStatus -Message $excerpt -Kind Muted -Indent 2
@@ -634,7 +567,6 @@ function Invoke-ReviewLoopObservedProcess {
         ActionCount = 0
         ThreadId = ""
         LastActivity = [DateTimeOffset]::UtcNow
-        CommandFailureCount = 0
         EventErrorCount = 0
         EventStreamLossCount = 0
         PolicyViolationCount = 0
@@ -817,7 +749,6 @@ function Invoke-ReviewLoopObservedProcess {
         ActionCount = [int]$activity.ActionCount
         ThreadId = [string]$activity.ThreadId
         TimedOut = $timedOut
-        CommandFailureCount = [int]$activity.CommandFailureCount
         EventErrorCount = [int]$activity.EventErrorCount
         EventStreamLossCount = [int]$activity.EventStreamLossCount
         PolicyViolationCount = [int]$activity.PolicyViolationCount
@@ -974,7 +905,7 @@ function Invoke-CodexCliRole {
         $structured = $null
         if ($null -ne $observed -and [int]$observed.PolicyViolationCount -gt 0) {
             $exitCode = 5
-            $failureKind = "forbidden_role_command"
+            $failureKind = "model_owned_test"
             $failureReason = [string]$observed.PolicyViolationReason
         }
         elseif ($null -ne $observed -and [bool]$observed.InputWriteFailed) {
@@ -986,11 +917,6 @@ function Invoke-CodexCliRole {
             $exitCode = 5
             $failureKind = "malformed_event_stream"
             $failureReason = "$($observed.MalformedEventCount) malformed Codex JSONL event(s) occurred; the role trace was rejected."
-        }
-        elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.CommandFailureCount -gt 0) {
-            $exitCode = 5
-            $failureKind = "role_command_error"
-            $failureReason = "$($observed.CommandFailureCount) internal command(s) failed; the role result was rejected."
         }
         elseif ($exitCode -eq 0 -and $null -ne $observed -and [int]$observed.EventErrorCount -gt 0) {
             $exitCode = 5
@@ -1077,10 +1003,9 @@ function Invoke-CodexCliRole {
             "timeout",
             "invalid_output",
             "invalid_structured_output",
-            "role_command_error",
             "role_event_error",
             "event_stream_loss",
-            "forbidden_role_command",
+            "model_owned_test",
             "input_write_error",
             "malformed_event_stream"
         )

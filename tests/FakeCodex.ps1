@@ -242,7 +242,7 @@ if ($hasPlanCommands) {
 elseif (-not [string]::IsNullOrWhiteSpace($commandExitText)) {
     $legacyOutput = if ($null -eq $commandOutputText) { "fake command output" } else { $commandOutputText }
     [void]$commandPlans.Add([pscustomobject]@{
-        command = "Get-Location"
+        command = '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''Get-Location'''
         exitCode = [int]$commandExitText
         output = $legacyOutput
     })
@@ -254,7 +254,7 @@ foreach ($commandPlan in $commandPlans) {
     $commandName = [string](Get-FakePlanValue `
         -Plan $commandPlan `
         -Name "command" `
-        -Default "Get-Location")
+        -Default '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''Get-Location''')
     $commandExit = [int](Get-FakePlanValue -Plan $commandPlan -Name "exitCode" -Default 0)
     $commandOutput = [string](Get-FakePlanValue -Plan $commandPlan -Name "output" -Default "")
     $commandDelayText = [string](Get-FakePlanValue `

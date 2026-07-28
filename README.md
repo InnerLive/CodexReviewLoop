@@ -90,23 +90,18 @@ exact command match to passing targeted-test evidence produced by the
 orchestrator; otherwise Sol confirmation or Terra adjudication is required.
 Configured host gates still run independently before every commit.
 
-If a model role attempts a build, test, process-control command, unknown
-executable, or repository script, the loop stops its process tree as soon as
-Codex reports the command, rejects the role result, and retries within the
-technical budget. A fixer edits the worktree and returns exactly one direct
-targeted-test command. The orchestrator validates that command, executes it
-with a bounded process lifetime, records its actual exit code and log, and
-supplies that evidence to the verifier. Every finding cluster starts with a
-fresh fixer thread; the second fix attempt and technical retries with a
-recorded thread ID resume that same thread.
+A fixer edits the worktree and returns exactly one direct targeted-test
+command. The orchestrator validates that command, executes it with a bounded
+process lifetime, records its actual exit code and log, and supplies that
+evidence to the verifier. Every finding cluster starts with a fresh fixer
+thread; the second fix attempt and technical retries with a recorded thread ID
+resume that same thread.
 
-Shell activity is parsed as one literal command and matched against a small
-read/edit allowlist. Unknown executables and repository scripts fail closed.
-Pipelines, command chaining, redirection, nested shells, interpreters, build
-tools, and model-owned test runners are rejected. Git is restricted to a small
-read-only allowlist without directory or configuration overrides; all index,
-ref, network, and Git worktree mutations remain orchestrator-owned. Fixers can
-still edit files through the CLI's workspace-write file-editing tools.
+Codex sandboxes provide the command boundary: analysis roles use `read-only`
+and fixers use `workspace-write`. Analysis commands are not filtered through a
+second tool-specific allowlist. Clearly recognized model-owned test commands
+are still stopped because targeted tests and their evidence belong to the
+orchestrator.
 
 Role metadata and every durable phase transition are checkpointed atomically.
 Restarting resumes the active cluster; a read-only decision that was not yet
@@ -156,12 +151,14 @@ review cycle can start.
 `compact` shows phases, roles, findings, decisions, fix attempts, verification,
 targeted tests, host gates, and commits. Successful internal CLI commands stay
 hidden. `rg` exit code 1 without output is treated as "no matches", not as a
-failure. Real command errors, Codex error events, incomplete event streams,
-timeouts, missing output, and invalid structured output reject the role result
-and trigger a technical retry. Once Codex has supplied a thread ID, that retry
-continues the same thread instead of repeating completed work. `balanced` adds
-concise activity messages, while `detailed` also shows the start and completion
-of successful internal commands and no-match searches.
+failure. Internal command errors are shown immediately but stay within the
+active Codex turn so the model can recover without repeating the role. Codex
+error events, incomplete event streams, timeouts, missing output, and invalid
+structured output still reject the role result and trigger a technical retry.
+Once Codex has supplied a thread ID, that retry continues the same thread
+instead of repeating completed work. `balanced` adds concise activity messages,
+while `detailed` also shows the start and completion of successful internal
+commands and no-match searches.
 
 Raw agent reasoning is never printed. Only role and decision summaries are
 shown.

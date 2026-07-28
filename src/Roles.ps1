@@ -12,13 +12,9 @@ function Get-ReviewLoopOperationalInstructions {
 
     $instructions = @"
 This is an unattended Windows PowerShell run.
-Use direct, single commands only. Do not launch nested pwsh or cmd processes and do not combine commands with semicolons or pipelines.
-Use rg -F -e for literal searches and rg -g for file globs. Exit code 1 with no output means no matches.
-Use only read commands such as rg, Get-ChildItem, Get-Content, Test-Path, and read-only Git subcommands. Commands run from the repository root; do not use Git directory or configuration overrides.
-Use repository-relative file paths only. Never read PowerShell providers, environment variables, parent directories, absolute paths, or URLs.
-Read bounded files with Get-Content -LiteralPath -TotalCount. Do not use inline PowerShell variables, indexing loops, scripts, or repository wrappers.
-Never enumerate, stop, or kill processes. The orchestrator owns process lifetime, tests, retries, and cleanup.
-Never run Git commands that change refs, HEAD, the index, or the worktree. The orchestrator owns Git state and commits.
+Work only inside the supplied repository and prefer repository-relative paths.
+Do not inspect credentials or external URLs.
+Do not stop processes or change Git refs, the index, or the worktree. The orchestrator owns process lifetime, tests, retries, and commits.
 "@
     if ($Role -eq "TriggerJudge") {
         return "$instructions`nDo not run shell commands or inspect the repository; classify only the supplied ledger evidence. Any possible architecture decision will be checked independently against the repository."

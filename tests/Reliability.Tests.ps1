@@ -166,61 +166,32 @@ Describe "Unattended reliability boundaries" {
         (@($records[1].arguments) -contains "read-only") | Should Be $true
     }
 
-    It "allows only direct read-only model shell commands" {
+    It "allows analysis commands and blocks orchestrator-owned tests" {
         $module = Get-Module CodexReviewLoop
         $allowed = @(
             "git diff --check",
-            "git status --short",
-            "git --no-pager log -1",
+            "git blame -L 850,1260 -- src/CoreRuntime/Representations/RepresentationCoordinator.cs",
+            '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''git blame -L 850,1260 -- src/CoreRuntime/Representations/RepresentationCoordinator.cs''',
             "rg -F -e cache .",
-            "rg -F -e 'TODO:' .",
-            "rg -F -e 'http://' .",
-            "Get-Content -LiteralPath .\README.txt -TotalCount 20",
-            "apply_patch patch.txt"
+            "Get-Content -LiteralPath .\README.txt -TotalCount 20"
         )
         foreach ($command in $allowed) {
             (& $module {
                 param($value)
-                Test-ReviewLoopForbiddenRoleCommand -Command $value
+                Test-ReviewLoopModelOwnedTestCommand -Command $value
             } $command) | Should Be $false
         }
 
         $forbidden = @(
-            "dotnet msbuild -t:Test",
-            "dotnet --roll-forward LatestMajor test .\review-loop-test.proj",
-            "git -C . commit -m change",
-            "git -c user.name=x reset --hard",
-            "git -C . status",
-            "git -c color.ui=false log -1",
-            "git commit log",
-            "git reset status",
-            "git checkout show",
-            "git diff --ext-diff",
-            "git grep -O 'dotnet test .\x.csproj' x",
-            "git grep --open-files-in-pager='dotnet test .\x.csproj' x",
-            "git --git-dir=.git status",
-            "Get-Content .\README.txt; Set-Content .\README.txt changed",
-            "Get-Content .\README.txt | Select-Object -First 1",
-            "Get-Content .\README.txt > output.txt",
-            "rg --pre 'dotnet test .\x.csproj' -F x .",
-            "rg --hostname-bin cmd -F x .",
-            "rg --search-zip -F x .",
-            "rg -z -F x .",
-            "rg -zq x .",
-            "rg -qz x .",
-            ".\build.ps1",
-            "test.ps1",
-            "Invoke-Pester",
-            "vstest.console.exe tests.dll",
-            "nunit3-console.exe tests.dll",
-            "cargo-nextest run",
-            "nuget restore",
-            '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''git -C . commit -m change'''
+            "dotnet test .\review-loop-test.proj",
+            "dotnet vstest .\tests.dll",
+            "pytest -q",
+            '"C:\Program Files\PowerShell\7\pwsh.exe" -Command ''dotnet test .\review-loop-test.proj'''
         )
         foreach ($command in $forbidden) {
             (& $module {
                 param($value)
-                Test-ReviewLoopForbiddenRoleCommand -Command $value
+                Test-ReviewLoopModelOwnedTestCommand -Command $value
             } $command) | Should Be $true
         }
     }
@@ -238,27 +209,37 @@ Describe "Unattended reliability boundaries" {
         $startInfo.Environment.ContainsKey("GIT_EXTERNAL_DIFF") | Should Be $false
     }
 
-    It "retries a real command error on the same thread" {
+    It "keeps a failed analysis command inside the successful Codex turn" {
         $planPath = Join-Path $caseRoot "invocations.json"
         Write-ReliabilityJsonArray -Path $planPath -Values @(
             [pscustomobject]@{
                 threadId = "same-thread"
-                commands = @([pscustomobject]@{ command = "rg invalid"; exitCode = 2; output = "syntax error" })
-            },
-            [pscustomobject]@{ threadId = "same-thread"; commands = @() }
+                commands = @([pscustomobject]@{
+                    command = '"C:\Program Files\PowerShell\7\pwsh.exe" -Command "rg -n -F -e RequiredWatch tests\missing.cs"'
+                    exitCode = 1
+                    output = "rg: tests\missing.cs: file not found"
+                })
+            }
         )
         $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+        $transcript = Join-Path $logRoot "terminal.log"
+        & (Get-Module CodexReviewLoop) {
+            param($path)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
+        } $transcript
 
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 2
 
         $call.Success | Should Be $true
-        @($call.Attempts).Count | Should Be 2
+        @($call.Attempts).Count | Should Be 1
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
         $records[0].callKind | Should Be "exec"
-        $records[1].callKind | Should Be "resume"
-        $records[1].resumeThreadId | Should Be "same-thread"
+        $transcriptText = Get-Content -Raw -LiteralPath $transcript
+        $transcriptText | Should Match "CLI command failed"
+        $transcriptText | Should Match "tests\\missing.cs"
         $allJsonLinesValid = $true
         foreach ($line in @(Get-Content -LiteralPath $call.JsonlPath | Where-Object { $_ })) {
             try {
@@ -292,7 +273,7 @@ Describe "Unattended reliability boundaries" {
 
         $call.Success | Should Be $true
         @($call.Attempts).Count | Should Be 2
-        $call.Attempts[0].FailureKind | Should Be "forbidden_role_command"
+        $call.Attempts[0].FailureKind | Should Be "model_owned_test"
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
         $records[1].callKind | Should Be "resume"
@@ -313,27 +294,6 @@ Describe "Unattended reliability boundaries" {
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
         $call.Success | Should Be $true
-        @($call.Attempts).Count | Should Be 1
-    }
-
-    It "rejects a silent non-rg command failure" {
-        $planPath = Join-Path $caseRoot "invocations.json"
-        Write-ReliabilityJsonArray -Path $planPath -Values @(
-            [pscustomobject]@{
-                commands = @([pscustomobject]@{
-                    command = "Get-Content .\missing.txt"
-                    exitCode = 1
-                    output = ""
-                })
-            }
-        )
-        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
-
-        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
-            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1
-
-        $call.Success | Should Be $false
-        $call.FailureKind | Should Be "role_command_error"
         @($call.Attempts).Count | Should Be 1
     }
 

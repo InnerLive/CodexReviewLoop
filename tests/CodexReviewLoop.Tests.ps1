@@ -998,7 +998,7 @@ Describe "Live terminal and streaming process observation" {
         $excerpt[-1] | Should Be "final frame"
     }
 
-    It "hides successful commands in compact mode and shows failed commands" {
+    It "hides successful commands and shows failed analysis commands without rejecting the role" {
         $module = Get-Module CodexReviewLoop
         $successTranscript = Join-Path $caseRoot "compact-success.log"
         & $module {
@@ -1017,11 +1017,11 @@ Describe "Live terminal and streaming process observation" {
             Initialize-ReviewLoopConsole -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never -TranscriptPath $path
         } $failureTranscript
         $env:CODEX_REVIEW_LOOP_FAKE_COMMAND_EXIT_CODE = "7"
-        $failed = Invoke-CodexCliRole `
+        $call = Invoke-CodexCliRole `
             -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -CallId failure -MaxAttempts 1
-        $failed.Success | Should Be $false
-        $failed.FailureKind | Should Be "role_command_error"
+        $call.Success | Should Be $true
+        @($call.Attempts).Count | Should Be 1
         $failureText = Get-Content -Raw -LiteralPath $failureTranscript
         $failureText | Should Match "CLI command failed"
         $failureText | Should Match "exit code 7"
@@ -1173,8 +1173,7 @@ Describe "Schemas, prompts, and CLI-only invariants" {
     It "prevents read-only reviewers from launching build or test commands" {
         $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
         $roles | Should Match 'This role is read-only. Do not edit files or run builds or tests.'
-        $roles | Should Match 'Use rg -F -e for literal searches'
-        $roles | Should Match 'Do not launch nested pwsh or cmd processes'
+        $roles | Should Match 'Work only inside the supplied repository'
     }
 
     It "prevents read-only verifiers from launching build or test commands" {
