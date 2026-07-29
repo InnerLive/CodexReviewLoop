@@ -144,6 +144,7 @@ function New-CodexProcessStartInfo {
     $info.RedirectStandardInput = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    $info.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
     $info.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $info.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     return $info
