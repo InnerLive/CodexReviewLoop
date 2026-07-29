@@ -125,6 +125,11 @@ function Read-ReviewLoopLedger {
         return New-ReviewLoopLedger -RepoPath $RepoPath
     }
     $ledger = ConvertTo-ReviewLoopLedgerV2 (Read-ReviewLoopJson -Path $Path)
+    foreach ($finding in @($ledger.Findings)) {
+        if ($finding.PSObject.Properties.Name -notcontains "VerifiedRecurrenceCount") {
+            $finding | Add-Member -NotePropertyName VerifiedRecurrenceCount -NotePropertyValue 0
+        }
+    }
     Test-ReviewLoopLedger -Ledger $ledger | Out-Null
     return $ledger
 }
@@ -208,6 +213,7 @@ function ConvertTo-ReviewLoopFindingRecord {
         FirstSeenHead = $Head
         LastSeenHead = $Head
         RecurrenceCount = 0
+        VerifiedRecurrenceCount = 0
         FixAttempts = 0
         FixerThreadId = ""
         Verification = $null
@@ -244,6 +250,12 @@ function Merge-ReviewLoopFindings {
         }
 
         if ([string]$existing.Status -in @("resolved", "superseded", "duplicate")) {
+            if ([string]$existing.Status -eq "resolved") {
+                $verifiedRecurrences = [int](Get-ReviewLoopObjectProperty `
+                    -Object $existing -Name "VerifiedRecurrenceCount" -Default 0)
+                $existing | Add-Member -Force -NotePropertyName VerifiedRecurrenceCount `
+                    -NotePropertyValue ($verifiedRecurrences + 1)
+            }
             $existing.Status = "open"
             $existing.RecurrenceCount = [int]$existing.RecurrenceCount + 1
             $existing.FixAttempts = 0
@@ -369,6 +381,7 @@ function New-ReviewLoopState {
         CleanHead = ""
         ActiveClusterId = ""
         ActiveFindingIds = @()
+        ActiveRoleCall = $null
         ArchitectureRevision = 0
         ActiveStrategy = $null
         LastFixerResult = $null
@@ -398,6 +411,11 @@ function Read-ReviewLoopState {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $state = Read-ReviewLoopJson -Path $Path
+    foreach ($name in @("ActiveRoleCall")) {
+        if ($state.PSObject.Properties.Name -notcontains $name) {
+            $state | Add-Member -NotePropertyName $name -NotePropertyValue $null
+        }
+    }
     Test-ReviewLoopState -State $state | Out-Null
     return $state
 }
@@ -422,6 +440,7 @@ function Add-ReviewLoopRoleCall {
     )
 
     $record = [pscustomobject][ordered]@{
+        CallId = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "CallId" -Default "")
         Role = $Call.Role
         Model = $Call.Model
         Thinking = $Call.Thinking
@@ -429,10 +448,22 @@ function Add-ReviewLoopRoleCall {
         Success = $Call.Success
         ExitCode = $Call.ExitCode
         FailureKind = $Call.FailureKind
+        FailureReason = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "FailureReason" -Default "")
         ThreadId = $Call.ThreadId
         Usage = $Call.Usage
+        StructuredResult = Get-ReviewLoopObjectProperty -Object $Call -Name "StructuredResult"
+        FinalMessage = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "FinalMessage" -Default "")
         JsonlPath = $Call.JsonlPath
         ResultPath = $Call.ResultPath
+        Attempts = @((Get-ReviewLoopObjectProperty -Object $Call -Name "Attempts" -Default @()))
+        StartedAt = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "StartedAt" -Default "")
+        FinishedAt = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "FinishedAt" -Default "")
+        ExecutionFingerprint = [string](Get-ReviewLoopObjectProperty `
+            -Object $Call -Name "ExecutionFingerprint" -Default "")
+        RepositoryHead = [string](Get-ReviewLoopObjectProperty `
+            -Object $Call -Name "RepositoryHead" -Default "")
+        WorktreeFingerprint = [string](Get-ReviewLoopObjectProperty `
+            -Object $Call -Name "WorktreeFingerprint" -Default "")
         RecordedAt = [DateTimeOffset]::UtcNow.ToString("O")
     }
     $State.RoleCalls = @($State.RoleCalls) + @($record)

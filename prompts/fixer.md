@@ -8,7 +8,9 @@ Rules:
 - Before finalizing, inspect the actual diff for regressions in directly affected cleanup, acknowledgement, rollback, retry, cancellation, ownership, and complexity lifecycles.
 - Keep retained state and repeated work bounded by current affected state. Necessary work proportional to the corrected value is acceptable.
 - On a resumed attempt, address every verifier regression in the supplied feedback together without reopening the original finding.
-- You may run any useful build or test command while working.
+- While working, run only the narrowest useful project or filtered regression tests.
+- Do not run the configured full repository host gates; the orchestrator owns those commands after verification.
+- If no narrower durable regression command exists, return the full command as `targetedTest` without running it yourself.
 - Return exactly one structured `targetedTest` for independent execution by the orchestrator.
 - `filePath` may name any repository-appropriate executable or wrapper. Put every argument in `arguments`; use `pwsh` with `-Command` explicitly when shell syntax is required.
 - `rationale` must explain how this test reproduces the original defect.

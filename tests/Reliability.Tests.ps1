@@ -720,9 +720,10 @@ Describe "Unattended reliability boundaries" {
             ForEach-Object { $_ | ConvertFrom-Json })).Count | Should Be 1
     }
 
-    It "assesses architecture for one active finding related to resolved history" {
+    It "uses a point fix for one active finding related only to resolved history" {
         $finding = [pscustomobject]@{
             RecurrenceCount = 0
+            VerifiedRecurrenceCount = 0
             Relations = @([pscustomobject]@{
                 candidateFindingId = "F-history"
                 relation = "same_contract_different_edge"
@@ -737,8 +738,52 @@ Describe "Unattended reliability boundaries" {
             Get-ReviewLoopArchitectureTrigger -Findings @($value)
         } $finding
 
+        $trigger.ArchitectureRecommended | Should Be $false
+        $trigger.Reason | Should Be "bounded_point_fix"
+    }
+
+    It "assesses architecture for a verified recurrence" {
+        $finding = [pscustomobject]@{
+            VerifiedRecurrenceCount = 1
+            Relations = @()
+        }
+        $trigger = & (Get-Module CodexReviewLoop) {
+            param($value)
+            Get-ReviewLoopArchitectureTrigger -Findings @($value)
+        } $finding
+
         $trigger.ArchitectureRecommended | Should Be $true
-        $trigger.Relation | Should Be "same_contract_different_edge"
+        $trigger.Reason | Should Be "verified_recurrence"
+    }
+
+    It "assesses architecture for multiple active related findings" {
+        $first = [pscustomobject]@{ VerifiedRecurrenceCount = 0; Relations = @() }
+        $second = [pscustomobject]@{ VerifiedRecurrenceCount = 0; Relations = @() }
+        $trigger = & (Get-Module CodexReviewLoop) {
+            param($left, $right)
+            Get-ReviewLoopArchitectureTrigger -Findings @($left, $right)
+        } $first $second
+
+        $trigger.ArchitectureRecommended | Should Be $true
+        $trigger.Reason | Should Be "multiple_active_findings"
+    }
+
+    It "assesses architecture for a regression from a prior fix" {
+        $finding = [pscustomobject]@{
+            VerifiedRecurrenceCount = 0
+            Relations = @([pscustomobject]@{
+                relation = "regression_from_fix"
+                candidateStatus = "resolved"
+                confidence = "high"
+            })
+        }
+        $trigger = & (Get-Module CodexReviewLoop) {
+            param($value)
+            Get-ReviewLoopArchitectureTrigger -Findings @($value)
+        } $finding
+
+        $trigger.ArchitectureRecommended | Should Be $true
+        $trigger.Reason | Should Be "regression_from_fix"
     }
 
     It "rejects extra trigger decisions and strips nested relation history" {
@@ -800,6 +845,93 @@ Describe "Unattended reliability boundaries" {
         $records.Count | Should Be 1
         $records[0].callKind | Should Be "exec"
         (@($records[0].arguments) -contains "review") | Should Be $false
+
+        $replayed = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger, $repository, $logs, $fake)
+            Invoke-ReviewLoopReview -Config $profile -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -RepoPath $repository -Speed standard -RunRoot $logs -CodexPath $fake
+        } $config $state $statePath $ledger $repo $runRoot $fakeCodex
+        $replayed.Result.classification | Should Be "clean"
+        @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG)).Count | Should Be 1
+        @((Read-ReviewLoopState -Path $statePath).RoleCalls).Count | Should Be 1
+    }
+
+    It "resumes an interrupted state-backed role on its checkpointed thread" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $runRoot = Join-Path $caseRoot "role-resume-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot -ReviewBaseCommit $head
+        $state.Stage = "reviewing"
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.ActiveRoleCall = [pscustomobject]@{
+            CallId = "review-01"
+            Role = "Reviewer"
+            ThreadId = "checkpointed-reviewer"
+            ExecutionFingerprint = ""
+            CheckpointStage = "reviewing"
+            RepositoryHead = $snapshot.Head
+            WorktreeFingerprint = $snapshot.Fingerprint
+        }
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $call = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $fake)
+            Invoke-ConfiguredCodexRole -Config $profile -Role Reviewer -RepoPath $repository `
+                -Speed standard -Prompt review -LogRoot $logs `
+                -SchemaName "review-result-v1.schema.json" -CallId "review-01" `
+                -State $loopState -StatePath $loopStatePath -CodexPath $fake
+        } $config $state $statePath $repo $runRoot $fakeCodex
+
+        $call.Success | Should Be $true
+        $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ConvertFrom-Json
+        $record.callKind | Should Be "resume"
+        $record.resumeThreadId | Should Be "checkpointed-reviewer"
+        $record.prompt | Should Match "Resume the interrupted Reviewer role"
+        (Read-ReviewLoopState -Path $statePath).ActiveRoleCall | Should BeNullOrEmpty
+    }
+
+    It "does not replay a completed fixer when the same attempt needs a technical correction" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $runRoot = Join-Path $caseRoot "fixer-correction-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot
+        $state.ActiveClusterId = "C-fixer-correction"
+        $state.Stage = "fixing"
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $fix = '{"schemaVersion":"1.0","outcome":"no_change","summary":"corrected","changedPaths":[],"targetedTest":{"filePath":"pwsh","arguments":["-NoProfile","-Command","exit 0"],"rationale":"targeted regression"},"remainingRisk":""}'
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = $fix
+        $finding = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $finding -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+
+        $calls = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $item, $fake)
+            $first = Invoke-ReviewLoopFixer `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Speed standard -RunRoot $logs `
+                -Findings @($item) -Strategy $null -Attempt 1 -CodexPath $fake
+            $second = Invoke-ReviewLoopFixer `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Speed standard -RunRoot $logs `
+                -Findings @($item) -Strategy $null -Attempt 1 -Correction 1 `
+                -ThreadId $first.ThreadId -CodexPath $fake -Feedback "Correct the targeted test."
+            return @($first, $second)
+        } $config $state $statePath $repo $runRoot $finding.Findings[0] $fakeCodex
+
+        @($calls).Count | Should Be 2
+        $records = @((Read-ReviewLoopState -Path $statePath).RoleCalls)
+        @($records).Count | Should Be 2
+        $records[0].CallId | Should Be "C-fixer-correction-fix-1"
+        $records[1].CallId | Should Be "C-fixer-correction-fix-1-correction-1"
+        @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG)).Count | Should Be 2
     }
 
     It "rejects a resolved finding when the patch introduced regressions" {
@@ -1392,7 +1524,7 @@ Describe "Unattended reliability boundaries" {
         $imported.Findings[0].BlockedReason | Should BeNullOrEmpty
     }
 
-    It "uses the final fixer attempt after a crash before that call" {
+    It "resumes the final fixer attempt from the central role checkpoint" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $paths = & (Get-Module CodexReviewLoop) {
             param($profile, $repository)
@@ -1422,6 +1554,10 @@ Describe "Unattended reliability boundaries" {
         $state.Stage = "fixing"
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
+        $baselineSnapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
         $state.LastFixerResult = [pscustomobject]@{
             Success = $true
             FailureKind = "none"
@@ -1440,10 +1576,23 @@ Describe "Unattended reliability boundaries" {
                 remainingRisk = ""
             }
         }
+        $state.ActiveRoleCall = [pscustomobject]@{
+            CallId = "$($finding.ClusterId)-fix-2"
+            Role = "PointFixer"
+            Model = [string]$config.Roles.PointFixer.Model
+            Thinking = [string]$config.Roles.PointFixer.Thinking
+            Speed = "standard"
+            SchemaName = "fixer-result-v1.schema.json"
+            Mode = "Exec"
+            ThreadId = "reliability-thread"
+            ExecutionFingerprint = $executionFingerprint
+            CheckpointStage = "fixing"
+            RepositoryHead = $baselineSnapshot.Head
+            WorktreeFingerprint = $baselineSnapshot.Fingerprint
+            StartedAt = [DateTimeOffset]::UtcNow.ToString("O")
+            ThreadStartedAt = [DateTimeOffset]::UtcNow.ToString("O")
+        }
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
-        Set-Content -LiteralPath (
-            Join-Path $paths.RunRoot "$($finding.ClusterId)-fix-2-pointfixer.jsonl"
-        ) -Value '{"type":"thread.started","thread_id":"reliability-thread"}' -Encoding UTF8
         Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "partial"
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $fix = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
@@ -1456,6 +1605,13 @@ Describe "Unattended reliability boundaries" {
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
         )
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $resultSequence
+        $executionFingerprint = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $configPath
+        $state.ExecutionFingerprint = $executionFingerprint
+        $state.ActiveRoleCall.ExecutionFingerprint = $executionFingerprint
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
             -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never

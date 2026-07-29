@@ -8,7 +8,10 @@ function Get-ReviewLoopResourcePath {
 }
 
 function Get-ReviewLoopOperationalInstructions {
-    param([Parameter(Mandatory = $true)][string]$Role)
+    param(
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][hashtable]$Config
+    )
 
     $instructions = @"
 This is an unattended Windows PowerShell run.
@@ -18,10 +21,26 @@ You have unattended command access. Use any repository-specific tool needed to f
 Before naming an uncertain path, discover it with rg --files, rg, or Get-ChildItem. Prefer direct PowerShell commands over nested shell quoting.
 If an exploratory command fails, correct it and continue; do not treat the miss as a blocker.
 "@
-    if ($Role -in @("PointFixer", "ArchitectureFixer")) {
-        return "$instructions`nEdit the repository files needed for the supplied findings. You may run any useful analysis, build, or test command. Return one structured targeted regression test for the orchestrator to execute independently."
+    $hostGateCommands = @($Config.HostGates | ForEach-Object {
+        $arguments = @($_.Arguments | ForEach-Object { [string]$_ }) -join " "
+        "- $($_.Name): $($_.FilePath) $arguments".TrimEnd()
+    })
+    $hostGateText = if ($hostGateCommands.Count -eq 0) {
+        "- None configured."
     }
-    return "$instructions`nPreserve tracked and untracked repository state. You may run any useful analysis, build, or test command, but must not edit repository files."
+    else {
+        $hostGateCommands -join [Environment]::NewLine
+    }
+    $testOwnership = @"
+
+The following full repository gates are authoritative and owned by the orchestrator:
+$hostGateText
+Do not execute these configured gate commands inside this role. The orchestrator runs them after independent verification.
+"@
+    if ($Role -in @("PointFixer", "ArchitectureFixer")) {
+        return "$instructions$testOwnership`nEdit the repository files needed for the supplied findings. While iterating, run only the narrowest useful project or filtered regression tests. If no narrower durable regression command exists, return the full command as the structured targeted test without running it yourself. Return one structured targeted regression test for the orchestrator to execute independently."
+    }
+    return "$instructions$testOwnership`nPreserve tracked and untracked repository state. Use supplied test evidence and narrow investigative commands; do not run a full repository or solution test suite. You must not edit repository files."
 }
 
 function Get-ReviewLoopPrompt {
@@ -66,6 +85,32 @@ function Assert-ReviewLoopExecutionUnchanged {
     }
 }
 
+function ConvertFrom-ReviewLoopRoleCallRecord {
+    param([Parameter(Mandatory = $true)][object]$Record)
+
+    return [pscustomobject]@{
+        Success = [bool]$Record.Success
+        CallId = [string]$Record.CallId
+        Role = [string]$Record.Role
+        Model = [string]$Record.Model
+        Thinking = [string]$Record.Thinking
+        Speed = [string]$Record.Speed
+        ExitCode = [int]$Record.ExitCode
+        FailureKind = [string]$Record.FailureKind
+        FailureReason = [string]$Record.FailureReason
+        ThreadId = [string]$Record.ThreadId
+        Usage = $Record.Usage
+        FinalMessage = [string]$Record.FinalMessage
+        StructuredResult = $Record.StructuredResult
+        Arguments = @()
+        JsonlPath = [string]$Record.JsonlPath
+        ResultPath = [string]$Record.ResultPath
+        Attempts = @($Record.Attempts)
+        StartedAt = [string]$Record.StartedAt
+        FinishedAt = [string]$Record.FinishedAt
+    }
+}
+
 function Invoke-ConfiguredCodexRole {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -91,43 +136,184 @@ function Invoke-ConfiguredCodexRole {
     else {
         Get-ReviewLoopResourcePath -Kind schemas -Name $SchemaName
     }
+    if ($null -ne $State -and [string]::IsNullOrWhiteSpace($CallId)) {
+        throw "State-backed role calls require a stable CallId."
+    }
+
+    $executionFingerprint = if ($Config.ContainsKey("__ExecutionFingerprint")) {
+        [string]$Config["__ExecutionFingerprint"]
+    }
+    else {
+        ""
+    }
+    if ($null -ne $State) {
+        $completed = @($State.RoleCalls | Where-Object {
+            [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false) -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -eq $CallId -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq $Role -and
+            [string](Get-ReviewLoopObjectProperty `
+                -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint
+        } | Select-Object -Last 1)
+        if ($completed.Count -gt 0) {
+            $record = $completed[0]
+            $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+            if ([string]$record.RepositoryHead -ne [string]$current.Head -or
+                [string]$record.WorktreeFingerprint -ne [string]$current.Fingerprint) {
+                Stop-ReviewLoopBlocked -Message "Completed role call '$CallId' no longer matches the repository checkpoint."
+            }
+            Write-ReviewLoopStatus -Message "$Role reused completed checkpoint '$CallId'." -Kind Info
+            return ConvertFrom-ReviewLoopRoleCallRecord -Record $record
+        }
+    }
+
+    $mayEditRepository = $Role -in @("PointFixer", "ArchitectureFixer")
+    $pending = if ($null -ne $State) {
+        Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+    }
+    else {
+        $null
+    }
+    if ($null -ne $pending) {
+        $pendingSnapshot = [pscustomobject]@{
+            Head = [string](Get-ReviewLoopObjectProperty `
+                -Object $pending -Name "RepositoryHead" -Default "")
+            Fingerprint = [string](Get-ReviewLoopObjectProperty `
+                -Object $pending -Name "WorktreeFingerprint" -Default "")
+        }
+        $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        $pendingExecution = [string](Get-ReviewLoopObjectProperty `
+            -Object $pending -Name "ExecutionFingerprint" -Default "")
+        if ($pendingExecution -ne $executionFingerprint) {
+            if ([string]$pendingSnapshot.Head -eq [string]$currentSnapshot.Head -and
+                [string]$pendingSnapshot.Fingerprint -eq [string]$currentSnapshot.Fingerprint) {
+                $State.ActiveRoleCall = $null
+                Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+                $pending = $null
+            }
+            else {
+                Stop-ReviewLoopBlocked -Message "Interrupted role call cannot be resumed after the execution fingerprint changed."
+            }
+        }
+        elseif ([string]$pending.CallId -ne $CallId -or [string]$pending.Role -ne $Role) {
+            Stop-ReviewLoopBlocked -Message "Expected role call '$CallId' but checkpoint contains interrupted call '$($pending.CallId)'."
+        }
+        elseif ([string]$pendingSnapshot.Head -ne [string]$currentSnapshot.Head) {
+            Stop-ReviewLoopBlocked -Message "Repository HEAD changed during interrupted role call '$CallId'."
+        }
+        elseif (-not $mayEditRepository -and
+            [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint) {
+            Stop-ReviewLoopBlocked -Message "Read-only role '$Role' changed the repository before interruption."
+        }
+    }
+
+    $effectiveMode = $Mode
+    $effectiveThreadId = $ThreadId
+    $effectivePrompt = $Prompt
+    if ($null -ne $pending) {
+        $effectiveThreadId = [string](Get-ReviewLoopObjectProperty `
+            -Object $pending -Name "ThreadId" -Default "")
+        if ([string]::IsNullOrWhiteSpace($effectiveThreadId)) {
+            $pendingHead = [string](Get-ReviewLoopObjectProperty `
+                -Object $pending -Name "RepositoryHead" -Default "")
+            $pendingFingerprint = [string](Get-ReviewLoopObjectProperty `
+                -Object $pending -Name "WorktreeFingerprint" -Default "")
+            $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+            if ($pendingHead -ne [string]$currentSnapshot.Head -or
+                $pendingFingerprint -ne [string]$currentSnapshot.Fingerprint) {
+                Stop-ReviewLoopBlocked -Message "Interrupted mutating role '$Role' has no resumable thread."
+            }
+            $State.ActiveRoleCall = $null
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+            $pending = $null
+        }
+        else {
+            $effectiveMode = "Resume"
+            $effectivePrompt = @"
+Resume the interrupted $Role role. Do not repeat completed investigation or edits.
+Inspect current repository state only as needed and return the required final structured result for the original role task.
+"@
+        }
+    }
+
+    $roleStartSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ($null -ne $State -and $null -eq $pending) {
+        $State.ActiveRoleCall = [pscustomobject][ordered]@{
+            CallId = $CallId
+            Role = $Role
+            Model = [string]$roleConfig.Model
+            Thinking = [string]$roleConfig.Thinking
+            Speed = $Speed
+            SchemaName = $SchemaName
+            Mode = $effectiveMode
+            ThreadId = $effectiveThreadId
+            ExecutionFingerprint = $executionFingerprint
+            CheckpointStage = [string]$State.Stage
+            RepositoryHead = [string]$roleStartSnapshot.Head
+            WorktreeFingerprint = [string]$roleStartSnapshot.Fingerprint
+            StartedAt = [DateTimeOffset]::UtcNow.ToString("O")
+            ThreadStartedAt = ""
+        }
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
+
     $arguments = @{
         Role = $Role
         RepoPath = $RepoPath
         Model = [string]$roleConfig.Model
         Thinking = [string]$roleConfig.Thinking
         Speed = $Speed
-        Prompt = $Prompt
+        Prompt = $effectivePrompt
         LogRoot = $LogRoot
         SchemaPath = $schemaPath
-        Mode = $Mode
-        ThreadId = $ThreadId
+        Mode = $effectiveMode
+        ThreadId = $effectiveThreadId
         CallId = $CallId
     }
     if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
         $arguments.CodexPath = $CodexPath
     }
-    $operationalInstructions = Get-ReviewLoopOperationalInstructions -Role $Role
+    $operationalInstructions = Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
     $arguments.DeveloperInstructions = $operationalInstructions
-    $mayEditRepository = $Role -in @("PointFixer", "ArchitectureFixer")
     $worktreeBefore = if ($mayEditRepository) {
         ""
     }
     else {
         Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath
     }
+    if ($null -ne $State) {
+        $onThreadStarted = {
+            param([string]$ObservedThreadId)
+
+            $active = $State.ActiveRoleCall
+            if ($null -eq $active -or [string]$active.CallId -ne $CallId) {
+                throw "Role thread '$ObservedThreadId' does not match the active role checkpoint."
+            }
+            $active | Add-Member -Force -NotePropertyName ThreadId `
+                -NotePropertyValue $ObservedThreadId
+            $active | Add-Member -Force -NotePropertyName ThreadStartedAt `
+                -NotePropertyValue ([DateTimeOffset]::UtcNow.ToString("O"))
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        }
+        $arguments.OnThreadStarted = $onThreadStarted
+    }
     $call = Invoke-CodexCliRole @arguments
     Assert-ReviewLoopExecutionUnchanged -Config $Config
 
-    if ($null -ne $State) {
-        Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
-        if (-not [string]::IsNullOrWhiteSpace($StatePath)) {
-            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-        }
-    }
     if (-not $mayEditRepository -and
         $worktreeBefore -ne (Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath)) {
         throw "Read-only role '$Role' changed the repository worktree despite its role contract."
+    }
+    if ($null -ne $State) {
+        $roleEndSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        $call | Add-Member -Force -NotePropertyName ExecutionFingerprint `
+            -NotePropertyValue $executionFingerprint
+        $call | Add-Member -Force -NotePropertyName RepositoryHead `
+            -NotePropertyValue ([string]$roleEndSnapshot.Head)
+        $call | Add-Member -Force -NotePropertyName WorktreeFingerprint `
+            -NotePropertyValue ([string]$roleEndSnapshot.Fingerprint)
+        Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
+        $State.ActiveRoleCall = $null
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     }
     return $call
 }
@@ -878,6 +1064,8 @@ function Invoke-ReviewLoopFixer {
         [Parameter(Mandatory = $true)][object[]]$Findings,
         [Parameter(Mandatory = $true)][AllowNull()][object]$Strategy,
         [Parameter(Mandatory = $true)][int]$Attempt,
+        [ValidateRange(0, 2)][int]$Correction = 0,
+        [string]$CallId = "",
         [string]$ThreadId = "",
         [string]$CodexPath = "",
         [string]$Feedback = "None."
@@ -891,11 +1079,20 @@ function Invoke-ReviewLoopFixer {
         FEEDBACK = $Feedback
     }
     $mode = if ([string]::IsNullOrWhiteSpace($ThreadId)) { "Exec" } else { "Resume" }
+    $stableCallId = if (-not [string]::IsNullOrWhiteSpace($CallId)) {
+        $CallId
+    }
+    elseif ($Correction -gt 0) {
+        "$($State.ActiveClusterId)-fix-$Attempt-correction-$Correction"
+    }
+    else {
+        "$($State.ActiveClusterId)-fix-$Attempt"
+    }
     return Invoke-ConfiguredCodexRole `
         -Config $Config -Role $role -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v1.schema.json" `
         -Mode $mode -ThreadId $ThreadId -CodexPath $CodexPath `
-        -CallId ("$($State.ActiveClusterId)-fix-$Attempt") -State $State -StatePath $StatePath
+        -CallId $stableCallId -State $State -StatePath $StatePath
 }
 
 function Test-ReviewLoopResolvedWithTestEvidence {

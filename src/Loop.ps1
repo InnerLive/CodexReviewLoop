@@ -8,7 +8,8 @@ function Test-ReviewLoopStateCanResume {
         [string]$State.Status -eq "failed" -and
         (
             [string]$State.Stage -ne "stopped" -or
-            @($State.ActiveFindingIds).Count -gt 0
+            @($State.ActiveFindingIds).Count -gt 0 -or
+            $null -ne (Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall")
         )
     )
 }
@@ -1506,9 +1507,10 @@ function Invoke-ReviewLoopFixWorkflow {
     $attempt = [int](@($Findings | ForEach-Object { [int]$_.FixAttempts } |
         Measure-Object -Maximum).Maximum)
     $threadId = [string]$Findings[0].FixerThreadId
-    if ($Recover -and [string]::IsNullOrWhiteSpace($threadId) -and $attempt -gt 0) {
-        $threadId = Get-ReviewLoopFixerThreadIdFromLog `
-            -RunRoot $RunRoot -ClusterId $State.ActiveClusterId -Attempt $attempt
+    if ($Recover -and [string]::IsNullOrWhiteSpace($threadId) -and $attempt -gt 0 -and
+        $null -eq (Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall") -and
+        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        Stop-ReviewLoopBlocked -Message "Interrupted legacy fixer checkpoint has no resumable role thread."
     }
     if (-not [string]::IsNullOrWhiteSpace($threadId)) {
         foreach ($finding in $Findings) { $finding.FixerThreadId = $threadId }
@@ -1517,7 +1519,13 @@ function Invoke-ReviewLoopFixWorkflow {
 
     $feedback = "None."
     $retryCurrentAttempt = $Recover -and $attempt -gt 0
-    $technicalCorrections = 0
+    $technicalCorrections = if ($Recover) {
+        [int](Get-ReviewLoopObjectProperty `
+            -Object $State.LastFixerResult -Name "Correction" -Default 0)
+    }
+    else {
+        0
+    }
     $storedAttempt = [int](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "Attempt" -Default -1)
     $storedSuccess = [bool](Get-ReviewLoopObjectProperty `
@@ -1575,6 +1583,7 @@ function Invoke-ReviewLoopFixWorkflow {
     while ($retryCurrentAttempt -or $attempt -lt [int]$Config.MaxFixAttempts) {
         if (-not $retryCurrentAttempt) {
             $attempt++
+            $technicalCorrections = 0
             foreach ($finding in $Findings) {
                 $finding.Status = "fixing"
                 $finding.FixAttempts = [int]$finding.FixAttempts + 1
@@ -1585,10 +1594,18 @@ function Invoke-ReviewLoopFixWorkflow {
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fixing"
         $threadMode = if ([string]::IsNullOrWhiteSpace($threadId)) { "new thread" } else { "resuming thread" }
         Write-ReviewLoopStatus -Message "Fixer · attempt $attempt/$($Config.MaxFixAttempts) · $threadMode" -Kind Progress
+        $activeRoleCall = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+        $fixerCallId = if ($null -ne $activeRoleCall) {
+            [string](Get-ReviewLoopObjectProperty -Object $activeRoleCall -Name "CallId" -Default "")
+        }
+        else {
+            ""
+        }
         $fixer = Invoke-ReviewLoopFixer `
             -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
             -Speed $Speed -RunRoot $RunRoot -Findings $Findings -Strategy $State.ActiveStrategy `
-            -Attempt $attempt -ThreadId $threadId -CodexPath $CodexPath -Feedback $feedback
+            -Attempt $attempt -Correction $technicalCorrections -CallId $fixerCallId `
+            -ThreadId $threadId -CodexPath $CodexPath -Feedback $feedback
         if (-not [string]::IsNullOrWhiteSpace([string]$fixer.ThreadId)) {
             $threadId = [string]$fixer.ThreadId
             foreach ($finding in $Findings) { $finding.FixerThreadId = $threadId }
@@ -1599,6 +1616,7 @@ function Invoke-ReviewLoopFixWorkflow {
             StructuredResult = $fixer.StructuredResult
             ThreadId = $threadId
             Attempt = $attempt
+            Correction = $technicalCorrections
         }
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage $(if ($fixer.Success) {
@@ -1638,26 +1656,60 @@ function Get-ReviewLoopArchitectureTrigger {
     $relations = @($Findings | ForEach-Object { @($_.Relations) } | Where-Object {
         [string]$_.confidence -eq "high"
     })
-    $relatedRelations = @("same_root_cause", "same_contract_different_edge", "regression_from_fix")
-    $architectureRelations = @($relations | Where-Object {
-        [string]$_.relation -in $relatedRelations -and
+    $regressions = @($relations | Where-Object {
+        [string]$_.relation -eq "regression_from_fix" -and
         [string]$_.candidateStatus -in @("active", "resolved")
     })
-    $recurrent = @($Findings | Where-Object {
-        [int](Get-ReviewLoopObjectProperty -Object $_ -Name "RecurrenceCount" -Default 0) -gt 0
+    $relatedRelations = @($relations | Where-Object {
+        [string]$_.relation -in @(
+            "same_root_cause",
+            "same_contract_different_edge",
+            "regression_from_fix"
+        ) -and
+        [string]$_.candidateStatus -in @("active", "resolved")
+    })
+    $verifiedRecurrence = @($Findings | Where-Object {
+        [int](Get-ReviewLoopObjectProperty `
+            -Object $_ -Name "VerifiedRecurrenceCount" -Default 0) -gt 0
     }).Count -gt 0
-    $recommended = $architectureRelations.Count -gt 0 -or $recurrent
-    $relation = if ($architectureRelations.Count -gt 0) {
-        [string]$architectureRelations[0].relation
+    $multipleActive = $Findings.Count -gt 1
+    $recommended = $multipleActive -or $regressions.Count -gt 0 -or $verifiedRecurrence
+    $reason = if ($multipleActive) {
+        "multiple_active_findings"
     }
-    elseif ($recurrent) { "same_root_cause" }
-    else { "independent" }
+    elseif ($regressions.Count -gt 0) {
+        "regression_from_fix"
+    }
+    elseif ($verifiedRecurrence) {
+        "verified_recurrence"
+    }
+    else {
+        "bounded_point_fix"
+    }
+    $relation = if ($regressions.Count -gt 0) {
+        "regression_from_fix"
+    }
+    elseif ($multipleActive -and $relatedRelations.Count -gt 0) {
+        [string]$relatedRelations[0].relation
+    }
+    elseif ($multipleActive -or $verifiedRecurrence) {
+        "same_root_cause"
+    }
+    else {
+        "independent"
+    }
 
     return [pscustomobject]@{
         ArchitectureRecommended = $recommended
         Relation = $relation
+        Reason = $reason
         Confidence = "high"
-        Rationale = "Reused independently adjudicated semantic relations and recurrence history."
+        Rationale = if ($recommended) {
+            "Architecture pre-gate matched '$reason'."
+        }
+        else {
+            "One active finding has no verified recurrence or regression from a prior fix."
+        }
         Relations = $relations
     }
 }
@@ -1689,7 +1741,7 @@ function Invoke-ReviewLoopCluster {
     $adjudication = "reused Luna + Sol$(if (@($relations | Where-Object { [string]$_.rationale -match 'adjudicat' }).Count -gt 0) { ' + Terra' } else { '' })"
     $triggerKind = if ($trigger.ArchitectureRecommended) { "Architecture" } elseif ($trigger.Confidence -eq "high") { "Info" } else { "Warning" }
     Write-ReviewLoopStatus `
-        -Message "Trigger: $($trigger.Relation) · Confidence $($trigger.Confidence) · $adjudication" `
+        -Message "Trigger: $($trigger.Relation) · $($trigger.Reason) · Confidence $($trigger.Confidence) · $adjudication" `
         -Kind $triggerKind
     $strategy = $null
     if ($trigger.ArchitectureRecommended) {
@@ -1785,32 +1837,6 @@ function Invoke-ReviewLoopOpenClusters {
             -Findings $activeGroup -RepoPath $RepoPath -Speed $Speed `
             -RunRoot $RunRoot -CodexPath $CodexPath
     }
-}
-
-function Get-ReviewLoopFixerThreadIdFromLog {
-    param(
-        [Parameter(Mandatory = $true)][string]$RunRoot,
-        [Parameter(Mandatory = $true)][string]$ClusterId,
-        [Parameter(Mandatory = $true)][int]$Attempt
-    )
-
-    $pattern = "$ClusterId-fix-$Attempt-*.jsonl"
-    foreach ($file in @(Get-ChildItem -LiteralPath $RunRoot -Filter $pattern -File |
-        Sort-Object LastWriteTime -Descending)) {
-        foreach ($line in @(Get-Content -LiteralPath $file.FullName -TotalCount 50)) {
-            try {
-                $event = $line | ConvertFrom-Json -ErrorAction Stop
-                if ([string]$event.type -eq "thread.started" -and
-                    -not [string]::IsNullOrWhiteSpace([string]$event.thread_id)) {
-                    return [string]$event.thread_id
-                }
-            }
-            catch {
-                # Ignore malformed or partially flushed final lines.
-            }
-        }
-    }
-    return ""
 }
 
 function Resume-ReviewLoopInterruptedFix {
@@ -2008,7 +2034,12 @@ function Invoke-ReviewLoopCore {
     }
     if ($resumed -and [string]$state.Status -eq "failed") {
         $resumedFromFailure = $true
-        if ([string]$state.Stage -eq "stopped" -and @($state.ActiveFindingIds).Count -gt 0) {
+        $activeRoleCall = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
+        if ([string]$state.Stage -eq "stopped" -and $null -ne $activeRoleCall) {
+            $state.Stage = [string](Get-ReviewLoopObjectProperty `
+                -Object $activeRoleCall -Name "CheckpointStage" -Default "reviewing")
+        }
+        elseif ([string]$state.Stage -eq "stopped" -and @($state.ActiveFindingIds).Count -gt 0) {
             $state.Stage = if (
                 $null -ne $state.LastFixerResult -and
                 $null -ne $state.LastFixerResult.StructuredResult
@@ -2163,21 +2194,6 @@ function Invoke-ReviewLoopCore {
                 $state.ReviewCycle = [int]$state.ReviewCycle + 1
             }
             $state.CurrentHead = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
-            $reopened = @($ledger.Findings | Where-Object {
-                [string]$_.Status -eq "blocked" -and
-                [string]$_.LastBlockedHead -ne [string]$state.CurrentHead
-            })
-            foreach ($finding in $reopened) {
-                $finding.Status = "open"
-                $finding.FixAttempts = 0
-                $finding.FixerThreadId = ""
-                $finding.BlockedReason = ""
-                $finding.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
-            }
-            if ($reopened.Count -gt 0) {
-                Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
-                Write-ReviewLoopStatus -Message "Reopened $($reopened.Count) blocked finding(s) because HEAD changed." -Kind Warning
-            }
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewing"
             Write-ReviewLoopRule -Title ("Review cycle {0}/{1}" -f $state.ReviewCycle, $config.MaxReviewCycles) -Kind Review
             $review = Invoke-ReviewLoopReview `

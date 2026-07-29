@@ -77,6 +77,8 @@ $hangText = [string](Get-FakePlanValue -Plan $invocationPlan -Name "hangMs" -Def
 $tailDelayText = [string](Get-FakePlanValue -Plan $invocationPlan -Name "tailDelayMs" -Default $tailDelayText)
 $threadId = [string](Get-FakePlanValue -Plan $invocationPlan -Name "threadId" -Default $threadId)
 $emitThread = Get-FakePlanValue -Plan $invocationPlan -Name "emitThread" -Default $true
+$plannedResult = Get-FakePlanValue -Plan $invocationPlan -Name "result"
+$plannedMutations = @(Get-FakePlanValue -Plan $invocationPlan -Name "mutations" -Default @())
 $childPidPath = [string](Get-FakePlanValue -Plan $invocationPlan -Name "childPidPath" -Default "")
 $childSleepSeconds = [int](Get-FakePlanValue -Plan $invocationPlan -Name "childSleepSeconds" -Default 60)
 
@@ -152,7 +154,10 @@ if (-not [string]::IsNullOrWhiteSpace($exitText)) {
 }
 
 if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
-    if (-not [string]::IsNullOrWhiteSpace($resultSequencePath) -and (Test-Path -LiteralPath $resultSequencePath)) {
+    if ($null -ne $plannedResult) {
+        $result = [string]$plannedResult
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($resultSequencePath) -and (Test-Path -LiteralPath $resultSequencePath)) {
         $sequence = @(Get-Content -Raw -LiteralPath $resultSequencePath | ConvertFrom-Json)
         if ($sequence.Count -eq 0) {
             throw "Fake Codex result sequence is empty."
@@ -208,6 +213,44 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
             (Join-Path $repoPath "fake-review-loop-change.test.txt"),
             ([Guid]::NewGuid().ToString("N") + [Environment]::NewLine),
             [System.Text.UTF8Encoding]::new($false))
+    }
+}
+
+if ($plannedMutations.Count -gt 0) {
+    if ([string]::IsNullOrWhiteSpace($repoPath)) {
+        throw "Fake Codex cannot apply a planned mutation without a repository path."
+    }
+    $repoRoot = [System.IO.Path]::GetFullPath($repoPath)
+    $repoPrefix = [System.IO.Path]::TrimEndingDirectorySeparator($repoRoot) +
+        [System.IO.Path]::DirectorySeparatorChar
+    foreach ($mutation in $plannedMutations) {
+        $relative = [string](Get-FakePlanValue -Plan $mutation -Name "path" -Default "")
+        if ([string]::IsNullOrWhiteSpace($relative) -or [System.IO.Path]::IsPathRooted($relative) -or
+            $relative -match '(^|[\\/])\.\.([\\/]|$)') {
+            throw "Fake Codex mutation path is invalid: '$relative'."
+        }
+        $absolute = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $relative))
+        if (-not $absolute.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Fake Codex mutation path escapes the repository: '$relative'."
+        }
+        $parent = Split-Path -Parent $absolute
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+        }
+        $content = [string](Get-FakePlanValue -Plan $mutation -Name "content" -Default "")
+        $append = Test-FakeBoolean (Get-FakePlanValue -Plan $mutation -Name "append" -Default $false)
+        if ($append) {
+            [System.IO.File]::AppendAllText(
+                $absolute,
+                $content,
+                [System.Text.UTF8Encoding]::new($false))
+        }
+        else {
+            [System.IO.File]::WriteAllText(
+                $absolute,
+                $content,
+                [System.Text.UTF8Encoding]::new($false))
+        }
     }
 }
 

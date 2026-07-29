@@ -488,6 +488,7 @@ Describe "Finding identity and ledger" {
         Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-TestFinding)) -ReviewId r2 -Head h2 | Out-Null
         $ledger.Findings[0].Status | Should Be "open"
         $ledger.Findings[0].RecurrenceCount | Should Be 1
+        $ledger.Findings[0].VerifiedRecurrenceCount | Should Be 1
     }
 
     It "reopens a recurring duplicate instead of hiding a live finding" {
@@ -681,6 +682,7 @@ Describe "Run state" {
 
     It "starts at zero clean passes" {
         $state.CleanPasses | Should Be 0
+        $state.ActiveRoleCall | Should BeNullOrEmpty
     }
 
     It "stores the global speed" {
@@ -917,6 +919,62 @@ Describe "Live terminal and streaming process observation" {
             Wait-Job -Job $job -Timeout 15 | Out-Null
             $job.State | Should Be "Completed"
             Receive-Job -Job $job | Out-Null
+        }
+        finally {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "checkpoints a role thread before the Codex process finishes" {
+        $env:CODEX_REVIEW_LOOP_FAKE_EVENT_DELAY_MS = "2500"
+        $configPath = New-TestConfig -Path (Join-Path $caseRoot "checkpoint.psd1") -LogRoot $logRoot
+        $statePath = Join-Path $logRoot "run-v1.json"
+        $job = Start-Job -ScriptBlock {
+            param($importPath, $profilePath, $repoPath, $logs, $checkpointPath, $fake)
+            Import-Module $importPath -Force
+            $config = Import-PowerShellDataFile -LiteralPath $profilePath
+            $config["__ExecutionFingerprint"] = "checkpoint-fingerprint"
+            $head = & git -C $repoPath rev-parse HEAD
+            $state = New-ReviewLoopState -RepoPath $repoPath -ReviewBase HEAD -Speed standard `
+                -RunRoot $logs -ReviewBaseCommit $head -ExecutionFingerprint "checkpoint-fingerprint"
+            $state.Stage = "reviewing"
+            Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
+            & (Get-Module CodexReviewLoop) {
+                param($profile, $loopState, $loopStatePath, $repository, $runRoot, $fakePath)
+                Invoke-ConfiguredCodexRole -Config $profile -Role Reviewer -RepoPath $repository `
+                    -Speed standard -Prompt review -LogRoot $runRoot `
+                    -SchemaName "review-result-v1.schema.json" -CallId "review-01" `
+                    -State $loopState -StatePath $loopStatePath -CodexPath $fakePath
+            } $config $state $checkpointPath $repoPath $logs $fake | Out-Null
+        } -ArgumentList $modulePath, $configPath, $repo, $logRoot, $statePath, $fakeCodex
+        try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            $checkpoint = $null
+            while ([DateTime]::UtcNow -lt $deadline) {
+                if (Test-Path -LiteralPath $statePath) {
+                    try {
+                        $checkpoint = Read-ReviewLoopState -Path $statePath
+                        if (-not [string]::IsNullOrWhiteSpace(
+                                [string]$checkpoint.ActiveRoleCall.ThreadId)) {
+                            break
+                        }
+                    }
+                    catch {
+                        $checkpoint = $null
+                    }
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            $checkpoint.ActiveRoleCall.CallId | Should Be "review-01"
+            $checkpoint.ActiveRoleCall.ThreadId | Should Be "fake-thread-001"
+            $job.State | Should Be "Running"
+            Wait-Job -Job $job -Timeout 15 | Out-Null
+            $job.State | Should Be "Completed"
+            Receive-Job -Job $job | Out-Null
+            $completed = Read-ReviewLoopState -Path $statePath
+            $completed.ActiveRoleCall | Should BeNullOrEmpty
+            @($completed.RoleCalls).Count | Should Be 1
         }
         finally {
             Stop-Job -Job $job -ErrorAction SilentlyContinue
@@ -1221,9 +1279,10 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $message | Should Match "FIXER_RESULT"
     }
 
-    It "allows useful commands while preserving repository state for analysis roles" {
+    It "keeps analysis commands narrow and reserves full gates for the orchestrator" {
         $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
-        $roles | Should Match 'You may run any useful analysis, build, or test command'
+        $roles | Should Match 'authoritative and owned by the orchestrator'
+        $roles | Should Match 'do not run a full repository or solution test suite'
         $roles | Should Match 'must not edit repository files'
         $roles | Should Match 'Preserve tracked and untracked repository state'
     }
@@ -1233,9 +1292,10 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $verifier | Should Match 'orchestrator supplies the independently executed targeted-test result'
     }
 
-    It "lets fixers test while retaining independent orchestration" {
+    It "keeps fixer tests targeted while retaining independent orchestration" {
         $fixer = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\fixer.md")
-        $fixer | Should Match 'You may run any useful build or test command'
+        $fixer | Should Match 'narrowest useful project or filtered regression tests'
+        $fixer | Should Match 'Do not run the configured full repository host gates'
         $fixer | Should Match 'exactly one structured `targetedTest`'
         $fixer | Should Match 'independent execution by the orchestrator'
     }
@@ -1574,6 +1634,62 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Committed"
     }
 
+    It "rolls back an exhausted cluster before committing an independent cluster" {
+        $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"two independent findings","findings":[{"priority":"P1","title":"first defect","path":"src/A.cs","line":10,"component":"first","rootCause":"first cause","invariant":"first invariant","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second defect","path":"src/B.cs","line":20,"component":"second","rootCause":"second cause","invariant":"second invariant","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
+        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"changed","changedPaths":[],"targetedTest":{"filePath":"pwsh","arguments":["-NoProfile","-Command","exit 0"],"rationale":"targeted regression"},"remainingRisk":""}'
+        $reproduced = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"still present"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"fixed"}]}'
+        $clean = '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        $plans = @(
+            [pscustomobject]@{ result = $findingReview },
+            [pscustomobject]@{
+                result = $fixChanged
+                mutations = @([pscustomobject]@{ path = "first.txt"; content = "abandoned attempt one" })
+            },
+            [pscustomobject]@{ result = $reproduced },
+            [pscustomobject]@{
+                result = $fixChanged
+                mutations = @([pscustomobject]@{ path = "first.txt"; content = "abandoned attempt two" })
+            },
+            [pscustomobject]@{ result = $reproduced },
+            [pscustomobject]@{
+                result = $fixChanged
+                mutations = @([pscustomobject]@{ path = "second.txt"; content = "independent verified fix" })
+            },
+            [pscustomobject]@{ result = $resolved },
+            [pscustomobject]@{ result = $clean }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "rollback-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "blocked"
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $repo "first.txt") | Should Be $false
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "second.txt")) | Should Match "independent verified fix"
+        $committedPaths = @(& git -C $repo show --format= --name-only HEAD -- | Where-Object { $_ })
+        $committedPaths | Should Be @("second.txt")
+        $ledger = Read-ReviewLoopLedger -Path $result.LedgerPath
+        $blockedFinding = @($ledger.Findings | Where-Object {
+            $_.Status -eq "blocked" -and $_.FixAttempts -eq 2
+        })[0]
+        $blockedFinding | Should Not BeNullOrEmpty
+        Test-Path -LiteralPath $blockedFinding.BlockedArtifactRoot | Should Be $true
+        @($ledger.Findings | Where-Object { $_.Status -eq "resolved" -and $_.FixAttempts -eq 1 }).Count | Should Be 1
+        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
+        }).Count | Should Be 3
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-proposal-v1.schema.json"
+        }).Count | Should Be 0
+    }
+
     It "leaves the target repository unchanged during prompt-independent clean orchestration" {
         $before = & git -C $repo rev-parse HEAD
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
@@ -1618,7 +1734,7 @@ Describe "End-to-end orchestration with fake Codex" {
         [regex]::Matches([string]$architectCalls[0].prompt, '"Id":"F-[^"]+"').Count | Should Be 2
         @($records | Where-Object { [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-critique-v1.schema.json" }).Count | Should Be 3
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Trigger: same_contract_different_edge"
+        $terminal | Should Match "Trigger: same_contract_different_edge · multiple_active_findings"
         $terminal | Should Match "Proposal r0: consolidation"
         $terminal | Should Match "Terra-Critic: approve"
         $terminal | Should Match "Sol-Veto: reject_to_point_fix"

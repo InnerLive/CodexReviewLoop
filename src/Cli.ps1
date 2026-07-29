@@ -545,7 +545,8 @@ function Invoke-ReviewLoopObservedProcess {
         [AllowNull()][string]$InputText = $null,
         [ValidateSet("Codex", "HostGate")][string]$EventKind = "Codex",
         [switch]$AppendLogs,
-        [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0
+        [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0,
+        [AllowNull()][scriptblock]$OnThreadStarted = $null
     )
 
     $process = [System.Diagnostics.Process]::new()
@@ -632,7 +633,13 @@ function Invoke-ReviewLoopObservedProcess {
                 }
                 else {
                     if ($EventKind -eq "Codex") {
+                        $threadIdBefore = [string]$activity.ThreadId
                         Update-ReviewLoopCodexActivity -Line $line -Activity $activity
+                        if ($null -ne $OnThreadStarted -and
+                            -not [string]::IsNullOrWhiteSpace([string]$activity.ThreadId) -and
+                            [string]$activity.ThreadId -ne $threadIdBefore) {
+                            & $OnThreadStarted ([string]$activity.ThreadId)
+                        }
                     }
                     $safeLine = ConvertTo-ReviewLoopRedactedText $line
                     $stdoutWriter.WriteLine($safeLine)
@@ -763,7 +770,8 @@ function Invoke-CodexCliRole {
         [ValidateRange(1, 5)][int]$MaxAttempts = 3,
         [string]$CallId = "",
         [string]$DeveloperInstructions = "",
-        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 2700
+        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 2700,
+        [AllowNull()][scriptblock]$OnThreadStarted = $null
     )
 
     $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
@@ -796,6 +804,7 @@ function Invoke-CodexCliRole {
     $resultPath = "$stem.result.json"
 
     $attemptRecords = [System.Collections.Generic.List[object]]::new()
+    $callStartedAt = [DateTimeOffset]::UtcNow
     $totalUsage = [ordered]@{
         InputTokens = 0L
         CachedInputTokens = 0L
@@ -837,7 +846,8 @@ function Invoke-CodexCliRole {
                 -InputText $currentPrompt `
                 -EventKind Codex `
                 -AppendLogs:($attempt -gt 1) `
-                -TimeoutSeconds $TimeoutSeconds
+                -TimeoutSeconds $TimeoutSeconds `
+                -OnThreadStarted $OnThreadStarted
             $stdout = $observed.Stdout
             $stderr = $observed.Stderr
             $exitCode = $observed.ExitCode
@@ -945,8 +955,10 @@ function Invoke-CodexCliRole {
                 "$newInputTokens new input · $cachedTokens cached input · $outputTokens output tokens"
             }
             Write-ReviewLoopStatus -Message "$Role completed · $duration · $usageText" -Kind Success
+            $callFinishedAt = [DateTimeOffset]::UtcNow
             return [pscustomobject]@{
                 Success = $true
+                CallId = $CallId
                 Role = $Role
                 Model = $Model
                 Thinking = $Thinking
@@ -962,6 +974,8 @@ function Invoke-CodexCliRole {
                 JsonlPath = $jsonlPath
                 ResultPath = $resultPath
                 Attempts = $attemptRecords.ToArray()
+                StartedAt = $callStartedAt.ToString("O")
+                FinishedAt = $callFinishedAt.ToString("O")
             }
         }
 
@@ -988,6 +1002,7 @@ function Invoke-CodexCliRole {
             }
             return [pscustomobject]@{
                 Success = $false
+                CallId = $CallId
                 Role = $Role
                 Model = $Model
                 Thinking = $Thinking
@@ -1003,6 +1018,8 @@ function Invoke-CodexCliRole {
                 JsonlPath = $jsonlPath
                 ResultPath = $resultPath
                 Attempts = $attemptRecords.ToArray()
+                StartedAt = $callStartedAt.ToString("O")
+                FinishedAt = [DateTimeOffset]::UtcNow.ToString("O")
             }
         }
 
