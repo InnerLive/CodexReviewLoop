@@ -17,7 +17,8 @@ the branch is demonstrably clean or reaches a useful checkpoint.
 3. Applies a bounded fix and requires a targeted regression test.
 4. Independently runs the test, verifies the patch, and executes configured host
    gates before committing the exact verified tree.
-5. Repeats until two reviews are clean on the same unchanged `HEAD`.
+5. Repeats until the configured number of reviews are clean on the same
+   unchanged `HEAD` (two is the recommended default).
 
 Architecture work is considered only when the evidence supports it. A focused
 point fix remains the default.

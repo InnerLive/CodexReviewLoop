@@ -1042,15 +1042,18 @@ function Invoke-ReviewLoopArchitectureGate {
         if ([string]$decision.decision -ne "revise") {
             throw "Unsupported architecture decision: $($decision.decision)"
         }
+        Update-ReviewLoopLiveConfig -Config $Config
         if ($revision -ge [int]$Config.MaxArchitectureRevisions) {
             Write-ReviewLoopStatus -Message "Architecture revision budget exhausted; falling back to point fixing." -Kind Warning
             return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
         }
         $revision++
-        Write-ReviewLoopStatus -Message "Requesting the single allowed architecture-proposal revision." -Kind Warning
+        Write-ReviewLoopStatus `
+            -Message "Requesting architecture-proposal revision $revision/$($Config.MaxArchitectureRevisions)." `
+            -Kind Warning
         $State.ArchitectureRevision = $revision
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-        $architectPrompt += "`n`nRequired critic changes for the single allowed revision:`n$(ConvertTo-ReviewLoopJsonCompact $decision)"
+        $architectPrompt += "`n`nRequired critic changes for revision ${revision}:`n$(ConvertTo-ReviewLoopJsonCompact $decision)"
     }
 }
 

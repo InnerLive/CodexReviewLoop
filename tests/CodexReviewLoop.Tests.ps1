@@ -216,6 +216,8 @@ Describe "Optional profiles and command help" {
         $content = Get-Content -Raw -LiteralPath $resolved
         $content | Should Match "# Role settings:"
         $content | Should Match "# Host gates"
+        $content | Should Match "Recommended: 2-3 clean passes"
+        $content | Should Match "Recommended ranges: 6-30 review cycles, 2-5 fix attempts"
         $profile = Import-PowerShellDataFile -LiteralPath $resolved
         $profile.Name | Should Be "automatic-profile-repo"
         $canonicalRepo = & $module {
@@ -231,6 +233,36 @@ Describe "Optional profiles and command help" {
             Import-ReviewLoopConfig -ConfigPath $path
         } $resolved
         $imported.LogRoot | Should Be (Join-Path $root "runs")
+    }
+
+    It "accepts profile-owner budgets outside the recommended ranges" {
+        $repo = New-TestRepo (Join-Path $TestDrive "custom-budget-repo")
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "custom-budget.psd1") `
+            -LogRoot (Join-Path $TestDrive "custom-budget-logs")
+        $profile = Import-PowerShellDataFile -LiteralPath $profilePath
+        $profile.CleanPassesRequired = 7
+        $profile.MaxReviewCycles = 1
+        $profile.MaxFixAttempts = 9
+        $profile.MaxArchitectureRevisions = 4
+        $profile.AutoCommit = $false
+        $failure = $null
+
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($config)
+                Assert-ReviewLoopConfigValues -Config $config
+            } $profile
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should BeNullOrEmpty
+        $profile.CleanPassesRequired | Should Be 7
+        $profile.MaxReviewCycles | Should Be 1
+        $profile.MaxFixAttempts | Should Be 9
+        $profile.MaxArchitectureRevisions | Should Be 4
     }
 
     It "reuses the profile matched by canonical repository path" {
@@ -706,7 +738,11 @@ Describe "Run state" {
         } $profilePath
 
         $content = (Get-Content -Raw -LiteralPath $profilePath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 5").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 24").
+            Replace("MaxFixAttempts = 2", "MaxFixAttempts = 7").
+            Replace("MaxArchitectureRevisions = 1", "MaxArchitectureRevisions = 3").
+            Replace("AutoCommit = `$true", "AutoCommit = `$false").
             Replace(
                 'CommitMessagePrefix = "Test Review Loop"',
                 'CommitMessagePrefix = "Reloaded"')
@@ -1708,8 +1744,11 @@ Describe "End-to-end orchestration with fake Codex" {
             Should Match "Output:\s+detailed · heartbeat 0s · Never"
     }
 
-    It "uses exactly two fixer attempts and resumes only the cluster thread" {
+    It "uses the configured fixer-attempt budget and resumes only the cluster thread" {
         $configPath = New-TestConfig -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"cache defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs","tests/A.Tests.cs"]}]}'
         $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt","fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
@@ -1717,6 +1756,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $findingReview,
+            $fixChanged, $stillOpen,
             $fixChanged, $stillOpen,
             $fixChanged, $resolved,
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
@@ -1727,12 +1767,12 @@ Describe "End-to-end orchestration with fake Codex" {
         $result.Status | Should Be "completed"
         $ledger = Read-ReviewLoopLedger -Path $result.LedgerPath
         $ledger.Findings[0].Status | Should Be "resolved"
-        $ledger.Findings[0].FixAttempts | Should Be 2
+        $ledger.Findings[0].FixAttempts | Should Be 3
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 1
+        @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
-        $terminal | Should Match "Fixer · attempt 2/2 · resuming thread"
+        $terminal | Should Match "Fixer · attempt 3/3 · resuming thread"
         $terminal | Should Match "Fixer: changed · 1 changed paths"
         $terminal | Should Match "Verifier: resolved"
         $terminal | Should Match "Host-Gate: fake gate"
@@ -1846,7 +1886,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Terra-Tie-Break: reject_to_point_fix"
     }
 
-    It "falls back to point fixing after the single allowed architecture revision" {
+    It "falls back to point fixing after the configured architecture revision budget" {
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
         $twoFindings = '{"schemaVersion":"1.0","classification":"findings","summary":"two","findings":[{"priority":"P1","title":"first","path":"src/A.cs","line":10,"component":"shared","rootCause":"cause-a","invariant":"invariant-a","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second","path":"src/B.cs","line":20,"component":"shared","rootCause":"cause-b","invariant":"invariant-b","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
         $firstId = Get-ReviewLoopFindingId `

@@ -444,17 +444,21 @@ function New-ReviewLoopProfile {
     # Relative paths are resolved against the review loop script directory.
     LogRoot = $(ConvertTo-ReviewLoopPowerShellLiteral $logRoot)
 
-    # Two clean passes on an unchanged HEAD are the required completion gate.
+    # Recommended: 2-3 clean passes on an unchanged HEAD.
     CleanPassesRequired = 2
 
-    # Hard limits prevent endless review, fix, and architecture loops.
-    # MaxReviewCycles is reloaded at safe boundaries while a run is active.
+    # Recommended ranges: 6-30 review cycles, 2-5 fix attempts per finding
+    # cluster, and 0-2 architecture proposal revisions.
+    # These values are reloaded at safe boundaries while a run is active.
     MaxReviewCycles = 12
     MaxFixAttempts = 2
     MaxArchitectureRevisions = 1
-    # The unattended loop always commits after successful verification and all host gates.
+
+    # When false, verified changes are staged and the loop waits for a manual
+    # commit or for AutoCommit to be enabled before continuing.
     AutoCommit = `$true
-    # CommitMessagePrefix is reloaded for future commits while a run is active.
+
+    # Reloaded for future commits while a run is active.
     CommitMessagePrefix = 'Review-Loop'
 
     # Host gates run after successful finding verification and before the commit.
@@ -574,10 +578,6 @@ function Import-ReviewLoopConfig {
             $config[$entry.Key] = $entry.Value
         }
     }
-    if (-not [bool]$config.AutoCommit) {
-        throw "AutoCommit=false is incompatible with the unattended loop because it leaves a dirty worktree."
-    }
-
     $configuredLogRoot = [Environment]::ExpandEnvironmentVariables([string]$config.LogRoot)
     $config.LogRoot = if ([System.IO.Path]::IsPathRooted($configuredLogRoot)) {
         [System.IO.Path]::GetFullPath($configuredLogRoot)
@@ -606,32 +606,19 @@ function Assert-ReviewLoopConfigValues {
         throw "Configuration value 'Roles' must be a hashtable."
     }
 
-    $limits = @{
-        CleanPassesRequired = @(2, 2)
-        MaxReviewCycles = @(2, 100)
-        MaxFixAttempts = @(2, 2)
-        MaxArchitectureRevisions = @(1, 1)
-    }
-    foreach ($entry in $limits.GetEnumerator()) {
+    foreach ($name in @(
+        "CleanPassesRequired",
+        "MaxReviewCycles",
+        "MaxFixAttempts",
+        "MaxArchitectureRevisions"
+    )) {
         try {
-            $value = [int]$Config[$entry.Key]
+            $value = [int]$Config[$name]
         }
         catch {
-            throw "Configuration value '$($entry.Key)' must be an integer."
+            throw "Configuration value '$name' must be an integer."
         }
-        if ($value -lt $entry.Value[0] -or $value -gt $entry.Value[1]) {
-            $range = if ($entry.Value[0] -eq $entry.Value[1]) {
-                [string]$entry.Value[0]
-            }
-            else {
-                "$($entry.Value[0])..$($entry.Value[1])"
-            }
-            throw "Configuration value '$($entry.Key)' must be $range."
-        }
-        $Config[$entry.Key] = $value
-    }
-    if ([int]$Config.MaxReviewCycles -lt [int]$Config.CleanPassesRequired) {
-        throw "MaxReviewCycles must be at least CleanPassesRequired."
+        $Config[$name] = $value
     }
     $roles = @(
         "Reviewer",
@@ -667,7 +654,11 @@ function Assert-ReviewLoopConfigValues {
 }
 
 $script:ReviewLoopLiveConfigKeys = @(
+    "CleanPassesRequired",
     "MaxReviewCycles",
+    "MaxFixAttempts",
+    "MaxArchitectureRevisions",
+    "AutoCommit",
     "CommitMessagePrefix"
 )
 
@@ -749,11 +740,11 @@ function Update-ReviewLoopLiveConfig {
             continue
         }
         $Config[$key] = $latest[$key]
-        if ($key -eq "MaxReviewCycles") {
-            [void]$changes.Add("MaxReviewCycles $before -> $after")
+        if ($key -eq "CommitMessagePrefix") {
+            [void]$changes.Add("CommitMessagePrefix updated")
         }
         else {
-            [void]$changes.Add("$key updated")
+            [void]$changes.Add("$key $before -> $after")
         }
     }
     if ($changes.Count -gt 0) {

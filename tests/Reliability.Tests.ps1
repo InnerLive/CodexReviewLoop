@@ -934,6 +934,28 @@ Describe "Unattended reliability boundaries" {
         @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG)).Count | Should Be 2
     }
 
+    It "treats a targeted test that cannot start as a correction of the same attempt" {
+        $runRoot = Join-Path $caseRoot "targeted-start-failure"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $fixerResult = [pscustomobject]@{
+            targetedTest = [pscustomobject]@{
+                filePath = ".\README.txt"
+                arguments = @("ignored")
+            }
+        }
+
+        $result = & (Get-Module CodexReviewLoop) {
+            param($fix, $repository, $logs)
+            Invoke-ReviewLoopTargetedTests `
+                -FixerResult $fix -RepoPath $repository -RunRoot $logs `
+                -ClusterId "C-start-failure" -Attempt 1
+        } $fixerResult $repo $runRoot
+
+        $result.Success | Should Be $false
+        $result.Correctable | Should Be $true
+        $result.Feedback | Should Match "Exit code -1"
+    }
+
     It "rejects a resolved finding when the patch introduced regressions" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $runRoot = Join-Path $caseRoot "unsafe-verifier-run"
@@ -1008,6 +1030,82 @@ Describe "Unattended reliability boundaries" {
             Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
         } $repo
         $after | Should Be $before
+    }
+
+    It "stages verified work when AutoCommit is disabled and resumes after it is enabled" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.AutoCommit = $false
+        $runRoot = Join-Path $caseRoot "manual-commit-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "manual-commit-ledger.json"
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified manual commit"
+        $fingerprint = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $preHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.Verification = [pscustomobject]@{
+            verdict = "resolved"
+            patchSafety = "safe"
+            confidence = "high"
+        }
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $preHead
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.PendingCommit = [pscustomobject]@{
+            PreHead = $preHead
+            PatchFingerprint = $fingerprint
+            ExpectedTree = ""
+            Message = "Reliability: verified manual commit"
+            NeedsCurrentGates = $false
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $failure = $null
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($profile, $loopState, $loopStatePath, $loopLedger, $loopLedgerPath, $repository, $logs)
+                Complete-ReviewLoopPendingCommit `
+                    -Config $profile -State $loopState -StatePath $loopStatePath `
+                    -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                    -RepoPath $repository -RunRoot $logs
+            } $config $state $statePath $ledger $ledgerPath $repo $runRoot | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Data["ReviewLoopStatus"] | Should Be "blocked"
+        $failure.Exception.Message | Should Match "AutoCommit is disabled"
+        (& git -C $repo rev-parse HEAD) | Should Be $preHead
+        @(& git -C $repo diff --cached --name-only) | Should Be @("README.txt")
+        (Read-ReviewLoopState -Path $statePath).Stage | Should Be "commit_pending"
+
+        $config.AutoCommit = $true
+        $completed = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger, $loopLedgerPath, $repository, $logs)
+            Complete-ReviewLoopPendingCommit `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -RepoPath $repository -RunRoot $logs
+        } $config $state $statePath $ledger $ledgerPath $repo $runRoot
+
+        $completed | Should Be $true
+        (& git -C $repo rev-parse HEAD) | Should Not Be $preHead
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
     }
 
     It "refuses a verified change that remains unstaged before advancing HEAD" {

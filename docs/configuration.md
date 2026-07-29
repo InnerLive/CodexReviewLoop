@@ -29,7 +29,11 @@ a `RepositoryPath` cannot be used for another repository.
 | `RepositoryPath` | Canonical Git root | Prevents profile collisions |
 | `ReviewBase` | Detected Git revision | Revision reviewed against |
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
-| `MaxReviewCycles` | `12` | Live-reloaded hard bound for review cycles |
+| `CleanPassesRequired` | `2` | Live-reloaded completion gate |
+| `MaxReviewCycles` | `12` | Live-reloaded review-cycle budget |
+| `MaxFixAttempts` | `2` | Live-reloaded attempts per finding cluster |
+| `MaxArchitectureRevisions` | `1` | Live-reloaded proposal revision budget |
+| `AutoCommit` | `$true` | Live-reloaded commit behavior |
 | `CommitMessagePrefix` | `Review-Loop` | Live-reloaded prefix for future verified commits |
 | `HostGates` | Detected checks | Required checks before every commit |
 | `Roles` | Pinned model settings | Model and reasoning level per role |
@@ -37,23 +41,34 @@ a `RepositoryPath` cannot be used for another repository.
 Relative `LogRoot` paths are resolved against the Codex Review Loop
 installation, not the current shell directory or reviewed repository.
 
-Several values are deliberate invariants rather than tuning knobs:
+Generated numeric values are recommendations, not enforced policy. Useful
+starting points are:
 
-- `CleanPassesRequired = 2`
-- `MaxFixAttempts = 2`
-- `MaxArchitectureRevisions = 1`
-- `AutoCommit = $true`
+- `CleanPassesRequired`: 2-3
+- `MaxReviewCycles`: 6-30
+- `MaxFixAttempts`: 2-5
+- `MaxArchitectureRevisions`: 0-2
 
-Profiles that weaken these values are rejected.
+The loop accepts integer values outside these ranges. The profile owner chooses
+the tradeoff appropriate for the repository and run.
+
+With `AutoCommit = $true`, the loop commits the exact verified tree after all
+host gates pass. With `AutoCommit = $false`, it stages that verified tree and
+stops at a resumable checkpoint. The user may create the prepared commit
+manually, or enable `AutoCommit` and resume the same run.
 
 ## Changes during an active run
 
-The loop reloads two settings from the active profile at role and review-cycle
-boundaries:
+The loop reloads these settings from the active profile at safe role, review,
+fix, architecture, and commit boundaries:
 
+- `CleanPassesRequired`
 - `MaxReviewCycles` applies before the next review cycle. Increasing it lets the
   current checkpoint continue without stopping. Lowering it below the number of
   cycles already used stops at the normal maximum-cycle checkpoint.
+- `MaxFixAttempts`
+- `MaxArchitectureRevisions`
+- `AutoCommit`
 - `CommitMessagePrefix` applies to the next commit that has not yet entered
   commit preparation. A pending commit keeps its sealed message.
 

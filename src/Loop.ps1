@@ -412,7 +412,7 @@ function Invoke-ReviewLoopTargetedTests {
     })
     return [pscustomobject]@{
         Success = [bool]$result.Success
-        Correctable = $false
+        Correctable = [int]$result.ExitCode -eq -1
         Feedback = if ($result.Success) { "" } else {
             $excerpt = @(Get-ReviewLoopTextExcerpt -Text $result.Output -MaxLines 6) -join " "
             "Targeted regression test failed: $($test.filePath) $($arguments -join ' '). Exit code $($result.ExitCode). $excerpt"
@@ -1273,6 +1273,20 @@ function Complete-ReviewLoopPendingCommit {
         }
         $pending.ExpectedTree = $tree
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
+        $autoCommit = if ($Config.ContainsKey("AutoCommit")) {
+            [bool]$Config.AutoCommit
+        }
+        else {
+            $true
+        }
+        if (-not $autoCommit) {
+            Stop-ReviewLoopBlocked `
+                -Message "Verified changes are staged and ready to commit, but AutoCommit is disabled." `
+                -NextSteps @(
+                    "Commit the staged tree with message '$($pending.Message)', then run the same command again."
+                    "Or set AutoCommit = `$true in the active profile and run the same command again so the loop creates the verified commit."
+                )
+        }
         $commitObject = Invoke-ReviewLoopGitStep -Name "Commit object" -Arguments @(
             "commit-tree", $tree, "-p", $preHead, "-m", [string]$pending.Message
         ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId
@@ -1635,6 +1649,7 @@ function Invoke-ReviewLoopFixWorkflow {
             $technicalCorrections++
             $retryCurrentAttempt = $true
         }
+        Update-ReviewLoopLiveConfig -Config $Config
     }
 
     $reason = "Finding cluster remained open after $attempt fix attempts."
@@ -2218,6 +2233,7 @@ function Invoke-ReviewLoopCore {
             }
             Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewed"
+            Update-ReviewLoopLiveConfig -Config $config
             if ((Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")) -ne
                 [string]$review.Head -or -not (Test-ReviewLoopGitClean -RepoPath $repo)) {
                 Stop-ReviewLoopBlocked -Message "Repository state changed after review and before its result could be applied."

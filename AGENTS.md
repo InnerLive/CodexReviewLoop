@@ -188,8 +188,8 @@ arbitrary decision or an endless debate.
 - Repository, branch, symbolic review base, resolved base commit, HEAD, speed,
   and execution fingerprint must be checked before resuming relevant work.
 
-Completion requires exactly the configured clean-pass gate, normally two
-consecutive clean reviews on an unchanged HEAD, with no open or blocked
+Completion requires the configured clean-pass gate, with two consecutive clean
+reviews on an unchanged HEAD as the recommended default, and no open or blocked
 findings. Every commit or other HEAD change resets the counter.
 
 ## Architecture behavior
@@ -209,7 +209,7 @@ Architecture is optional remediation, not a mandatory ceremony.
 - Critics check coherence, complete finding/path coverage, minimality, risk, and
   artificial bundling.
 - Approval receives an independent veto and at most one tie-break.
-- At most one proposal revision is allowed.
+- Proposal revisions use the profile's budget; one is the recommended default.
 - Scope limits are pre-change gates, not targets to fill.
 - Rejected, excessive, or uncertain architecture normally falls back to a
   bounded point fix rather than blocking unrelated progress.
@@ -220,9 +220,10 @@ epochs, or interactive proposal review.
 ## Fixing, tests, and commits
 
 - Each semantic finding cluster gets a fresh fixer thread.
-- Only the second attempt or a technical correction for that same cluster may
+- Only a later attempt or a technical correction for that same cluster may
   resume the thread.
-- There are exactly two semantic fix attempts per cluster.
+- Semantic fix attempts use the profile's budget; two is the recommended
+  default.
 - A fixer returns a structured executable plus argument array for one targeted
   regression test. Do not require fragile shell-string parsing.
 - Repository wrappers and arbitrary executables are valid targeted-test

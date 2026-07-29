@@ -45,23 +45,24 @@ change.
 The assessment compares a minimal point fix with consolidation. Consolidation
 must cover the active findings, affected paths, and regression tests with lower
 risk than separate fixes. An uncertain, incomplete, excessive, or rejected
-proposal falls back to a point fix. Only one proposal revision is allowed.
+proposal falls back to a point fix. Proposal revisions use the configured
+budget; one revision is the recommended default.
 
 ## 3. Bounded fixing
 
-Each semantic finding cluster receives its own fixer thread and exactly two
-semantic fix attempts.
+Each semantic finding cluster receives its own fixer thread and the configured
+semantic fix-attempt budget. Two attempts are the recommended default.
 
 The fixer may edit the worktree and run exploratory tests, but it cannot commit.
 It must return one structured targeted test as an executable plus argument
-array. On the second attempt, the same fixer thread receives all supported
+array. On every later attempt, the same fixer thread receives all supported
 verification feedback together.
 
-If both attempts fail, the loop preserves the unverified patch as a hashed
-diagnostic artifact, restores the exact fixer-owned changes, and marks that
-cluster blocked. Independent clusters then continue instead of losing otherwise
-useful progress. Cleanup is checkpointed and resumable; uncertain concurrent
-state is never deleted automatically.
+If the configured attempt budget is exhausted, the loop preserves the
+unverified patch as a hashed diagnostic artifact, restores the exact
+fixer-owned changes, and marks that cluster blocked. Independent clusters then
+continue instead of losing otherwise useful progress. Cleanup is checkpointed
+and resumable; uncertain concurrent state is never deleted automatically.
 
 ## 4. Independent acceptance
 
@@ -91,9 +92,10 @@ included in loop-owned work.
 
 ## Trustworthy completion
 
-Completion requires exactly two consecutive clean reviews on an unchanged
-`HEAD`, with no open or blocked findings. Every commit or other `HEAD` change
-resets the clean-pass count.
+Completion requires the configured number of consecutive clean reviews on an
+unchanged `HEAD`, with no open or blocked findings. Two clean passes are the
+recommended default. Every commit or other `HEAD` change resets the clean-pass
+count.
 
 Hard invariant failures, exhausted attempts, or the review-cycle limit produce
 a durable checkpoint instead of an ambiguous success.
