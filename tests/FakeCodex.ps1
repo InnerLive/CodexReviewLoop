@@ -49,7 +49,16 @@ function Read-FakeInvocationPlan {
 }
 
 $arguments = @($args)
-$prompt = [Console]::In.ReadToEnd()
+$inputReader = [System.IO.StreamReader]::new(
+    [Console]::OpenStandardInput(),
+    [System.Text.UTF8Encoding]::new($false),
+    $false)
+try {
+    $prompt = $inputReader.ReadToEnd()
+}
+finally {
+    $inputReader.Dispose()
+}
 $logPath = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_LOG")
 $resultOverride = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_RESULT")
 $resultSequencePath = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE")

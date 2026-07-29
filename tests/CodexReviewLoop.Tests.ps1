@@ -844,6 +844,22 @@ Describe "Fake Codex integration" {
         $record.prompt | Should Be "hello prompt"
     }
 
+    It "writes role prompts to stdin as BOM-less UTF-8" {
+        $inputEncoding = & (Get-Module CodexReviewLoop) {
+            param($executable)
+            (New-CodexProcessStartInfo -CodexExecutable $executable -Arguments @("exec")).StandardInputEncoding
+        } $fakeCodex
+        $inputEncoding.WebName | Should Be "utf-8"
+        @($inputEncoding.GetPreamble()).Count | Should Be 0
+
+        $prompt = "Umlaute: äöü · punctuation: – · emoji: 🔎"
+        Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low `
+            -Prompt $prompt -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
+        $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            Select-Object -Last 1 | ConvertFrom-Json
+        $record.prompt | Should Be $prompt
+    }
+
     It "passes standard to the fake CLI" {
         Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Speed standard -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
         (Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Match 'service_tier=\\?"default'
