@@ -62,3 +62,11 @@ For the complete command reference:
 ```powershell
 pwsh -File .\codex-review-loop.ps1 -Help
 ```
+
+## License
+
+Copyright 2026 InnerLive.
+
+Codex Review Loop is licensed under the
+[Apache License 2.0](LICENSE). Using the tool does not change the license of
+the repository being reviewed.
