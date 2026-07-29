@@ -109,6 +109,40 @@ function Write-FakeResultSequence {
     Set-Content -LiteralPath $Path -Value ($Results | ConvertTo-Json -Depth 20) -Encoding UTF8
 }
 
+function New-TestActiveCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [ValidateSet("standard", "fast")][string]$Speed = "standard"
+    )
+
+    return & (Get-Module CodexReviewLoop) {
+        param($repository, $profilePath, $runSpeed)
+
+        $config = Import-ReviewLoopConfig -ConfigPath $profilePath -RepoPath $repository
+        $baseCommit = Get-ReviewLoopGitValue -RepoPath $repository -Arguments @(
+            "rev-parse", "--verify", "$($config.ReviewBase)^{commit}"
+        )
+        $paths = New-ReviewLoopRunPaths `
+            -Config $config `
+            -RepoPath $repository `
+            -ReviewBaseCommit $baseCommit
+        Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repository `
+            -ReviewBase ([string]$config.ReviewBase) `
+            -ReviewBaseCommit $baseCommit `
+            -ExecutionFingerprint (Get-ReviewLoopExecutionFingerprint -ConfigPath $profilePath) `
+            -Speed $runSpeed `
+            -RunRoot $paths.RunRoot
+        Write-ReviewLoopState -Path $paths.StatePath -State $state | Out-Null
+        return [pscustomobject]@{
+            RunRoot = $paths.RunRoot
+            StatePath = $paths.StatePath
+        }
+    } $RepoPath $ConfigPath $Speed
+}
+
 Describe "Codex Review Loop module" {
     It "imports the module" {
         Get-Module CodexReviewLoop | Should Not BeNullOrEmpty
@@ -296,6 +330,36 @@ Describe "Optional profiles and command help" {
         ($output -join "`n") | Should Match "OutputMode"
         ($output -join "`n") | Should Match "HeartbeatSeconds"
         ($output -join "`n") | Should Match "ColorMode"
+        ($output -join "`n") | Should Match "Json"
+    }
+
+    It "shows actionable guidance when RepoPath is missing" {
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive -File $entryPoint 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+
+        $exitCode | Should Be 1
+        $text | Should Match "repository path is required"
+        $text | Should Match "Recommended"
+        $text | Should Match "-RepoPath"
+        $text | Should Not Match '"Status"\s*:'
+        $text | Should Not Match "CategoryInfo|ScriptStackTrace"
+    }
+
+    It "emits only JSON for a missing RepoPath when requested" {
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint -Json 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        $result = $text | ConvertFrom-Json
+
+        $exitCode | Should Be 1
+        $result.Status | Should Be "failed"
+        $result.ExitCode | Should Be 1
+        ($result.NextSteps -join "`n") | Should Match "-RepoPath"
+        $text | Should Not Match "\[X\]|Recommended|Alternative"
     }
 }
 
@@ -651,6 +715,21 @@ Describe "Run state" {
     It "rejects unknown state versions" {
         $state.SchemaVersion = "2.0"
         (Test-Throws { Write-ReviewLoopState -Path (Join-Path $TestDrive "state.json") -State $state }) | Should Be $true
+    }
+
+    It "provides safe default guidance for resumable and blocked failures" {
+        $guidance = & (Get-Module CodexReviewLoop) {
+            $exception = [System.InvalidOperationException]::new("test failure")
+            [pscustomobject]@{
+                Failed = @(Get-ReviewLoopFailureNextSteps -Exception $exception -Context failed)
+                Blocked = @(Get-ReviewLoopFailureNextSteps -Exception $exception -Context blocked)
+            }
+        }
+
+        ($guidance.Failed -join "`n") | Should Match "same command"
+        ($guidance.Failed -join "`n") | Should Match "-NewRun"
+        ($guidance.Blocked -join "`n") | Should Match "without blindly discarding"
+        ($guidance.Blocked -join "`n") | Should Match "-NewRun"
     }
 }
 
@@ -1234,11 +1313,149 @@ Describe "End-to-end orchestration with fake Codex" {
             "FilePath = `"$missingExecutable`"")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
 
-        (Test-Throws {
-            Invoke-CodexReviewLoop `
-                -RepoPath $repo -ConfigPath $configPath -Speed standard `
-                -CodexPath $fakeCodex -NewRun
-        }) | Should Be $true
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -ColorMode Never
+
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "Host gate"
+        ($result.NextSteps -join "`n") | Should Match "FilePath"
+        ($result.NextSteps -join "`n") | Should Match "same command"
+        Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "explains how to resolve a resumed speed mismatch" {
+        New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed fast | Out-Null
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never
+
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "cannot change speed"
+        ($result.NextSteps -join "`n") | Should Match "-Speed fast"
+        ($result.NextSteps -join "`n") | Should Match "-Speed standard -NewRun"
+        Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "keeps an immediate compact failure short and non-duplicative" {
+        New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed fast | Out-Null
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        $lines = @($output | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_)
+        })
+
+        $exitCode | Should Be 2
+        $lines.Count | Should Not BeGreaterThan 8
+        [regex]::Matches($text, "cannot change speed").Count | Should Be 1
+        $text | Should Match "Recommended"
+        $text | Should Match "Alternative"
+        $text | Should Not Match "Repository:|Checkpoint:|Ledger:|`"Status`"\s*:"
+    }
+
+    It "emits only one JSON result for an immediate runtime failure" {
+        New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed fast | Out-Null
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never `
+            -Json 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        $result = $text | ConvertFrom-Json
+
+        $exitCode | Should Be 2
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "cannot change speed"
+        ($result.NextSteps -join "`n") | Should Match "-Speed fast"
+        $text | Should Not Match "\[X\]|\[!\]|Codex Review Loop"
+    }
+
+    It "gives a concrete compact recovery command for a dirty legacy blocked checkpoint" {
+        $checkpoint = New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $state.Status = "failed"
+        $state.ExitCode = 2
+        $state.Stage = "cluster_blocked"
+        Write-ReviewLoopState -Path $checkpoint.StatePath -State $state | Out-Null
+        Set-Content -LiteralPath (Join-Path $repo "legacy-fixer.txt") -Value "unverified"
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+
+        $exitCode | Should Be 2
+        $text | Should Match "legacy checkpoint"
+        $text | Should Match "1 file"
+        $text | Should Match "stash push -u"
+        $text | Should Match "-NewRun"
+        $text | Should Not Match "Repository:|Checkpoint:|Ledger:|`"Status`"\s*:"
+    }
+
+    It "explains both safe choices when HEAD moved after a checkpoint" {
+        $checkpoint = New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard
+        Set-Content -LiteralPath (Join-Path $repo "external.txt") -Value "intentional"
+        & git -C $repo add external.txt
+        & git -C $repo commit -q -m "external change"
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never
+
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "repository moved after the checkpoint"
+        ($result.NextSteps -join "`n") | Should Match "-NewRun"
+        ($result.NextSteps -join "`n") | Should Match ([regex]::Escape(
+            (Read-ReviewLoopState -Path $checkpoint.StatePath).CurrentHead
+        ))
+        (Get-Content -Raw -LiteralPath (Join-Path $checkpoint.RunRoot "terminal.log")) |
+            Should Match "Recommended"
         Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
     }
 
@@ -1256,6 +1473,59 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Clean pass 2/2"
         $terminal | Should Match "Review Loop completed"
+    }
+
+    It "emits one JSON document and no human dashboard when requested" {
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        )
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -NewRun `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never `
+            -Json 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        $result = $text | ConvertFrom-Json
+
+        $exitCode | Should Be 0
+        $result.Status | Should Be "completed"
+        $result.CleanPasses | Should Be 2
+        @($result.NextSteps).Count | Should Be 0
+        $text | Should Not Match "\[OK\]|\[\.\.\]|Codex Review Loop"
+        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
+            Should Match "Review Loop completed"
+    }
+
+    It "does not append JSON to normal human output" {
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
+            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        )
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed standard `
+            -CodexPath $fakeCodex `
+            -NewRun `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+
+        $exitCode | Should Be 0
+        $text | Should Match "Review Loop completed"
+        $text | Should Not Match '"Status"\s*:|"RunRoot"\s*:'
+        $text | Should Not Match "Repository:|Checkpoint:|Ledger:"
     }
 
     It "propagates fast to every role in a complete run" {
@@ -1526,7 +1796,7 @@ Describe "End-to-end orchestration with fake Codex" {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
         }).Count | Should Be 0
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Resuming the previous failed checkpoint at stage 'fix_attempted'"
+        $terminal | Should Not Match "Resuming the previous failed checkpoint at stage 'fix_attempted'"
         $terminal | Should Match "Resuming interrupted fix cluster"
     }
 }

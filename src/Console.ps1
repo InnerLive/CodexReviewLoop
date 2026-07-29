@@ -2,6 +2,7 @@ $script:ReviewLoopConsole = [ordered]@{
     OutputMode       = "compact"
     HeartbeatSeconds = 30
     ColorMode        = "Host"
+    HostOutputEnabled = $true
     TranscriptPath   = ""
     CapturePending   = $false
     PendingLines     = [System.Collections.Generic.List[string]]::new()
@@ -17,12 +18,14 @@ function Initialize-ReviewLoopConsole {
         [int]$HeartbeatSeconds = 30,
         [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")]
         [string]$ColorMode = "Host",
+        [bool]$HostOutputEnabled = $true,
         [string]$TranscriptPath = ""
     )
 
     $script:ReviewLoopConsole.OutputMode = $OutputMode
     $script:ReviewLoopConsole.HeartbeatSeconds = $HeartbeatSeconds
     $script:ReviewLoopConsole.ColorMode = $ColorMode
+    $script:ReviewLoopConsole.HostOutputEnabled = $HostOutputEnabled
     $script:ReviewLoopConsole.TranscriptPath = $TranscriptPath
     $script:ReviewLoopConsole.InlineActive = $false
     $script:ReviewLoopConsole.InlineWidth = 0
@@ -144,6 +147,9 @@ function Write-ReviewLoopConsoleLine {
     Complete-ReviewLoopInlineStatus
     $safe = ConvertTo-ReviewLoopRedactedText $Text
     Add-ReviewLoopTranscriptLine -Text $safe
+    if (-not [bool]$script:ReviewLoopConsole.HostOutputEnabled) {
+        return
+    }
     $mode = [string]$script:ReviewLoopConsole.ColorMode
     if ($mode -eq "Never") {
         Write-Host $safe
@@ -161,7 +167,9 @@ function Complete-ReviewLoopInlineStatus {
         return
     }
 
-    Write-Host ""
+    if ([bool]$script:ReviewLoopConsole.HostOutputEnabled) {
+        Write-Host ""
+    }
     $script:ReviewLoopConsole.InlineActive = $false
     $script:ReviewLoopConsole.InlineWidth = 0
 }
@@ -178,6 +186,9 @@ function Write-ReviewLoopInlineStatus {
         $safe = $safe.Substring(0, $maxWidth - 1) + "…"
     }
     Add-ReviewLoopTranscriptLine -Text $safe
+    if (-not [bool]$script:ReviewLoopConsole.HostOutputEnabled) {
+        return
+    }
 
     $renderWidth = [Math]::Max([int]$script:ReviewLoopConsole.InlineWidth, $safe.Length)
     $rendered = "`r$($safe.PadRight($renderWidth))"
@@ -246,6 +257,48 @@ function Write-ReviewLoopStatus {
     }
 }
 
+function Write-ReviewLoopNextSteps {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Steps,
+        [ValidateRange(0, 100)]
+        [int]$RecommendedCount = 1
+    )
+
+    $items = @($Steps | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    })
+    if ($items.Count -eq 0) {
+        return
+    }
+
+    $recommended = [Math]::Min($items.Count, $RecommendedCount)
+    if ($recommended -gt 0) {
+        Write-ReviewLoopStatus -Message "Recommended:" -Kind Warning
+    }
+    for ($index = 0; $index -lt $recommended; $index++) {
+        Write-ReviewLoopStatus `
+            -Message $(if ($recommended -eq 1) {
+                $items[$index]
+            }
+            else {
+                "{0}. {1}" -f ($index + 1), $items[$index]
+            }) `
+            -Kind Muted `
+            -Indent 1
+    }
+    if ($items.Count -gt $recommended) {
+        Write-ReviewLoopStatus -Message "Alternative:" -Kind Info
+        for ($index = $recommended; $index -lt $items.Count; $index++) {
+            Write-ReviewLoopStatus `
+                -Message $items[$index] `
+                -Kind Muted `
+                -Indent 1
+        }
+    }
+}
+
 function Write-ReviewLoopRule {
     param(
         [Parameter(Mandatory = $true)][string]$Title,
@@ -282,4 +335,92 @@ function Write-ReviewLoopResultBlock {
     foreach ($entry in $Values.GetEnumerator()) {
         Write-ReviewLoopKeyValue -Name ([string]$entry.Key) -Value $entry.Value
     }
+}
+
+function Write-ReviewLoopFailureSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Problem,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [AllowEmptyCollection()][string[]]$NextSteps = @(),
+        [ValidateRange(0, 100)][int]$RecommendedStepCount = 1,
+        [int]$Cycles = 0,
+        [string]$CleanPasses = "",
+        [int]$OpenFindings = 0,
+        [int]$BlockedFindings = 0,
+        [string]$RunRoot = "",
+        [string]$LedgerPath = "",
+        [string]$TranscriptPath = ""
+    )
+
+    if (Test-ReviewLoopOutputLevel -Minimum detailed) {
+        Write-ReviewLoopRule -Title $Title -Kind Error
+        Write-ReviewLoopStatus -Message $Problem -Kind Error
+        Write-ReviewLoopKeyValue -Name "Status" -Value $Status
+        Write-ReviewLoopKeyValue -Name "Cycles" -Value $Cycles
+        if (-not [string]::IsNullOrWhiteSpace($CleanPasses)) {
+            Write-ReviewLoopKeyValue -Name "Clean passes" -Value $CleanPasses
+        }
+        Write-ReviewLoopKeyValue -Name "Open findings" -Value $OpenFindings
+        Write-ReviewLoopKeyValue -Name "Blocked findings" -Value $BlockedFindings
+        if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
+            Write-ReviewLoopKeyValue -Name "Run" -Value $RunRoot
+        }
+        if (-not [string]::IsNullOrWhiteSpace($LedgerPath)) {
+            Write-ReviewLoopKeyValue -Name "Ledger" -Value $LedgerPath
+        }
+    }
+    elseif (Test-ReviewLoopOutputLevel -Minimum balanced) {
+        Write-ReviewLoopRule -Title $Title -Kind Error
+        Write-ReviewLoopStatus -Message $Problem -Kind Error
+        Write-ReviewLoopKeyValue -Name "Status" -Value $Status
+        Write-ReviewLoopKeyValue -Name "Cycles" -Value $Cycles
+        Write-ReviewLoopKeyValue -Name "Open findings" -Value $OpenFindings
+        Write-ReviewLoopKeyValue -Name "Blocked findings" -Value $BlockedFindings
+        if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
+            Write-ReviewLoopKeyValue -Name "Run" -Value (Split-Path -Leaf $RunRoot)
+        }
+    }
+    else {
+        Write-ReviewLoopStatus -Message "${Title}: $Problem" -Kind Error
+    }
+
+    Write-ReviewLoopNextSteps `
+        -Steps $NextSteps `
+        -RecommendedCount $RecommendedStepCount
+    if (-not [string]::IsNullOrWhiteSpace($TranscriptPath)) {
+        Write-ReviewLoopStatus -Message "Details: $TranscriptPath" -Kind Muted
+    }
+}
+
+function Write-ReviewLoopCompletionSummary {
+    param(
+        [Parameter(Mandatory = $true)][int]$Cycles,
+        [Parameter(Mandatory = $true)][string]$CleanPasses,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][string]$TranscriptPath
+    )
+
+    if (Test-ReviewLoopOutputLevel -Minimum detailed) {
+        Write-ReviewLoopResultBlock -Title "Review Loop completed" -Kind Success -Values ([ordered]@{
+            Status = "completed"
+            Cycles = $Cycles
+            "Clean passes" = $CleanPasses
+            "Open findings" = 0
+            "Blocked findings" = 0
+            Run = $RunRoot
+            Ledger = $LedgerPath
+            Transcript = $TranscriptPath
+        })
+        return
+    }
+
+    Write-ReviewLoopStatus `
+        -Message "Review Loop completed · $Cycles cycles · $CleanPasses clean passes" `
+        -Kind Success
+    if (Test-ReviewLoopOutputLevel -Minimum balanced) {
+        Write-ReviewLoopKeyValue -Name "Run" -Value (Split-Path -Leaf $RunRoot)
+    }
+    Write-ReviewLoopStatus -Message "Details: $TranscriptPath" -Kind Muted
 }

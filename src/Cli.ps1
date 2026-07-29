@@ -16,7 +16,12 @@ function Resolve-CodexCliExecutable {
         $command = Get-Command "codex.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     }
     if ($null -eq $command) {
-        throw "Codex CLI was not found. Install or authenticate Codex before starting the loop."
+        throw (New-ReviewLoopFailureException `
+            -Message "The local Codex CLI could not be found." `
+            -NextSteps @(
+                "Install the Codex CLI, sign in, and confirm that codex runs successfully in this terminal."
+                "If Codex is installed at a non-standard location, run the command again with -CodexPath pointing to its launcher."
+            ))
     }
     return $command.Source
 }

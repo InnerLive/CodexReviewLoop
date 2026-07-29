@@ -1472,6 +1472,340 @@ Describe "Unattended reliability boundaries" {
         $fixerRecord.resumeThreadId | Should Be "reliability-thread"
     }
 
+    It "preserves and restores tracked binary staged deleted and untracked fixer changes" {
+        Set-Content -LiteralPath (Join-Path $repo "delete.txt") -Value "delete me"
+        [System.IO.File]::WriteAllBytes(
+            (Join-Path $repo "binary.bin"),
+            [byte[]](0, 1, 2, 3, 255))
+        & git -C $repo add delete.txt binary.bin
+        & git -C $repo commit -q -m "add artifact fixtures"
+        $head = & git -C $repo rev-parse HEAD
+
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "unstaged change"
+        Set-Content -LiteralPath (Join-Path $repo "review-loop-test.proj") -Value "staged change"
+        & git -C $repo add review-loop-test.proj
+        Remove-Item -LiteralPath (Join-Path $repo "delete.txt")
+        & git -C $repo add -u -- delete.txt
+        [System.IO.File]::WriteAllBytes(
+            (Join-Path $repo "binary.bin"),
+            [byte[]](255, 3, 2, 1, 0, 42))
+        $untrackedPath = Join-Path $repo "new\untracked.bin"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $untrackedPath) | Out-Null
+        [System.IO.File]::WriteAllBytes($untrackedPath, [byte[]](9, 8, 7, 6))
+
+        $runRoot = Join-Path $caseRoot "artifact-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $head
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.LastFixerResult = [pscustomobject]@{
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+        }
+        $artifact = & (Get-Module CodexReviewLoop) {
+            param($runState, $repository, $rootPath)
+            Get-ReviewLoopBlockedArtifact `
+                -State $runState -RepoPath $repository -RunRoot $rootPath `
+                -ClusterId "C-artifact" -Attempt 2
+        } $state $repo $runRoot
+        $manifest = Get-Content -Raw -LiteralPath $artifact.ManifestPath | ConvertFrom-Json
+
+        & (Get-Module CodexReviewLoop) {
+            param($repository, $cleanup)
+            Restore-ReviewLoopBlockedWorktree -RepoPath $repository -Cleanup $cleanup
+        } $repo $artifact
+
+        (& git -C $repo status --porcelain | Out-String).Trim() | Should Be ""
+        Test-Path -LiteralPath (Join-Path $artifact.ArtifactRoot "tracked.patch") | Should Be $true
+        Test-Path -LiteralPath (
+            Join-Path $artifact.ArtifactRoot "untracked\new\untracked.bin"
+        ) | Should Be $true
+        @($manifest.Tracked).Count | Should Be 4
+        @($manifest.Untracked).Count | Should Be 1
+        $trackedTypes = @($manifest.Tracked | ForEach-Object { [string]$_.FileType })
+        ($trackedTypes -contains "tracked_deletion") | Should Be $true
+        $manifest.Untracked[0].FileType | Should Be "untracked_file"
+
+        & git -C $repo apply (Join-Path $artifact.ArtifactRoot "tracked.patch")
+        New-Item -ItemType Directory -Path (Split-Path -Parent $untrackedPath) -Force | Out-Null
+        [System.IO.File]::Copy(
+            (Join-Path $artifact.ArtifactRoot "untracked\new\untracked.bin"),
+            $untrackedPath,
+            $true)
+        $reconstructed = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+        $reconstructed | Should Be ([string]$manifest.WorktreeFingerprint)
+    }
+
+    It "resumes an interrupted partial blocked-patch cleanup idempotently" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "first change"
+        Set-Content -LiteralPath (Join-Path $repo "review-loop-test.proj") -Value "second change"
+        Set-Content -LiteralPath (Join-Path $repo "untracked.txt") -Value "third change"
+        $runRoot = Join-Path $caseRoot "partial-cleanup"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $runRoot "ledger-v2.json"
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings `
+            -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.LastFixerResult = [pscustomobject]@{
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+        }
+        $artifact = & (Get-Module CodexReviewLoop) {
+            param($runState, $repository, $rootPath)
+            Get-ReviewLoopBlockedArtifact `
+                -State $runState -RepoPath $repository -RunRoot $rootPath `
+                -ClusterId ([string]$runState.ActiveClusterId) -Attempt 2
+        } $state $repo $runRoot
+        $artifact | Add-Member -Force -NotePropertyName Reason `
+            -NotePropertyValue "Finding cluster remained open after 2 fix attempts."
+        $artifact | Add-Member -Force -NotePropertyName FindingIds `
+            -NotePropertyValue @($finding.Id)
+        $state.BlockedCleanup = $artifact
+        $state.Stage = "blocked_patch_captured"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        & git -C $repo restore --source=HEAD --staged --worktree -- README.txt
+        & (Get-Module CodexReviewLoop) {
+            param($runState, $checkpoint, $currentLedger, $ledgerFile, $repository, $rootPath)
+            Resume-ReviewLoopBlockedCleanup `
+                -State $runState -StatePath $checkpoint `
+                -Ledger $currentLedger -LedgerPath $ledgerFile `
+                -RepoPath $repository -RunRoot $rootPath
+        } $state $statePath $ledger $ledgerPath $repo $runRoot | Should Be $true
+
+        (& git -C $repo status --porcelain | Out-String).Trim() | Should Be ""
+        $state.Stage | Should Be "cluster_blocked"
+        $state.ActiveFindingIds.Count | Should Be 0
+        $updated = Read-ReviewLoopLedger -Path $ledgerPath
+        $updated.Findings[0].Status | Should Be "blocked"
+        Test-Path -LiteralPath $updated.Findings[0].BlockedArtifactRoot | Should Be $true
+    }
+
+    It "leaves every file untouched when an unexpected path appears before cleanup" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "fixer change"
+        $runRoot = Join-Path $caseRoot "unsafe-cleanup"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.LastFixerResult = [pscustomobject]@{
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+        }
+        $artifact = & (Get-Module CodexReviewLoop) {
+            param($runState, $repository, $rootPath)
+            Get-ReviewLoopBlockedArtifact `
+                -State $runState -RepoPath $repository -RunRoot $rootPath `
+                -ClusterId "C-unsafe" -Attempt 2
+        } $state $repo $runRoot
+        Set-Content -LiteralPath (Join-Path $repo "unexpected.txt") -Value "concurrent"
+
+        $failure = $null
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($repository, $cleanup)
+                Restore-ReviewLoopBlockedWorktree -RepoPath $repository -Cleanup $cleanup
+            } $repo $artifact
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message | Should Match "Unexpected path"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "fixer change"
+        Test-Path -LiteralPath (Join-Path $repo "unexpected.txt") | Should Be $true
+    }
+
+    It "does not clean the worktree when a blocked artifact fails integrity checks" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "fixer change"
+        $runRoot = Join-Path $caseRoot "damaged-artifact"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.LastFixerResult = [pscustomobject]@{
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+        }
+        $artifact = & (Get-Module CodexReviewLoop) {
+            param($runState, $repository, $rootPath)
+            Get-ReviewLoopBlockedArtifact `
+                -State $runState -RepoPath $repository -RunRoot $rootPath `
+                -ClusterId "C-damaged" -Attempt 2
+        } $state $repo $runRoot
+        Set-Content -LiteralPath (
+            Join-Path $artifact.ArtifactRoot "tracked.patch"
+        ) -Value "damaged"
+
+        $failure = $null
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($repository, $cleanup)
+                Restore-ReviewLoopBlockedWorktree -RepoPath $repository -Cleanup $cleanup
+            } $repo $artifact
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message | Should Match "integrity check"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "fixer change"
+    }
+
+    It "rejects submodule entries without changing the index" {
+        $head = (& git -C $repo rev-parse HEAD | Out-String).Trim()
+        & git -C $repo update-index --add --cacheinfo 160000 $head dependency
+        $LASTEXITCODE | Should Be 0
+        (& git -C $repo diff --cached --name-only | Out-String) | Should Match "dependency"
+        $runRoot = Join-Path $caseRoot "submodule-artifact"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.LastFixerResult = [pscustomobject]@{
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+        }
+
+        $failure = $null
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($runState, $repository, $rootPath)
+                Get-ReviewLoopBlockedArtifact `
+                    -State $runState -RepoPath $repository -RunRoot $rootPath `
+                    -ClusterId "C-submodule" -Attempt 2
+            } $state $repo $runRoot | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message | Should Match "submodule"
+        (& git -C $repo diff --cached --name-only | Out-String) | Should Match "dependency"
+    }
+
+    It "rejects a reparse point in an untracked file path" {
+        $target = Join-Path $caseRoot "junction-target"
+        New-Item -ItemType Directory -Path $target | Out-Null
+        Set-Content -LiteralPath (Join-Path $target "fix.txt") -Value "external"
+        New-Item -ItemType Junction -Path (Join-Path $repo "linked") -Target $target | Out-Null
+
+        $failure = $null
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($repository)
+                Assert-ReviewLoopPathWithoutReparsePoints `
+                    -RootPath $repository `
+                    -RelativePath "linked/fix.txt" `
+                    -Description "Automatic blocked-patch cleanup"
+            } $repo | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message | Should Match "reparse point"
+        (Get-Content -Raw -LiteralPath (Join-Path $target "fix.txt")) |
+            Should Match "external"
+        Remove-Item -LiteralPath (Join-Path $repo "linked") -Force
+    }
+
+    It "continues to an independent cluster after preserving a blocked patch" {
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        $first = New-ReliabilityFinding
+        $second = New-ReliabilityFinding
+        $second.title = "independent defect"
+        $second.path = "src/B.cs"
+        $second.line = 20
+        $second.component = "renderer"
+        $second.rootCause = "wrong formatting"
+        $second.invariant = "output is canonical"
+        $second.fixPaths = @("src/B.cs")
+        Merge-ReviewLoopFindings `
+            -Ledger $ledger -Findings @($first, $second) `
+            -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        foreach ($finding in $ledger.Findings) {
+            $finding.Status = "open"
+        }
+        $runRoot = Join-Path $caseRoot "independent-clusters"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $runRoot "ledger-v2.json"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        & (Get-Module CodexReviewLoop) {
+            param($transcript)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath $transcript
+        } (Join-Path $runRoot "terminal.log")
+
+        $fix = '{"schemaVersion":"1.0","outcome":"changed","summary":"changed","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
+        $open = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"still open"}]}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"resolved","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"resolved"}]}'
+        $resultSequence = Join-Path $caseRoot "cluster-results.json"
+        Write-ReliabilityJsonArray -Path $resultSequence -Values @(
+            $fix, $open, $fix, $open, $fix, $resolved
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $resultSequence
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+
+        & (Get-Module CodexReviewLoop) {
+            param($profile, $runState, $checkpoint, $currentLedger, $ledgerFile,
+                $repository, $rootPath, $fake)
+            Invoke-ReviewLoopOpenClusters `
+                -Config $profile -State $runState -StatePath $checkpoint `
+                -Ledger $currentLedger -LedgerPath $ledgerFile `
+                -RepoPath $repository -Speed standard -RunRoot $rootPath `
+                -CodexPath $fake
+        } $config $state $statePath $ledger $ledgerPath $repo $runRoot $fakeCodex
+
+        $updated = Read-ReviewLoopLedger -Path $ledgerPath
+        @($updated.Findings | Where-Object { $_.Status -eq "blocked" }).Count | Should Be 1
+        @($updated.Findings | Where-Object { $_.Status -eq "resolved" }).Count | Should Be 1
+        $blocked = @($updated.Findings | Where-Object { $_.Status -eq "blocked" })[0]
+        Test-Path -LiteralPath $blocked.BlockedArtifactRoot | Should Be $true
+        (& git -C $repo status --porcelain | Out-String).Trim() | Should Be ""
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
+        }).Count | Should Be 3
+    }
+
     It "uses an exclusive repository lock" {
         $lockPath = & (Get-Module CodexReviewLoop) {
             param($repository)
@@ -1487,15 +1821,12 @@ Describe "Unattended reliability boundaries" {
             [System.IO.FileAccess]::ReadWrite,
             [System.IO.FileShare]::None)
         try {
-            $threw = $false
-            try {
-                Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
-                    -CodexPath $fakeCodex -NewRun | Out-Null
-            }
-            catch {
-                $threw = $true
-            }
-            $threw | Should Be $true
+            $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+                -CodexPath $fakeCodex -NewRun -ColorMode Never
+            $result.Status | Should Be "failed"
+            $result.Reason | Should Match "already running"
+            ($result.NextSteps -join "`n") | Should Match "Let the existing loop finish"
+            ($result.NextSteps -join "`n") | Should Match "Do not delete the lock"
         }
         finally {
             $lock.Dispose()

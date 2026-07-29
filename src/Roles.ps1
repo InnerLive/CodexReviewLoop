@@ -57,7 +57,12 @@ function Assert-ReviewLoopExecutionUnchanged {
         $Config.ContainsKey("__ConfigPath") -and
         (Get-ReviewLoopExecutionFingerprint -ConfigPath ([string]$Config.__ConfigPath)) -ne
             [string]$Config.__ExecutionFingerprint) {
-        throw "Tool prompts, schemas, code, or the active profile changed during the run."
+        throw (New-ReviewLoopFailureException `
+            -Message "The review-loop code, prompts, schemas, or active profile changed while this run was executing." `
+            -NextSteps @(
+                "Finish the intended tool or profile edits and do not change them again while the loop is running."
+                "Run the same command again; completed model work will be requalified before any commit."
+            ))
     }
 }
 
@@ -131,7 +136,13 @@ function Assert-ReviewLoopRoleSuccess {
     param([Parameter(Mandatory = $true)][object]$Call)
 
     if (-not $Call.Success) {
-        throw "Codex role '$($Call.Role)' failed ($($Call.FailureKind)): $($Call.FailureReason)"
+        throw (New-ReviewLoopFailureException `
+            -Message "Codex role '$($Call.Role)' failed after its automatic recovery attempts ($($Call.FailureKind)): $($Call.FailureReason)" `
+            -NextSteps @(
+                "Check the role logs in the run directory and correct the reported Codex, environment, or repository problem."
+                "Run the same command again to resume from the saved checkpoint."
+                "If the failure repeats, verify that the local Codex CLI is signed in and can complete a simple command."
+            ))
     }
 }
 

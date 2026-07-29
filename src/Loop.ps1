@@ -172,19 +172,39 @@ function Assert-ReviewLoopResumeInvariant {
     )
 
     if (-not (Test-ReviewLoopSamePath -Left ([string]$State.RepoPath) -Right $RepoPath)) {
-        throw "Checkpoint repository '$($State.RepoPath)' does not match '$RepoPath'."
+        throw (New-ReviewLoopFailureException `
+            -Message "The saved checkpoint belongs to repository '$($State.RepoPath)', but this command selected '$RepoPath'." `
+            -NextSteps @(
+                "Run the command for the repository stored in the checkpoint: '$($State.RepoPath)'."
+                "If '$RepoPath' is intentional, make its worktree clean and start it with -NewRun."
+            ))
     }
     $branch = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("branch", "--show-current")
     if ([string]$State.Branch -ne $branch) {
-        throw "Checkpoint branch '$($State.Branch)' does not match current branch '$branch'."
+        throw (New-ReviewLoopFailureException `
+            -Message "The saved checkpoint is for branch '$($State.Branch)', but the repository is currently on '$branch'." `
+            -NextSteps @(
+                "To resume the checkpoint, switch back to '$($State.Branch)' and run the same command again."
+                "To review '$branch' instead, make its worktree clean and start with -NewRun."
+            ))
     }
     if ([string]$State.ReviewBase -ne $ReviewBase) {
-        throw "Checkpoint review base '$($State.ReviewBase)' does not match '$ReviewBase'."
+        throw (New-ReviewLoopFailureException `
+            -Message "The saved checkpoint uses review base '$($State.ReviewBase)', but the selected profile now uses '$ReviewBase'." `
+            -NextSteps @(
+                "To resume the checkpoint, restore ReviewBase='$($State.ReviewBase)' in the profile and run the same command again."
+                "To use ReviewBase='$ReviewBase', make the worktree clean and start with -NewRun."
+            ))
     }
     if (-not $SkipHead) {
         $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
         if ([string]$State.CurrentHead -ne $head) {
-            throw "Checkpoint HEAD '$($State.CurrentHead)' does not match current HEAD '$head'."
+            throw (New-ReviewLoopFailureException `
+                -Message "The repository moved after the checkpoint: saved HEAD is '$($State.CurrentHead)', current HEAD is '$head'. A commit, checkout, rebase, or another tool changed the branch." `
+                -NextSteps @(
+                    "If the current HEAD is intentional, make the worktree clean and start with -NewRun."
+                    "If the checkpoint should be resumed, restore the branch to '$($State.CurrentHead)' using your normal Git workflow, then run the same command again."
+                ))
         }
     }
 }
@@ -223,7 +243,12 @@ function Assert-ReviewLoopHostGatePreflight {
                 -RepoPath $RepoPath -FilePath ([string]$gate.FilePath)
         }
         catch {
-            throw "Host gate '$($gate.Name)' executable '$($gate.FilePath)' could not be resolved: $($_.Exception.Message)"
+            throw (New-ReviewLoopFailureException `
+                -Message "Host gate '$($gate.Name)' cannot start because executable '$($gate.FilePath)' could not be resolved: $($_.Exception.Message)" `
+                -NextSteps @(
+                    "Install the required executable or correct this host gate's FilePath in the selected profile."
+                    "Confirm the executable can be started from the repository, then run the same command again."
+                ))
         }
     }
 }
@@ -402,16 +427,547 @@ function Get-ReviewLoopChangedPaths {
     if ($LASTEXITCODE -ne 0) {
         throw "git diff --name-only failed."
     }
+    $staged = @(& git -C $RepoPath diff --cached --name-only HEAD -- 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "git diff --cached --name-only failed."
+    }
+    $unstaged = @(& git -C $RepoPath diff --name-only -- 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "git diff --name-only for unstaged changes failed."
+    }
     $untracked = @(& git -C $RepoPath ls-files --others --exclude-standard 2>$null)
     if ($LASTEXITCODE -ne 0) {
         throw "git ls-files --others failed."
     }
     return @(
-        (@($tracked) + @($untracked)) |
+        (@($tracked) + @($staged) + @($unstaged) + @($untracked)) |
             ForEach-Object { ([string]$_).Trim().Replace("\", "/") } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Sort-Object -Unique
     )
+}
+
+function Resolve-ReviewLoopRepositoryRelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    if ([System.IO.Path]::IsPathRooted($RelativePath)) {
+        throw "Repository change path must be relative: $RelativePath"
+    }
+    $root = [System.IO.Path]::GetFullPath($RepoPath).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+    $full = [System.IO.Path]::GetFullPath((Join-Path $root $RelativePath))
+    $prefix = $root + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Repository change path escapes the repository: $RelativePath"
+    }
+    return $full
+}
+
+function Assert-ReviewLoopPathWithoutReparsePoints {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $absolute = Resolve-ReviewLoopRepositoryRelativePath `
+        -RepoPath $RootPath `
+        -RelativePath $RelativePath
+    $current = [System.IO.Path]::GetFullPath($RootPath)
+    foreach ($segment in @($RelativePath -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+        $current = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $current)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Description contains a reparse point: $RelativePath"
+        }
+    }
+    return $absolute
+}
+
+function Get-ReviewLoopTrackedPathPatchHash {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Head,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $lines = @(& git -C $RepoPath diff --binary --full-index $Head -- $Path 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not capture the blocked patch for '$Path'."
+    }
+    return Get-ReviewLoopSha256 ($lines -join [Environment]::NewLine)
+}
+
+function Test-ReviewLoopGitDiffPresent {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    & git -C $RepoPath diff --quiet @Arguments 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        return $false
+    }
+    if ($LASTEXITCODE -eq 1) {
+        return $true
+    }
+    throw "Git could not compare the blocked fixer path."
+}
+
+function Write-ReviewLoopGitBinaryPatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Head,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = "git"
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+        "-C", $RepoPath, "diff", "--binary", "--full-index",
+        "--no-ext-diff", "--no-textconv", $Head, "--"
+    )) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $stream = $null
+    $started = $false
+    try {
+        if (-not $process.Start()) {
+            throw "Git could not start while creating the blocked fixer patch."
+        }
+        $started = $true
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stream = [System.IO.File]::Create($Path)
+        $process.StandardOutput.BaseStream.CopyTo($stream)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        $process.WaitForExit()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            $detail = (ConvertTo-ReviewLoopRedactedText $stderr).Trim()
+            throw "Git could not create the blocked fixer patch$(if ($detail) { ": $detail" })."
+        }
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($started -and -not $process.HasExited) {
+            try {
+                $process.Kill($true)
+                [void]$process.WaitForExit(5000)
+            }
+            catch {
+                # Preserve the original artifact error.
+            }
+        }
+        $process.Dispose()
+    }
+}
+
+function Get-ReviewLoopBlockedArtifact {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$ClusterId,
+        [Parameter(Mandatory = $true)][int]$Attempt
+    )
+
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$snapshot.Head -ne [string]$State.CurrentHead) {
+        throw "HEAD changed before the blocked fixer patch could be preserved."
+    }
+    $expectedFingerprint = [string](Get-ReviewLoopObjectProperty `
+        -Object $State.LastFixerResult -Name "WorktreeFingerprint" -Default "")
+    if ([string]::IsNullOrWhiteSpace($expectedFingerprint) -or
+        [string]$snapshot.Fingerprint -ne $expectedFingerprint) {
+        throw "The worktree no longer matches the final recorded fixer result; automatic cleanup is unsafe."
+    }
+
+    $changedPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
+    if ($changedPaths.Count -eq 0) {
+        return $null
+    }
+    $artifactParent = Join-Path $RunRoot "blocked"
+    $artifactRoot = Join-Path $artifactParent "$ClusterId-attempt-$Attempt"
+    $manifestPath = Join-Path $artifactRoot "manifest.json"
+    if (Test-Path -LiteralPath $manifestPath) {
+        $existing = Read-ReviewLoopJson -Path $manifestPath
+        if ([string]$existing.Head -ne [string]$snapshot.Head -or
+            [string]$existing.WorktreeFingerprint -ne [string]$snapshot.Fingerprint) {
+            throw "An existing blocked-patch artifact does not match the current fixer result: $artifactRoot"
+        }
+        return [pscustomobject]@{
+            ArtifactRoot = $artifactRoot
+            ManifestPath = $manifestPath
+            Head = [string]$existing.Head
+            WorktreeFingerprint = [string]$existing.WorktreeFingerprint
+            ChangedPaths = @($existing.ChangedPaths)
+            ClusterId = $ClusterId
+            FindingIds = @($State.ActiveFindingIds)
+            Attempt = $Attempt
+        }
+    }
+
+    [System.IO.Directory]::CreateDirectory($artifactParent) | Out-Null
+    $temporaryRoot = Join-Path $artifactParent (
+        ".$ClusterId-attempt-$Attempt.$([Guid]::NewGuid().ToString('N')).tmp")
+    [System.IO.Directory]::CreateDirectory($temporaryRoot) | Out-Null
+    try {
+        $trackedEntries = [System.Collections.Generic.List[object]]::new()
+        $untrackedEntries = [System.Collections.Generic.List[object]]::new()
+        foreach ($path in $changedPaths) {
+            $absolute = Assert-ReviewLoopPathWithoutReparsePoints `
+                -RootPath $RepoPath `
+                -RelativePath $path `
+                -Description "Automatic blocked-patch cleanup"
+
+            $stage = @(& git -C $RepoPath ls-files --stage -- $path 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+                throw "Git could not classify blocked-patch path '$path'."
+            }
+            $headEntry = @(& git -C $RepoPath ls-tree ([string]$snapshot.Head) -- $path 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+                throw "Git could not inspect the saved HEAD entry for '$path'."
+            }
+            $trackedGitEntries = @($stage) + @($headEntry)
+            if ($trackedGitEntries.Count -gt 0) {
+                if (@($trackedGitEntries -match '^\s*160000(?:\s|$)').Count -gt 0) {
+                    throw "Automatic blocked-patch cleanup does not support submodule changes: $path"
+                }
+                $finalDiff = Test-ReviewLoopGitDiffPresent `
+                    -RepoPath $RepoPath `
+                    -Arguments @(([string]$snapshot.Head), "--", $path)
+                $indexDiff = Test-ReviewLoopGitDiffPresent `
+                    -RepoPath $RepoPath `
+                    -Arguments @("--cached", ([string]$snapshot.Head), "--", $path)
+                $unstagedDiff = Test-ReviewLoopGitDiffPresent `
+                    -RepoPath $RepoPath `
+                    -Arguments @("--", $path)
+                if (-not $finalDiff -and ($indexDiff -or $unstagedDiff)) {
+                    throw "The staged and unstaged changes for '$path' cancel each other. Automatic blocked-patch cleanup cannot preserve that split state safely."
+                }
+                [void]$trackedEntries.Add([pscustomobject][ordered]@{
+                    Path = $path
+                    FileType = if (Test-Path -LiteralPath $absolute -PathType Leaf) {
+                        "tracked_file"
+                    }
+                    else {
+                        "tracked_deletion"
+                    }
+                    PatchHash = Get-ReviewLoopTrackedPathPatchHash `
+                        -RepoPath $RepoPath -Head ([string]$snapshot.Head) -Path $path
+                })
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+                throw "Untracked blocked-patch path is not a regular file: $path"
+            }
+            $destination = Join-Path (Join-Path $temporaryRoot "untracked") $path
+            [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+            [System.IO.File]::Copy($absolute, $destination, $false)
+            $sourceHash = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+            $copyHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sourceHash -ne $copyHash) {
+                throw "Untracked blocked-patch file could not be copied reliably: $path"
+            }
+            [void]$untrackedEntries.Add([pscustomobject][ordered]@{
+                Path = $path
+                FileType = "untracked_file"
+                Sha256 = $sourceHash
+                Length = [int64](Get-Item -LiteralPath $absolute).Length
+            })
+        }
+
+        $patchPath = Join-Path $temporaryRoot "tracked.patch"
+        Write-ReviewLoopGitBinaryPatch `
+            -RepoPath $RepoPath `
+            -Head ([string]$snapshot.Head) `
+            -Path $patchPath
+        $manifest = [pscustomobject][ordered]@{
+            SchemaVersion = "1.0"
+            ClusterId = $ClusterId
+            Attempt = $Attempt
+            Head = [string]$snapshot.Head
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+            ChangedPaths = @($changedPaths)
+            Tracked = @($trackedEntries)
+            Untracked = @($untrackedEntries)
+            PatchFile = "tracked.patch"
+            PatchSha256 = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+        }
+        Write-ReviewLoopAtomicJson `
+            -Path (Join-Path $temporaryRoot "manifest.json") `
+            -Value $manifest
+        Move-Item -LiteralPath $temporaryRoot -Destination $artifactRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryRoot) {
+            $resolvedTemporary = [System.IO.Path]::GetFullPath($temporaryRoot)
+            $resolvedParent = [System.IO.Path]::GetFullPath($artifactParent)
+            if ($resolvedTemporary.StartsWith(
+                $resolvedParent + [System.IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        ArtifactRoot = $artifactRoot
+        ManifestPath = Join-Path $artifactRoot "manifest.json"
+        Head = [string]$snapshot.Head
+        WorktreeFingerprint = [string]$snapshot.Fingerprint
+        ChangedPaths = @($changedPaths)
+        ClusterId = $ClusterId
+        FindingIds = @($State.ActiveFindingIds)
+        Attempt = $Attempt
+    }
+}
+
+function Restore-ReviewLoopBlockedWorktree {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Cleanup
+    )
+
+    $manifest = Read-ReviewLoopJson -Path ([string]$Cleanup.ManifestPath)
+    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    if ($head -ne [string]$manifest.Head) {
+        throw "HEAD changed after the blocked fixer patch was preserved; automatic cleanup was not attempted."
+    }
+
+    $artifactRoot = Split-Path -Parent ([string]$Cleanup.ManifestPath)
+    $patchPath = Assert-ReviewLoopPathWithoutReparsePoints `
+        -RootPath $artifactRoot `
+        -RelativePath ([string]$manifest.PatchFile) `
+        -Description "The preserved blocked fixer artifact"
+    if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
+        throw "The preserved blocked fixer patch is missing; automatic cleanup was not attempted."
+    }
+    $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($patchHash -ne [string]$manifest.PatchSha256) {
+        throw "The preserved blocked fixer patch failed its integrity check; automatic cleanup was not attempted."
+    }
+
+    $trackedByPath = @{}
+    foreach ($entry in @($manifest.Tracked)) {
+        $trackedByPath[[string]$entry.Path] = $entry
+    }
+    $untrackedByPath = @{}
+    $artifactUntrackedRoot = Join-Path $artifactRoot "untracked"
+    foreach ($entry in @($manifest.Untracked)) {
+        $path = [string]$entry.Path
+        $untrackedByPath[$path] = $entry
+        $savedPath = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath $artifactUntrackedRoot `
+            -RelativePath $path `
+            -Description "The preserved blocked fixer artifact"
+        if (-not (Test-Path -LiteralPath $savedPath -PathType Leaf)) {
+            throw "A preserved untracked fixer file is missing: $path"
+        }
+        $savedItem = Get-Item -LiteralPath $savedPath -Force
+        if (($savedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "A preserved untracked fixer file became a reparse point: $path"
+        }
+        $savedHash = (Get-FileHash -LiteralPath $savedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($savedHash -ne [string]$entry.Sha256) {
+            throw "A preserved untracked fixer file failed its integrity check: $path"
+        }
+        $currentPath = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath $RepoPath `
+            -RelativePath $path `
+            -Description "The current blocked fixer worktree"
+        if (Test-Path -LiteralPath $currentPath) {
+            if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
+                throw "Untracked blocked-patch file is no longer a regular file: $path"
+            }
+            $currentItem = Get-Item -LiteralPath $currentPath -Force
+            if (($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Untracked blocked-patch file became a reparse point: $path"
+            }
+            $currentHash = (Get-FileHash -LiteralPath $currentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($currentHash -ne [string]$entry.Sha256) {
+                throw "Untracked path changed after the blocked patch was captured: $path"
+            }
+        }
+    }
+
+    $currentPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
+    if ($currentPaths.Count -eq 0) {
+        return
+    }
+
+    $allowed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($manifestPath in @($manifest.ChangedPaths)) {
+        $null = $allowed.Add([string]$manifestPath)
+    }
+    foreach ($path in $currentPaths) {
+        if (-not $allowed.Contains([string]$path)) {
+            throw "Unexpected path appeared during blocked-patch cleanup: $path"
+        }
+    }
+
+    foreach ($path in $currentPaths) {
+        if ($trackedByPath.ContainsKey($path)) {
+            $actualHash = Get-ReviewLoopTrackedPathPatchHash `
+                -RepoPath $RepoPath -Head $head -Path $path
+            if ($actualHash -ne [string]$trackedByPath[$path].PatchHash) {
+                throw "Tracked path changed after the blocked patch was captured: $path"
+            }
+            continue
+        }
+        if (-not $untrackedByPath.ContainsKey($path)) {
+            throw "Path changed classification during blocked-patch cleanup: $path"
+        }
+    }
+
+    $trackedPaths = @($manifest.Tracked | ForEach-Object { [string]$_.Path })
+    if ($trackedPaths.Count -gt 0) {
+        $output = @(& git -C $RepoPath restore "--source=$head" --staged --worktree -- @trackedPaths 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not restore the tracked blocked-patch paths: $($output -join ' ')"
+        }
+    }
+    foreach ($entry in @($manifest.Untracked)) {
+        $absolute = Resolve-ReviewLoopRepositoryRelativePath `
+            -RepoPath $RepoPath -RelativePath ([string]$entry.Path)
+        if (Test-Path -LiteralPath $absolute) {
+            Remove-Item -LiteralPath $absolute -Force
+        }
+    }
+    if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        throw "The blocked fixer patch was preserved, but the worktree could not be restored completely."
+    }
+}
+
+function Complete-ReviewLoopBlockedCluster {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][int]$Attempt,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    $cleanup = Get-ReviewLoopObjectProperty -Object $State -Name "BlockedCleanup"
+    try {
+        if ($null -eq $cleanup) {
+            $cleanup = Get-ReviewLoopBlockedArtifact `
+                -State $State `
+                -RepoPath $RepoPath `
+                -RunRoot $RunRoot `
+                -ClusterId ([string]$State.ActiveClusterId) `
+                -Attempt $Attempt
+            if ($null -ne $cleanup) {
+                $cleanup | Add-Member -Force -NotePropertyName Reason -NotePropertyValue $Reason
+                $cleanup | Add-Member -Force -NotePropertyName FindingIds `
+                    -NotePropertyValue @($Findings | ForEach-Object { [string]$_.Id })
+                $State | Add-Member -Force -NotePropertyName BlockedCleanup -NotePropertyValue $cleanup
+                Set-ReviewLoopCheckpoint `
+                    -State $State `
+                    -StatePath $StatePath `
+                    -Stage "blocked_patch_captured"
+            }
+        }
+        if ($null -ne $cleanup) {
+            Restore-ReviewLoopBlockedWorktree -RepoPath $RepoPath -Cleanup $cleanup
+        }
+    }
+    catch {
+        throw (New-ReviewLoopFailureException `
+            -Message "Automatic cleanup of the blocked fixer patch stopped safely: $($_.Exception.Message) No further cleanup will be attempted until this is resolved." `
+            -NextSteps @(
+                "Leave the current worktree unchanged, repair the reported artifact or concurrent-change mismatch, then run the same command again to resume cleanup."
+                "If safe resume is no longer possible, preserve the current changes manually, make the worktree clean, and start with -NewRun."
+            ))
+    }
+
+    Set-ReviewLoopFindingsStatus -Findings $Findings -Status "blocked" -Reason $Reason
+    foreach ($finding in $Findings) {
+        $finding.LastBlockedHead = [string]$State.CurrentHead
+        if ($null -ne $cleanup) {
+            $finding | Add-Member -Force -NotePropertyName BlockedArtifactRoot `
+                -NotePropertyValue ([string]$cleanup.ArtifactRoot)
+        }
+    }
+    Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
+    if ($State.PSObject.Properties.Name -contains "BlockedCleanup") {
+        $State.BlockedCleanup = $null
+    }
+    if ($null -ne $cleanup) {
+        Write-ReviewLoopStatus `
+            -Message "$Reason Unverified work was preserved at '$($cleanup.ArtifactRoot)' and the clean worktree was restored. Independent clusters will continue." `
+            -Kind Warning
+    }
+    else {
+        Write-ReviewLoopStatus -Message "$Reason Independent clusters will continue." -Kind Warning
+    }
+    Clear-ReviewLoopActiveCluster -State $State -StatePath $StatePath -Stage "cluster_blocked"
+    return $false
+}
+
+function Resume-ReviewLoopBlockedCleanup {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot
+    )
+
+    if ([string]$State.Stage -ne "blocked_patch_captured") {
+        return $false
+    }
+    $cleanup = Get-ReviewLoopObjectProperty -Object $State -Name "BlockedCleanup"
+    if ($null -eq $cleanup) {
+        throw "Blocked-patch cleanup checkpoint is missing its cleanup record."
+    }
+    $ids = @($cleanup.FindingIds | ForEach-Object { [string]$_ })
+    $findings = @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
+    if ($findings.Count -ne $ids.Count -or $findings.Count -eq 0) {
+        throw "Blocked-patch cleanup cannot resume because its findings are missing from the ledger."
+    }
+    Write-ReviewLoopStatus `
+        -Message "Resuming cleanup of preserved blocked fixer work." `
+        -Kind Progress
+    Complete-ReviewLoopBlockedCluster `
+        -State $State `
+        -StatePath $StatePath `
+        -Ledger $Ledger `
+        -LedgerPath $LedgerPath `
+        -Findings $findings `
+        -RepoPath $RepoPath `
+        -RunRoot $RunRoot `
+        -Attempt ([int]$cleanup.Attempt) `
+        -Reason ([string]$cleanup.Reason) | Out-Null
+    return $true
 }
 
 function Update-ReviewLoopFixerResultFromWorktree {
@@ -1064,14 +1620,16 @@ function Invoke-ReviewLoopFixWorkflow {
     }
 
     $reason = "Finding cluster remained open after $attempt fix attempts."
-    Set-ReviewLoopFindingsStatus -Findings $Findings -Status "blocked" -Reason $reason
-    foreach ($finding in $Findings) {
-        $finding.LastBlockedHead = [string]$State.CurrentHead
-    }
-    Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
-    Write-ReviewLoopStatus -Message "$reason Independent clusters will continue." -Kind Error
-    Clear-ReviewLoopActiveCluster -State $State -StatePath $StatePath -Stage "cluster_blocked"
-    return $false
+    return Complete-ReviewLoopBlockedCluster `
+        -State $State `
+        -StatePath $StatePath `
+        -Ledger $Ledger `
+        -LedgerPath $LedgerPath `
+        -Findings $Findings `
+        -RepoPath $RepoPath `
+        -RunRoot $RunRoot `
+        -Attempt $attempt `
+        -Reason $reason
 }
 
 function Get-ReviewLoopArchitectureTrigger {
@@ -1308,21 +1866,46 @@ function Invoke-ReviewLoopCore {
         [switch]$NewRun,
         [ValidateSet("compact", "balanced", "detailed")][string]$OutputMode = "compact",
         [ValidateRange(0, 3600)][int]$HeartbeatSeconds = 30,
-        [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host"
+        [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host",
+        [switch]$Json
     )
 
     Initialize-ReviewLoopConsole `
         -OutputMode $OutputMode `
         -HeartbeatSeconds $HeartbeatSeconds `
         -ColorMode $ColorMode `
+        -HostOutputEnabled (-not $Json) `
         -TranscriptPath ""
     $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     $resolvedConfigPath = Resolve-ReviewLoopConfigPath -RepoPath $repo -ConfigPath $ConfigPath
-    $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath -RepoPath $repo
-    Assert-ReviewLoopConfigValues -Config $config
-    Assert-ReviewLoopHostGatePreflight -Config $config -RepoPath $repo
-    $resolvedReviewBase = Get-ReviewLoopGitValue `
-        -RepoPath $repo -Arguments @("rev-parse", "--verify", "$($config.ReviewBase)^{commit}")
+    try {
+        $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath -RepoPath $repo
+        Assert-ReviewLoopConfigValues -Config $config
+        Assert-ReviewLoopHostGatePreflight -Config $config -RepoPath $repo
+    }
+    catch {
+        if ($_.Exception.Data.Contains("ReviewLoopNextSteps")) {
+            throw
+        }
+        throw (New-ReviewLoopFailureException `
+            -Message "$($_.Exception.Message) Selected profile: $resolvedConfigPath" `
+            -NextSteps @(
+                "Correct the reported value in '$resolvedConfigPath'."
+                "Run the same command again, or select another profile with -ConfigPath."
+            ))
+    }
+    try {
+        $resolvedReviewBase = Get-ReviewLoopGitValue `
+            -RepoPath $repo -Arguments @("rev-parse", "--verify", "$($config.ReviewBase)^{commit}")
+    }
+    catch {
+        throw (New-ReviewLoopFailureException `
+            -Message "ReviewBase '$($config.ReviewBase)' from profile '$resolvedConfigPath' does not resolve to a commit: $($_.Exception.Message)" `
+            -NextSteps @(
+                "Fetch or create the configured review-base ref, or correct ReviewBase in the profile."
+                "Confirm git rev-parse --verify `"$($config.ReviewBase)^{commit}`" succeeds in the repository, then run the same command again."
+            ))
+    }
     $executionFingerprint = Get-ReviewLoopExecutionFingerprint -ConfigPath $resolvedConfigPath
     $config["__ConfigPath"] = $resolvedConfigPath
     $config["__ExecutionFingerprint"] = $executionFingerprint
@@ -1347,7 +1930,12 @@ function Invoke-ReviewLoopCore {
 
     if ($null -eq $state) {
         if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
-            throw "A new review loop requires a clean worktree."
+            throw (New-ReviewLoopFailureException `
+                -Message "A new review loop cannot start because the repository has staged, unstaged, or untracked changes." `
+                -NextSteps @(
+                    "Run git status in '$repo' and decide whether to commit, stash, or revert each existing change."
+                    "When the worktree is clean, run the same command again."
+                ))
         }
         Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
         $statePath = $paths.StatePath
@@ -1361,7 +1949,12 @@ function Invoke-ReviewLoopCore {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
     elseif ([string]$state.Speed -ne $Speed) {
-        throw "A resumed run keeps its global speed '$($state.Speed)'; requested speed was '$Speed'."
+        throw (New-ReviewLoopFailureException `
+            -Message "The existing checkpoint was started with speed '$($state.Speed)', but this command selected '$Speed'. A run cannot change speed while it is being resumed." `
+            -NextSteps @(
+                "Resume the existing checkpoint by running the same command with -Speed $($state.Speed)."
+                "To use -Speed $Speed instead, make the worktree clean and start with -Speed $Speed -NewRun."
+            ))
     }
 
     if ($resumed) {
@@ -1437,6 +2030,7 @@ function Invoke-ReviewLoopCore {
         -OutputMode $OutputMode `
         -HeartbeatSeconds $HeartbeatSeconds `
         -ColorMode $ColorMode `
+        -HostOutputEnabled (-not $Json) `
         -TranscriptPath $terminalPath
 
     Import-ReviewLoopLegacyLedgers `
@@ -1459,10 +2053,6 @@ function Invoke-ReviewLoopCore {
     Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
     $head = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")
     $shortHead = if ($head.Length -gt 10) { $head.Substring(0, 10) } else { $head }
-    Write-ReviewLoopRule -Title "Codex Review Loop" -Kind Progress
-    Write-ReviewLoopKeyValue -Name "Repository" -Value $repo
-    Write-ReviewLoopKeyValue -Name "Branch" -Value ([string]$state.Branch)
-    Write-ReviewLoopKeyValue -Name "Review-Base" -Value ([string]$config.ReviewBase)
     $baseCommitText = [string]$state.ReviewBaseCommit
     $baseShort = if ($baseCommitText.Length -gt 10) {
         $baseCommitText.Substring(0, 10)
@@ -1470,29 +2060,59 @@ function Invoke-ReviewLoopCore {
     else {
         $baseCommitText
     }
-    Write-ReviewLoopKeyValue -Name "Base commit" -Value $baseShort
-    Write-ReviewLoopKeyValue -Name "HEAD" -Value $shortHead
-    Write-ReviewLoopKeyValue -Name "Speed" -Value $Speed
-    Write-ReviewLoopKeyValue -Name "Output" -Value "$OutputMode · heartbeat ${HeartbeatSeconds}s · $ColorMode"
-    Write-ReviewLoopKeyValue -Name "Profile" -Value "$($config.Name) · $resolvedConfigPath"
-    Write-ReviewLoopKeyValue -Name "Run" -Value "$($state.RunId) ($(if ($resumed) { 'resumed' } else { 'new' }))"
-    Write-ReviewLoopKeyValue -Name "Checkpoint" -Value $statePath
-    Write-ReviewLoopKeyValue -Name "Ledger" -Value $paths.LedgerPath
-    Write-ReviewLoopKeyValue -Name "Terminal-Log" -Value $terminalPath
-    if ($resumedFromFailure) {
+    $runMode = if ($resumed) { "resumed" } else { "new" }
+    if (Test-ReviewLoopOutputLevel -Minimum detailed) {
+        Write-ReviewLoopRule -Title "Codex Review Loop" -Kind Progress
+        Write-ReviewLoopKeyValue -Name "Repository" -Value $repo
+        Write-ReviewLoopKeyValue -Name "Branch" -Value ([string]$state.Branch)
+        Write-ReviewLoopKeyValue -Name "Review-Base" -Value ([string]$config.ReviewBase)
+        Write-ReviewLoopKeyValue -Name "Base commit" -Value $baseShort
+        Write-ReviewLoopKeyValue -Name "HEAD" -Value $shortHead
+        Write-ReviewLoopKeyValue -Name "Speed" -Value $Speed
+        Write-ReviewLoopKeyValue -Name "Output" -Value "$OutputMode · heartbeat ${HeartbeatSeconds}s · $ColorMode"
+        Write-ReviewLoopKeyValue -Name "Profile" -Value "$($config.Name) · $resolvedConfigPath"
+        Write-ReviewLoopKeyValue -Name "Run" -Value "$($state.RunId) ($runMode)"
+        Write-ReviewLoopKeyValue -Name "Checkpoint" -Value $statePath
+        Write-ReviewLoopKeyValue -Name "Ledger" -Value $paths.LedgerPath
+        Write-ReviewLoopKeyValue -Name "Terminal-Log" -Value $terminalPath
+    }
+    elseif (Test-ReviewLoopOutputLevel -Minimum balanced) {
+        Write-ReviewLoopRule -Title "Codex Review Loop" -Kind Progress
+        Write-ReviewLoopKeyValue -Name "Repository" -Value $repo
+        Write-ReviewLoopKeyValue -Name "Branch" -Value ([string]$state.Branch)
+        Write-ReviewLoopKeyValue -Name "Review-Base" -Value ([string]$config.ReviewBase)
+        Write-ReviewLoopKeyValue -Name "HEAD" -Value $shortHead
+        Write-ReviewLoopKeyValue -Name "Speed" -Value $Speed
+        Write-ReviewLoopKeyValue -Name "Output" -Value "$OutputMode · heartbeat ${HeartbeatSeconds}s · $ColorMode"
+        Write-ReviewLoopKeyValue -Name "Run" -Value "$($state.RunId) ($runMode)"
+    }
+    else {
+        Write-ReviewLoopStatus `
+            -Message "$($config.Name) · $($state.Branch) · $runMode · $Speed · HEAD $shortHead" `
+            -Kind Progress
+    }
+    if ($resumedFromFailure -and (Test-ReviewLoopOutputLevel -Minimum balanced)) {
         Write-ReviewLoopStatus -Message "Resuming the previous failed checkpoint at stage '$($state.Stage)'." -Kind Warning
     }
-    if ($executionChanged) {
+    if ($executionChanged -and (Test-ReviewLoopOutputLevel -Minimum balanced)) {
         Write-ReviewLoopStatus -Message "Tool or profile changed; completed model work will be requalified before any commit." -Kind Warning
     }
 
     try {
+        $resumedBlockedCleanup = $false
         if ($resumed) {
             Complete-ReviewLoopPendingCommit `
                 -Config $config -State $state -StatePath $statePath -Ledger $ledger `
                 -LedgerPath $paths.LedgerPath -RepoPath $repo -RunRoot $paths.RunRoot | Out-Null
             Assert-ReviewLoopResumeInvariant `
                 -State $state -RepoPath $repo -ReviewBase ([string]$config.ReviewBase)
+            $resumedBlockedCleanup = Resume-ReviewLoopBlockedCleanup `
+                -State $state `
+                -StatePath $statePath `
+                -Ledger $ledger `
+                -LedgerPath $paths.LedgerPath `
+                -RepoPath $repo `
+                -RunRoot $paths.RunRoot
         }
         Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
             "rev-parse", "--verify", "$($state.ReviewBaseCommit)^{commit}"
@@ -1501,7 +2121,7 @@ function Invoke-ReviewLoopCore {
             -Config $config -State $state -StatePath $statePath `
             -Ledger $ledger -LedgerPath $paths.LedgerPath `
             -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
-        if (-not $resumedCluster -and $resumed -and
+        if (-not $resumedBlockedCleanup -and -not $resumedCluster -and $resumed -and
             [string]$state.Stage -eq "reviewed" -and
             @(Get-ReviewLoopOpenFindings -Ledger $ledger).Count -gt 0) {
             Write-ReviewLoopStatus -Message "Continuing the reviewed findings without spending another review call." -Kind Warning
@@ -1515,7 +2135,28 @@ function Invoke-ReviewLoopCore {
             [string]$state.Stage -eq "reviewing"
         ) {
             if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
-                throw "Worktree is not clean outside a resumable fix step."
+                if ($resumed -and [string]$state.Stage -eq "cluster_blocked") {
+                    $changedPathCount = @(Get-ReviewLoopChangedPaths -RepoPath $repo).Count
+                    $repoLiteral = ConvertTo-ReviewLoopPowerShellLiteral $repo
+                    $entryLiteral = ConvertTo-ReviewLoopPowerShellLiteral (
+                        Join-Path $script:ModuleRoot "codex-review-loop.ps1")
+                    $configLiteral = ConvertTo-ReviewLoopPowerShellLiteral $resolvedConfigPath
+                    throw (New-ReviewLoopFailureException `
+                        -Message "The previous blocked fixer attempt left unverified changes in $changedPathCount file(s). This legacy checkpoint cannot prove their ownership well enough to clean them automatically." `
+                        -NextSteps @(
+                            "git -C $repoLiteral stash push -u -m 'Blocked Codex Review Loop attempt'"
+                            "& $entryLiteral $repoLiteral -ConfigPath $configLiteral -Speed $Speed -NewRun"
+                            "Inspect the current git diff and deliberately commit or revert it instead of stashing it."
+                        ) `
+                        -RecommendedStepCount 2)
+                }
+                throw (New-ReviewLoopFailureException `
+                    -Message "The repository contains changes that are not part of a resumable fixer checkpoint." `
+                    -NextSteps @(
+                        "Inspect git status and git diff, and preserve or revert the changes deliberately."
+                        "After restoring the saved checkpoint state, run the same command again."
+                        "If the changes are intentional, commit or otherwise preserve them, make the worktree clean, and start with -NewRun."
+                    ))
             }
 
             if ([string]$state.Stage -ne "reviewing") {
@@ -1586,19 +2227,17 @@ function Invoke-ReviewLoopCore {
                     $state.Status = "completed"
                     $state.ExitCode = 0
                     Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "completed" -Status "completed"
-                    Write-ReviewLoopResultBlock -Title "Review Loop completed" -Kind Success -Values ([ordered]@{
-                        Status = "completed"
-                        Cycles = $state.ReviewCycle
-                        "Clean passes" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
-                        "Open findings" = 0
-                        "Blocked findings" = 0
-                        Run = $paths.RunRoot
-                        Ledger = $paths.LedgerPath
-                        Transcript = $terminalPath
-                    })
+                    Write-ReviewLoopCompletionSummary `
+                        -Cycles $state.ReviewCycle `
+                        -CleanPasses "$($state.CleanPasses)/$($config.CleanPassesRequired)" `
+                        -RunRoot $paths.RunRoot `
+                        -LedgerPath $paths.LedgerPath `
+                        -TranscriptPath $terminalPath
                     return [pscustomobject]@{
                         Status = $state.Status
                         ExitCode = 0
+                        Reason = ""
+                        NextSteps = @()
                         RunRoot = $paths.RunRoot
                         StatePath = $statePath
                         LedgerPath = $paths.LedgerPath
@@ -1620,7 +2259,7 @@ function Invoke-ReviewLoopCore {
         Stop-ReviewLoopBlocked -Message "Maximum review cycle count $($config.MaxReviewCycles) reached."
     }
     catch {
-        $message = $_.Exception.Message
+        $message = ConvertTo-ReviewLoopRedactedText $_.Exception.Message
         $failureStage = [string]$state.Stage
         $state.Status = if (
             $_.Exception.Data.Contains("ReviewLoopStatus") -and
@@ -1632,6 +2271,12 @@ function Invoke-ReviewLoopCore {
             "failed"
         }
         $state.ExitCode = if ($state.Status -eq "blocked") { 3 } else { 2 }
+        $nextSteps = @(Get-ReviewLoopFailureNextSteps `
+            -Exception $_.Exception `
+            -Context $state.Status)
+        $recommendedStepCount = Get-ReviewLoopRecommendedStepCount `
+            -Exception $_.Exception `
+            -Steps $nextSteps
         $state.BlockedReason = $message
         if ($state.Status -eq "blocked" -and @($state.ActiveFindingIds).Count -gt 0) {
             $activeIds = @($state.ActiveFindingIds | ForEach-Object { [string]$_ })
@@ -1651,30 +2296,65 @@ function Invoke-ReviewLoopCore {
             "stopped"
         }
         Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage $checkpointStage -Status $state.Status
-        Write-ReviewLoopStatus -Message $message -Kind Error
         $openCount = @($ledger.Findings | Where-Object { [string]$_.Status -in @("pending", "open", "fixing") }).Count
         $blockedCount = @($ledger.Findings | Where-Object { [string]$_.Status -eq "blocked" }).Count
-        Write-ReviewLoopResultBlock -Title "Review Loop stopped" -Kind Error -Values ([ordered]@{
-            Status = $state.Status
-            Reason = $message
-            Cycles = $state.ReviewCycle
-            "Clean passes" = "$($state.CleanPasses)/$($config.CleanPassesRequired)"
-            "Open findings" = $openCount
-            "Blocked findings" = $blockedCount
-            Run = $paths.RunRoot
-            Ledger = $paths.LedgerPath
-            Transcript = $terminalPath
-        })
-        return [pscustomobject]@{
+        $cleanupAtFailure = Get-ReviewLoopObjectProperty `
+            -Object $state `
+            -Name "BlockedCleanup"
+        $blockedArtifactRoot = if (
+            $null -ne $cleanupAtFailure -and
+            $cleanupAtFailure.PSObject.Properties.Name -contains "ArtifactRoot" -and
+            -not [string]::IsNullOrWhiteSpace([string]$cleanupAtFailure.ArtifactRoot)
+        ) {
+            [string]$cleanupAtFailure.ArtifactRoot
+        }
+        else {
+            [string](@(
+            $ledger.Findings |
+                Where-Object {
+                    [string]$_.Status -eq "blocked" -and
+                    $_.PSObject.Properties.Name -contains "BlockedArtifactRoot" -and
+                    -not [string]::IsNullOrWhiteSpace([string]$_.BlockedArtifactRoot)
+                } |
+                Select-Object -Last 1 |
+                ForEach-Object { [string]$_.BlockedArtifactRoot }
+            ) | Select-Object -First 1)
+        }
+        $detailPath = if ([string]::IsNullOrWhiteSpace($blockedArtifactRoot)) {
+            $terminalPath
+        }
+        else {
+            $blockedArtifactRoot
+        }
+        Write-ReviewLoopFailureSummary `
+            -Title "Review Loop stopped" `
+            -Problem $message `
+            -Status $state.Status `
+            -NextSteps $nextSteps `
+            -RecommendedStepCount $recommendedStepCount `
+            -Cycles $state.ReviewCycle `
+            -CleanPasses "$($state.CleanPasses)/$($config.CleanPassesRequired)" `
+            -OpenFindings $openCount `
+            -BlockedFindings $blockedCount `
+            -RunRoot $paths.RunRoot `
+            -LedgerPath $paths.LedgerPath `
+            -TranscriptPath $detailPath
+        $failureResult = [pscustomobject]@{
             Status = $state.Status
             ExitCode = $state.ExitCode
             Reason = $message
+            NextSteps = $nextSteps
             RunRoot = $paths.RunRoot
             StatePath = $statePath
             LedgerPath = $paths.LedgerPath
             ReviewCycles = $state.ReviewCycle
             CleanPasses = $state.CleanPasses
         }
+        if (-not [string]::IsNullOrWhiteSpace($blockedArtifactRoot)) {
+            $failureResult | Add-Member -NotePropertyName BlockedArtifactRoot `
+                -NotePropertyValue $blockedArtifactRoot
+        }
+        return $failureResult
     }
 }
 
@@ -1688,18 +2368,25 @@ function Invoke-CodexReviewLoop {
         [switch]$NewRun,
         [ValidateSet("compact", "balanced", "detailed")][string]$OutputMode = "compact",
         [ValidateRange(0, 3600)][int]$HeartbeatSeconds = 30,
-        [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host"
+        [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host",
+        [switch]$Json
     )
 
-    $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
-    $lockPath = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
-        "rev-parse", "--git-path", "codex-review-loop.lock"
-    )
-    if (-not [System.IO.Path]::IsPathRooted($lockPath)) {
-        $lockPath = Join-Path $repo $lockPath
-    }
+    Initialize-ReviewLoopConsole `
+        -OutputMode $OutputMode `
+        -HeartbeatSeconds $HeartbeatSeconds `
+        -ColorMode $ColorMode `
+        -HostOutputEnabled (-not $Json) `
+        -TranscriptPath ""
     $lock = $null
     try {
+        $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
+        $lockPath = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
+            "rev-parse", "--git-path", "codex-review-loop.lock"
+        )
+        if (-not [System.IO.Path]::IsPathRooted($lockPath)) {
+            $lockPath = Join-Path $repo $lockPath
+        }
         try {
             $lock = [System.IO.FileStream]::new(
                 $lockPath,
@@ -1708,9 +2395,73 @@ function Invoke-CodexReviewLoop {
                 [System.IO.FileShare]::None)
         }
         catch {
-            throw "A review loop is already running for '$repo'."
+            throw (New-ReviewLoopFailureException `
+                -Message "Another review loop is already running for '$repo'." `
+                -NextSteps @(
+                    "Let the existing loop finish, or stop it normally from the terminal that started it."
+                    "After that process exits, run this command again. Do not delete the lock file manually."
+                ))
         }
         return Invoke-ReviewLoopCore @PSBoundParameters
+    }
+    catch {
+        $message = ConvertTo-ReviewLoopRedactedText $_.Exception.Message
+        $transcriptPath = [string](Get-ReviewLoopConsoleOption -Name "TranscriptPath")
+        $failureContext = if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
+            "startup"
+        }
+        else {
+            "failed"
+        }
+        $nextSteps = @(Get-ReviewLoopFailureNextSteps `
+            -Exception $_.Exception `
+            -Context $failureContext)
+        $recommendedStepCount = Get-ReviewLoopRecommendedStepCount `
+            -Exception $_.Exception `
+            -Steps $nextSteps
+        $runRoot = if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
+            ""
+        }
+        else {
+            Split-Path -Parent $transcriptPath
+        }
+        $statePath = if ([string]::IsNullOrWhiteSpace($runRoot)) {
+            ""
+        }
+        else {
+            Join-Path $runRoot "run-v1.json"
+        }
+        $ledgerPath = if ([string]::IsNullOrWhiteSpace($runRoot)) {
+            ""
+        }
+        else {
+            Join-Path (Split-Path -Parent $runRoot) "ledger-v2.json"
+        }
+
+        $title = if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
+            "Review Loop could not start"
+        }
+        else {
+            "Review Loop stopped during initialization"
+        }
+        Write-ReviewLoopFailureSummary `
+            -Title $title `
+            -Problem $message `
+            -Status "failed" `
+            -NextSteps $nextSteps `
+            -RecommendedStepCount $recommendedStepCount `
+            -TranscriptPath $transcriptPath
+        return [pscustomobject]@{
+            Status = "failed"
+            ExitCode = 2
+            Reason = $message
+            NextSteps = $nextSteps
+            RunRoot = $runRoot
+            StatePath = $statePath
+            LedgerPath = $ledgerPath
+            ReviewCycles = 0
+            CleanPasses = 0
+        }
     }
     finally {
         if ($null -ne $lock) {

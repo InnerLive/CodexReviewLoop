@@ -1,11 +1,86 @@
 Set-StrictMode -Version Latest
 
-function Stop-ReviewLoopBlocked {
-    param([Parameter(Mandatory = $true)][string]$Message)
+function New-ReviewLoopFailureException {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [AllowEmptyCollection()][string[]]$NextSteps = @(),
+        [ValidateRange(0, 100)][int]$RecommendedStepCount = 1,
+        [ValidateSet("failed", "blocked")][string]$Status = "failed"
+    )
 
     $exception = [System.InvalidOperationException]::new($Message)
-    $exception.Data["ReviewLoopStatus"] = "blocked"
-    throw $exception
+    $exception.Data["ReviewLoopStatus"] = $Status
+    if ($NextSteps.Count -gt 0) {
+        $exception.Data["ReviewLoopNextSteps"] = @($NextSteps)
+        $exception.Data["ReviewLoopRecommendedStepCount"] = [Math]::Min(
+            $NextSteps.Count,
+            $RecommendedStepCount)
+    }
+    return $exception
+}
+
+function Get-ReviewLoopFailureNextSteps {
+    param(
+        [Parameter(Mandatory = $true)][System.Exception]$Exception,
+        [ValidateSet("startup", "failed", "blocked")][string]$Context = "failed"
+    )
+
+    if ($Exception.Data.Contains("ReviewLoopNextSteps")) {
+        return @(
+            $Exception.Data["ReviewLoopNextSteps"] |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+    }
+
+    return @(switch ($Context) {
+        "startup" {
+            "Correct the reported startup problem, then run the same command again."
+            "Use -Help to review parameters and examples if the selected repository, profile, or option is unclear."
+            "If the problem concerns an old checkpoint and the current repository state is intentional, make the worktree clean and use -NewRun."
+        }
+        "blocked" {
+            "Inspect the transcript, ledger, and current Git diff before deciding which work to preserve."
+            "Make the worktree clean without blindly discarding changes."
+            "Start with -NewRun to requalify the current HEAD and give blocked findings a fresh bounded attempt budget."
+        }
+        default {
+            "Correct the reported problem, then run the same command again to resume from the last safe checkpoint."
+            "If the repository was changed intentionally, first make the worktree clean and use -NewRun instead."
+            "If the same failure repeats without any state change, preserve the transcript and ledger and report the defect instead of editing checkpoint files."
+        }
+    })
+}
+
+function Get-ReviewLoopRecommendedStepCount {
+    param(
+        [Parameter(Mandatory = $true)][System.Exception]$Exception,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Steps
+    )
+
+    if ($Steps.Count -eq 0) {
+        return 0
+    }
+    if ($Exception.Data.Contains("ReviewLoopRecommendedStepCount")) {
+        return [Math]::Min(
+            $Steps.Count,
+            [Math]::Max(0, [int]$Exception.Data["ReviewLoopRecommendedStepCount"]))
+    }
+    return 1
+}
+
+function Stop-ReviewLoopBlocked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [AllowEmptyCollection()][string[]]$NextSteps = @(),
+        [ValidateRange(0, 100)][int]$RecommendedStepCount = 1
+    )
+
+    throw (New-ReviewLoopFailureException `
+        -Message $Message `
+        -NextSteps $NextSteps `
+        -RecommendedStepCount $RecommendedStepCount `
+        -Status "blocked")
 }
 
 function Resolve-ReviewLoopPath {
@@ -19,7 +94,12 @@ function Resolve-ReviewLoopPath {
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
     $absolute = [System.IO.Path]::GetFullPath($expanded)
     if ($MustExist -and -not (Test-Path -LiteralPath $absolute)) {
-        throw "Path does not exist: $absolute"
+        throw (New-ReviewLoopFailureException `
+            -Message "The requested path does not exist: $absolute" `
+            -NextSteps @(
+                "Check the path for typing errors and confirm that the drive or network location is available."
+                "Run the same command again with an existing path."
+            ))
     }
     return $absolute
 }
@@ -147,7 +227,12 @@ function Get-ReviewLoopRepositoryRoot {
     $candidate = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
     $root = (& git -C $candidate rev-parse --show-toplevel 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
-        throw "RepoPath is not a Git repository: $candidate"
+        throw (New-ReviewLoopFailureException `
+            -Message "The selected RepoPath is not inside a Git worktree: $candidate" `
+            -NextSteps @(
+                "Pass the repository folder as the first argument or with -RepoPath."
+                "Run git status in that folder to confirm it is a usable Git worktree, then try again."
+            ))
     }
     return Get-ReviewLoopComparablePath -Path $root
 }
@@ -196,10 +281,20 @@ function Assert-ReviewLoopConfigRepository {
     $configured = [string]$config.RepositoryPath
     if (-not [System.IO.Path]::IsPathRooted(
         [Environment]::ExpandEnvironmentVariables($configured))) {
-        throw "RepositoryPath must be absolute: $ConfigPath"
+        throw (New-ReviewLoopFailureException `
+            -Message "Profile '$ConfigPath' contains a relative RepositoryPath. RepositoryPath must be absolute." `
+            -NextSteps @(
+                "Set RepositoryPath in that profile to the full Git repository path."
+                "Run the same command again, or select a different profile with -ConfigPath."
+            ))
     }
     if (-not (Test-ReviewLoopSamePath -Left $configured -Right $RepoPath)) {
-        throw "Profile '$ConfigPath' belongs to '$configured', not '$RepoPath'."
+        throw (New-ReviewLoopFailureException `
+            -Message "Profile '$ConfigPath' belongs to repository '$configured', not '$RepoPath'." `
+            -NextSteps @(
+                "Use this profile with '$configured', or select the correct profile for '$RepoPath' with -ConfigPath."
+                "If the profile binding is wrong, correct RepositoryPath in the profile and run the command again."
+            ))
     }
 }
 
@@ -237,7 +332,12 @@ function Find-ReviewLoopProfileByRepository {
         }
     }
     if ($matches.Count -gt 1) {
-        throw "Multiple profiles belong to '$RepoPath': $($matches -join ', ')"
+        throw (New-ReviewLoopFailureException `
+            -Message "Multiple tool-local profiles belong to '$RepoPath': $($matches -join ', ')" `
+            -NextSteps @(
+                "Choose one explicitly with -ConfigPath."
+                "To restore automatic discovery, change or remove the duplicate profiles so exactly one remains bound to this repository."
+            ))
     }
     if ($matches.Count -eq 1) {
         return Get-ReviewLoopComparablePath -Path $matches[0]
@@ -680,4 +780,9 @@ function Get-ReviewLoopWorktreeFingerprint {
 function ConvertTo-ReviewLoopJsonCompact {
     param([Parameter(Mandatory = $true)][object]$Value)
     return ($Value | ConvertTo-Json -Depth 30 -Compress)
+}
+
+function ConvertTo-ReviewLoopPowerShellLiteral {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
 }

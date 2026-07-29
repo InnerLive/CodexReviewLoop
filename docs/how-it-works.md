@@ -57,8 +57,11 @@ It must return one structured targeted test as an executable plus argument
 array. On the second attempt, the same fixer thread receives all supported
 verification feedback together.
 
-If both attempts fail, that cluster becomes blocked. Independent clusters
-continue instead of losing otherwise useful progress.
+If both attempts fail, the loop preserves the unverified patch as a hashed
+diagnostic artifact, restores the exact fixer-owned changes, and marks that
+cluster blocked. Independent clusters then continue instead of losing otherwise
+useful progress. Cleanup is checkpointed and resumable; uncertain concurrent
+state is never deleted automatically.
 
 ## 4. Independent acceptance
 

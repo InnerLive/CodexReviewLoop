@@ -57,6 +57,10 @@ Auto uses ANSI only in a suitable interactive terminal;
 Never disables colors.
 The terminal.log file never contains color codes.
 
+.PARAMETER Json
+Suppresses human terminal rendering and writes exactly one JSON result document
+to stdout. OutputMode still controls which messages are written to terminal.log.
+
 .PARAMETER Help
 Shows this help without creating a profile or starting the review loop.
 
@@ -81,6 +85,11 @@ C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
     -ColorMode Host
 
 Adds concise CLI activity and reports progress every 15 seconds.
+
+.EXAMPLE
+C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project -Json
+
+Writes one machine-readable JSON result and no human terminal dashboard.
 
 .EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 -Help
@@ -113,6 +122,8 @@ param(
     [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")]
     [string]$ColorMode = "Host",
 
+    [switch]$Json,
+
     [Alias("h")]
     [switch]$Help
 )
@@ -124,7 +135,30 @@ if ($Help) {
     exit 0
 }
 if ([string]::IsNullOrWhiteSpace($RepoPath)) {
-    Write-Error "RepoPath is required. Use -Help for examples and parameters."
+    $missingPathResult = [pscustomobject][ordered]@{
+        Status = "failed"
+        ExitCode = 1
+        Reason = "A repository path is required."
+        NextSteps = @(
+            "Pass the repository as the first argument or with -RepoPath."
+            "Run .\codex-review-loop.ps1 -Help for examples and all options."
+        )
+        RunRoot = ""
+        StatePath = ""
+        LedgerPath = ""
+        ReviewCycles = 0
+        CleanPasses = 0
+    }
+    if ($Json) {
+        $missingPathResult | ConvertTo-Json -Depth 20
+    }
+    else {
+        Write-Host "[X] A repository path is required." -ForegroundColor Red
+        Write-Host "[!] Recommended:" -ForegroundColor Yellow
+        Write-Host "    Pass the repository as the first argument or with -RepoPath."
+        Write-Host "[i] Alternative:"
+        Write-Host "    Run .\codex-review-loop.ps1 -Help for examples and all options."
+    }
     exit 1
 }
 
@@ -138,6 +172,7 @@ $arguments = @{
     OutputMode = $OutputMode
     HeartbeatSeconds = $HeartbeatSeconds
     ColorMode = $ColorMode
+    Json = $Json
 }
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $arguments.ConfigPath = $ConfigPath
@@ -147,5 +182,7 @@ if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
 }
 
 $result = Invoke-CodexReviewLoop @arguments
-$result | ConvertTo-Json -Depth 20
+if ($Json) {
+    $result | ConvertTo-Json -Depth 20
+}
 exit ([int]$result.ExitCode)

@@ -373,6 +373,7 @@ function New-ReviewLoopState {
         ActiveStrategy = $null
         LastFixerResult = $null
         PendingCommit = $null
+        BlockedCleanup = $null
         BlockedReason = ""
         RoleCalls = @()
         CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")

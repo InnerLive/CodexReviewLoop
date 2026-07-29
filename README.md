@@ -51,6 +51,9 @@ and compact terminal output.
 The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
 when you deliberately want a fresh run; the finding ledger is retained.
 
+Normal invocations print only the human dashboard. Automation can request one
+machine-readable result document and no terminal dashboard with `-Json`.
+
 ## Learn more
 
 - [How the loop works](docs/how-it-works.md)
