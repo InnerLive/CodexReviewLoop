@@ -29,8 +29,8 @@ a `RepositoryPath` cannot be used for another repository.
 | `RepositoryPath` | Canonical Git root | Prevents profile collisions |
 | `ReviewBase` | Detected Git revision | Revision reviewed against |
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
-| `MaxReviewCycles` | `12` | Hard bound for review cycles |
-| `CommitMessagePrefix` | `Review-Loop` | Prefix for verified commits |
+| `MaxReviewCycles` | `12` | Live-reloaded hard bound for review cycles |
+| `CommitMessagePrefix` | `Review-Loop` | Live-reloaded prefix for future verified commits |
 | `HostGates` | Detected checks | Required checks before every commit |
 | `Roles` | Pinned model settings | Model and reasoning level per role |
 
@@ -45,6 +45,26 @@ Several values are deliberate invariants rather than tuning knobs:
 - `AutoCommit = $true`
 
 Profiles that weaken these values are rejected.
+
+## Changes during an active run
+
+The loop reloads two settings from the active profile at role and review-cycle
+boundaries:
+
+- `MaxReviewCycles` applies before the next review cycle. Increasing it lets the
+  current checkpoint continue without stopping. Lowering it below the number of
+  cycles already used stops at the normal maximum-cycle checkpoint.
+- `CommitMessagePrefix` applies to the next commit that has not yet entered
+  commit preparation. A pending commit keeps its sealed message.
+
+These settings are excluded from the execution fingerprint because changing
+them does not invalidate review, test, or verification evidence.
+
+Other settings remain fixed for an active invocation. In particular, changing
+`Name`, `RepositoryPath`, `ReviewBase`, `LogRoot`, `HostGates`, or `Roles`
+changes run identity or execution evidence. The loop preserves its checkpoint
+and requires the same command to be run again so that the change is applied
+with the normal resume checks.
 
 ## Host gates
 
@@ -97,5 +117,6 @@ Each entry under `Roles` contains:
 change models or reasoning levels, and a resumed run must keep its original
 speed.
 
-Tool, prompt, schema, and profile contents are fingerprinted. If they change
-between invocations, completed model work is requalified before any commit.
+Tool, prompt, schema, and execution-affecting profile settings are
+fingerprinted. If they change between invocations, completed model work is
+requalified before any commit. The live settings described above are excluded.

@@ -694,6 +694,40 @@ Describe "Run state" {
         $state.ExecutionFingerprint | Should Be "test-execution-fingerprint"
     }
 
+    It "fingerprints execution settings but excludes live profile settings" {
+        $repo = New-TestRepo (Join-Path $TestDrive "live-fingerprint-repo")
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "live-fingerprint.psd1") `
+            -LogRoot (Join-Path $TestDrive "live-fingerprint-logs")
+        $module = Get-Module CodexReviewLoop
+        $initial = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $profilePath
+
+        $content = (Get-Content -Raw -LiteralPath $profilePath).
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 24").
+            Replace(
+                'CommitMessagePrefix = "Test Review Loop"',
+                'CommitMessagePrefix = "Reloaded"')
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $liveChanged = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $profilePath
+        $liveChanged | Should Be $initial
+
+        $content = $content.Replace(
+            'Reviewer = @{ Model = "fake"; Thinking = "high" }',
+            'Reviewer = @{ Model = "fake"; Thinking = "medium" }')
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $executionChanged = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $profilePath
+        $executionChanged | Should Not Be $initial
+    }
+
     It "persists and reads state" {
         $path = Join-Path $TestDrive "state.json"
         Write-ReviewLoopState -Path $path -State $state | Out-Null
@@ -1533,6 +1567,61 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Clean pass 2/2"
         $terminal | Should Match "Review Loop completed"
+    }
+
+    It "reloads live profile settings without stopping the active run" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 2")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"live reload defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]}]}'
+        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["live-reload.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
+        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $clean = '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        $plans = @(
+            [pscustomobject]@{
+                result = $findingReview
+                profileMutation = [pscustomobject]@{
+                    path = $configPath
+                    replacements = @(
+                        [pscustomobject]@{
+                            old = "MaxReviewCycles = 2"
+                            new = "MaxReviewCycles = 3"
+                        }
+                        [pscustomobject]@{
+                            old = 'CommitMessagePrefix = "Test Review Loop"'
+                            new = 'CommitMessagePrefix = "Reloaded"'
+                        }
+                    )
+                }
+            },
+            [pscustomobject]@{
+                result = $fixChanged
+                mutations = @([pscustomobject]@{
+                    path = "live-reload.txt"
+                    content = "verified live reload"
+                })
+            },
+            [pscustomobject]@{ result = $resolved },
+            [pscustomobject]@{ result = $clean },
+            [pscustomobject]@{ result = $clean }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "live-reload-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.ReviewCycles | Should Be 3
+        (& git -C $repo show -s --format=%s HEAD) | Should Match "^Reloaded:"
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
+        $terminal | Should Match "Reloaded live profile settings"
+        $terminal | Should Match "MaxReviewCycles 2 -> 3"
+        $terminal | Should Match "Review cycle 3/3"
+        $terminal | Should Not Match "active profile changed"
     }
 
     It "emits one JSON document and no human dashboard when requested" {

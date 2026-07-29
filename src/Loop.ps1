@@ -2161,10 +2161,14 @@ function Invoke-ReviewLoopCore {
                 -Ledger $ledger -LedgerPath $paths.LedgerPath `
                 -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         }
-        while (
-            [int]$state.ReviewCycle -lt [int]$config.MaxReviewCycles -or
-            [string]$state.Stage -eq "reviewing"
-        ) {
+        while ($true) {
+            Assert-ReviewLoopExecutionUnchanged -Config $config
+            if (
+                [int]$state.ReviewCycle -ge [int]$config.MaxReviewCycles -and
+                [string]$state.Stage -ne "reviewing"
+            ) {
+                break
+            }
             if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
                 if ($resumed -and [string]$state.Stage -eq "cluster_blocked") {
                     $changedPathCount = @(Get-ReviewLoopChangedPaths -RepoPath $repo).Count

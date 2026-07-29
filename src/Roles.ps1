@@ -72,6 +72,7 @@ function Get-ReviewLoopPrompt {
 function Assert-ReviewLoopExecutionUnchanged {
     param([Parameter(Mandatory = $true)][hashtable]$Config)
 
+    Update-ReviewLoopLiveConfig -Config $Config
     if ($Config.ContainsKey("__ExecutionFingerprint") -and
         $Config.ContainsKey("__ConfigPath") -and
         (Get-ReviewLoopExecutionFingerprint -ConfigPath ([string]$Config.__ConfigPath)) -ne

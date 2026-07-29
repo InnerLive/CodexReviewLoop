@@ -448,11 +448,13 @@ function New-ReviewLoopProfile {
     CleanPassesRequired = 2
 
     # Hard limits prevent endless review, fix, and architecture loops.
+    # MaxReviewCycles is reloaded at safe boundaries while a run is active.
     MaxReviewCycles = 12
     MaxFixAttempts = 2
     MaxArchitectureRevisions = 1
     # The unattended loop always commits after successful verification and all host gates.
     AutoCommit = `$true
+    # CommitMessagePrefix is reloaded for future commits while a run is active.
     CommitMessagePrefix = 'Review-Loop'
 
     # Host gates run after successful finding verification and before the commit.
@@ -664,6 +666,103 @@ function Assert-ReviewLoopConfigValues {
     }
 }
 
+$script:ReviewLoopLiveConfigKeys = @(
+    "MaxReviewCycles",
+    "CommitMessagePrefix"
+)
+
+function ConvertTo-ReviewLoopFingerprintData {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return "null"
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $entries = foreach ($key in @($Value.Keys | ForEach-Object {
+            [string]$_
+        } | Sort-Object)) {
+            $encodedKey = ConvertTo-Json -InputObject $key -Compress
+            $encodedValue = ConvertTo-ReviewLoopFingerprintData -Value $Value[$key]
+            "${encodedKey}:${encodedValue}"
+        }
+        return "{$($entries -join ',')}"
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = foreach ($item in $Value) {
+            ConvertTo-ReviewLoopFingerprintData -Value $item
+        }
+        return "[$($items -join ',')]"
+    }
+    return ConvertTo-Json -InputObject $Value -Compress
+}
+
+function Get-ReviewLoopExecutionProfileText {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    $profile = Import-PowerShellDataFile -LiteralPath (
+        Resolve-ReviewLoopPath -Path $ConfigPath -MustExist)
+    $executionSettings = @{}
+    foreach ($key in $profile.Keys) {
+        if ([string]$key -notin $script:ReviewLoopLiveConfigKeys) {
+            $executionSettings[$key] = $profile[$key]
+        }
+    }
+    return ConvertTo-ReviewLoopFingerprintData -Value $executionSettings
+}
+
+function Update-ReviewLoopLiveConfig {
+    param([Parameter(Mandatory = $true)][hashtable]$Config)
+
+    if (-not $Config.ContainsKey("__ConfigPath")) {
+        return
+    }
+
+    $latest = $null
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $latest = Import-ReviewLoopConfig -ConfigPath ([string]$Config.__ConfigPath)
+            Assert-ReviewLoopConfigValues -Config $latest
+            break
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt 3) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    if ($null -eq $latest) {
+        throw (New-ReviewLoopFailureException `
+            -Message "The active profile could not be reloaded: $($lastError.Exception.Message)" `
+            -NextSteps @(
+                "Correct the active profile and keep it unchanged until it is a valid PowerShell data file."
+                "Run the same command again to resume from the last safe checkpoint."
+            ))
+    }
+
+    $changes = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $script:ReviewLoopLiveConfigKeys) {
+        $before = ConvertTo-ReviewLoopFingerprintData -Value $Config[$key]
+        $after = ConvertTo-ReviewLoopFingerprintData -Value $latest[$key]
+        if ($before -eq $after) {
+            continue
+        }
+        $Config[$key] = $latest[$key]
+        if ($key -eq "MaxReviewCycles") {
+            [void]$changes.Add("MaxReviewCycles $before -> $after")
+        }
+        else {
+            [void]$changes.Add("$key updated")
+        }
+    }
+    if ($changes.Count -gt 0) {
+        Write-ReviewLoopStatus `
+            -Message "Reloaded live profile settings · $($changes -join ' · ')" `
+            -Kind Info
+    }
+}
+
 function Get-ReviewLoopExecutionFingerprint {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
 
@@ -681,13 +780,18 @@ function Get-ReviewLoopExecutionFingerprint {
             [void]$files.Add($file.FullName)
         }
     }
-    [void]$files.Add((Resolve-ReviewLoopPath -Path $ConfigPath -MustExist))
 
     $records = foreach ($file in $files) {
         $absolute = Resolve-ReviewLoopPath -Path $file -MustExist
         $relative = [System.IO.Path]::GetRelativePath($script:ModuleRoot, $absolute).Replace("\", "/")
         "$relative`n$(Get-ReviewLoopSha256 ([System.IO.File]::ReadAllText($absolute)))"
     }
+    $profilePath = Resolve-ReviewLoopPath -Path $ConfigPath -MustExist
+    $profileRelative = [System.IO.Path]::GetRelativePath(
+        $script:ModuleRoot,
+        $profilePath).Replace("\", "/")
+    $profileText = Get-ReviewLoopExecutionProfileText -ConfigPath $profilePath
+    $records = @($records) + "$profileRelative`n$(Get-ReviewLoopSha256 $profileText)"
     return Get-ReviewLoopSha256 ($records -join "`n")
 }
 

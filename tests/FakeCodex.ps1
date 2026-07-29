@@ -79,6 +79,7 @@ $threadId = [string](Get-FakePlanValue -Plan $invocationPlan -Name "threadId" -D
 $emitThread = Get-FakePlanValue -Plan $invocationPlan -Name "emitThread" -Default $true
 $plannedResult = Get-FakePlanValue -Plan $invocationPlan -Name "result"
 $plannedMutations = @(Get-FakePlanValue -Plan $invocationPlan -Name "mutations" -Default @())
+$profileMutation = Get-FakePlanValue -Plan $invocationPlan -Name "profileMutation"
 $childPidPath = [string](Get-FakePlanValue -Plan $invocationPlan -Name "childPidPath" -Default "")
 $childSleepSeconds = [int](Get-FakePlanValue -Plan $invocationPlan -Name "childSleepSeconds" -Default 60)
 
@@ -252,6 +253,30 @@ if ($plannedMutations.Count -gt 0) {
                 [System.Text.UTF8Encoding]::new($false))
         }
     }
+}
+
+if ($null -ne $profileMutation) {
+    $profileMutationPath = [string](Get-FakePlanValue `
+        -Plan $profileMutation -Name "path" -Default "")
+    if ([string]::IsNullOrWhiteSpace($profileMutationPath) -or
+        [System.IO.Path]::GetExtension($profileMutationPath) -ne ".psd1" -or
+        -not (Test-Path -LiteralPath $profileMutationPath -PathType Leaf)) {
+        throw "Fake Codex profile mutation path is invalid: '$profileMutationPath'."
+    }
+    $profileText = [System.IO.File]::ReadAllText($profileMutationPath)
+    foreach ($replacement in @(Get-FakePlanValue `
+        -Plan $profileMutation -Name "replacements" -Default @())) {
+        $old = [string](Get-FakePlanValue -Plan $replacement -Name "old" -Default "")
+        $new = [string](Get-FakePlanValue -Plan $replacement -Name "new" -Default "")
+        if ([string]::IsNullOrEmpty($old) -or -not $profileText.Contains($old)) {
+            throw "Fake Codex profile mutation did not find the requested text."
+        }
+        $profileText = $profileText.Replace($old, $new)
+    }
+    [System.IO.File]::WriteAllText(
+        $profileMutationPath,
+        $profileText,
+        [System.Text.UTF8Encoding]::new($false))
 }
 
 if (Test-FakeBoolean $emitThread) {

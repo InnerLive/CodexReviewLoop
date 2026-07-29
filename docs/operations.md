@@ -84,8 +84,10 @@ speed. The base commit recorded at run start remains pinned and must still
 exist.
 
 Interrupted fixer work can resume from its recorded thread and remaining
-attempt. A changed tool or profile fingerprint resets clean-pass evidence and
-forces completed model work to be requalified before commit.
+attempt. A changed tool or execution-affecting profile fingerprint resets
+clean-pass evidence and forces completed model work to be requalified before
+commit. `MaxReviewCycles` and `CommitMessagePrefix` are live profile settings;
+they are reloaded at safe boundaries without invalidating the checkpoint.
 
 Use `-NewRun` when a blocked or interrupted finding should receive a fresh
 two-attempt budget. It still requires a clean worktree, respects the repository
