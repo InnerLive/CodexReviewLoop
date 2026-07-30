@@ -69,8 +69,11 @@ available, those changes are preserved and one fresh Fixer completes the same
 semantic attempt. A second technical failure preserves the latest evidence,
 restores the clean checkpoint, and returns to native review.
 
-The Fixer may provide one targeted test as an executable plus argument array.
-It may also report that no targeted test is available.
+The Fixer may provide one targeted test through `targetedTest.executable` and
+`targetedTest.arguments`. The executable is the program started by the
+orchestrator, such as `dotnet`, `pwsh`, or a repository wrapper. Project,
+script, test, and filter paths are arguments. The Fixer may also report that no
+targeted test is available.
 
 ## 4. Direct verification
 

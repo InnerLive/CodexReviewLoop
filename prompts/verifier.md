@@ -13,5 +13,8 @@ Architectural advice:
 Fixer result and targeted-test execution:
 {{FIXER_RESULT}}
 
+Workflow:
+Reviewer findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+
 Result:
 Return your decision and any feedback in the supplied structured format.

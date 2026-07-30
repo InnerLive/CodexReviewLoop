@@ -13,8 +13,11 @@ Architectural advice:
 Previous feedback:
 {{FEEDBACK}}
 
-Execution context:
-The orchestrator observes repository changes, can execute the returned targeted test, runs the configured host gates, and owns the commit.
+Workflow:
+Reviewer findings → Architect advice → Fixer changes [current role] → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+
+Targeted test:
+`targetedTest.executable` is the program started by the orchestrator, for example `dotnet`, `pwsh`, or a repository wrapper. Project, script, test, and filter values belong in `targetedTest.arguments`; for `dotnet test`, `dotnet` is the executable and `test` is the first argument.
 
 Result:
 Return your work summary and targeted-test information in the supplied structured format.

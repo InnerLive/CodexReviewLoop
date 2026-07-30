@@ -502,11 +502,11 @@ Describe "Unattended reliability boundaries" {
         )
         $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = "not json"
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v2.schema.json"
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v3.schema.json"
 
         $call = Invoke-CodexCliRole -Role Fixer -RepoPath $repo -Model model -Thinking high `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex `
-            -MaxAttempts 2 -SchemaPath (Join-Path $root "schemas\fixer-result-v2.schema.json")
+            -MaxAttempts 2 -SchemaPath (Join-Path $root "schemas\fixer-result-v3.schema.json")
 
         $call.Success | Should Be $false
         $call.FailureKind | Should Be "unsafe_partial_mutation"
@@ -550,7 +550,7 @@ Describe "Unattended reliability boundaries" {
         $pwsh = (Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1).Source
         $fixer = [pscustomobject]@{
             targetedTest = [pscustomobject]@{
-                filePath = $pwsh
+                executable = $pwsh
                 arguments = @("-NoProfile", "-Command", "exit 0")
                 rationale = "repository-specific regression wrapper"
             }
@@ -673,7 +673,7 @@ Describe "Unattended reliability boundaries" {
         $state.Stage = "fixing"
         $statePath = Join-Path $runRoot "run-v1.json"
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
-        $fix = '{"schemaVersion":"2.0","summary":"corrected","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fix = '{"schemaVersion":"3.0","summary":"corrected","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = $fix
         $finding = New-ReviewLoopLedger -RepoPath $repo
         Merge-ReviewLoopFindings -Ledger $finding -Findings @((New-ReliabilityFinding)) `
@@ -706,7 +706,7 @@ Describe "Unattended reliability boundaries" {
         New-Item -ItemType Directory -Path $runRoot | Out-Null
         $fixerResult = [pscustomobject]@{
             targetedTest = [pscustomobject]@{
-                filePath = ".\README.txt"
+                executable = ".\README.txt"
                 arguments = @("ignored")
             }
         }
@@ -872,7 +872,7 @@ Describe "Unattended reliability boundaries" {
                 summary = "Changed the implementation."
                 targetedTest = [pscustomobject]@{
                     available = $false
-                    filePath = ""
+                    executable = ""
                     arguments = @()
                 }
             }
@@ -1071,7 +1071,7 @@ Describe "Unattended reliability boundaries" {
                 summary = "candidate fix"
                 changedPaths = @()
                 targetedTest = [pscustomobject]@{
-                    filePath = "dotnet"
+                    executable = "dotnet"
                     arguments = @("test", ".\review-loop-test.proj", "--no-restore", "--nologo")
                     rationale = "targeted regression"
                 }

@@ -1327,9 +1327,15 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         '{"schemaVersion":"2.0","summary":"Any approach.","approach":"Replace the subsystem if useful.","steps":[],"considerations":[]}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\architecture-advice-v2.schema.json") |
             Should Be $true
-        '{"schemaVersion":"2.0","summary":"Done.","targetedTest":{"available":false,"filePath":"","arguments":[]}}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v2.schema.json") |
+        '{"schemaVersion":"3.0","summary":"Done.","targetedTest":{"available":false,"executable":"","arguments":[]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
             Should Be $true
+        '{"schemaVersion":"3.0","summary":"Done.","targetedTest":{"available":true,"executable":"dotnet","arguments":["test","tests/Project.Tests.csproj"]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"3.0","summary":"Ambiguous.","targetedTest":{"available":true,"filePath":"tests/Project.Tests.csproj","arguments":[]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
+            Should Be $false
     }
 
     It "keeps the complete free-role prompts stable" {
@@ -1350,6 +1356,9 @@ Repository context:
 Recent history:
 {{HISTORY}}
 
+Workflow:
+Reviewer findings → Architect advice [current role] → Fixer changes → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+
 Result:
 Return your advice in the supplied structured format.
 '@
@@ -1369,8 +1378,11 @@ Architectural advice:
 Previous feedback:
 {{FEEDBACK}}
 
-Execution context:
-The orchestrator observes repository changes, can execute the returned targeted test, runs the configured host gates, and owns the commit.
+Workflow:
+Reviewer findings → Architect advice → Fixer changes [current role] → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+
+Targeted test:
+`targetedTest.executable` is the program started by the orchestrator, for example `dotnet`, `pwsh`, or a repository wrapper. Project, script, test, and filter values belong in `targetedTest.arguments`; for `dotnet test`, `dotnet` is the executable and `test` is the first argument.
 
 Result:
 Return your work summary and targeted-test information in the supplied structured format.
@@ -1390,6 +1402,9 @@ Architectural advice:
 
 Fixer result and targeted-test execution:
 {{FIXER_RESULT}}
+
+Workflow:
+Reviewer findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Result:
 Return your decision and any feedback in the supplied structured format.
@@ -1447,10 +1462,15 @@ Return your decision and any feedback in the supplied structured format.
         $verifier | Should Match 'Fixer result and targeted-test execution'
     }
 
-    It "describes the fixer's mechanical orchestration context" {
+    It "gives each free role the shared workflow and marks its current position" {
+        foreach ($name in @("architect.md", "fixer.md", "verifier.md")) {
+            $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$name")
+            $prompt | Should Match 'Reviewer findings.+Architect advice.+Fixer changes.+Verifier decision'
+            $prompt | Should Match '\[current role\]'
+            $prompt | Should Match 'orchestrator runs tests and host gates and commits accepted changes'
+        }
         $fixer = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\fixer.md")
-        $fixer | Should Match 'observes repository changes'
-        $fixer | Should Match 'owns the commit'
+        $fixer | Should Match 'targetedTest\.executable'
     }
 
     It "has no direct HTTP model invocation in active code" {
@@ -1851,7 +1871,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] restart budget defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
-        $fixer = '{"schemaVersion":"2.0","summary":"Handled it.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixer = '{"schemaVersion":"3.0","summary":"Handled it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $verifier = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
@@ -1896,7 +1916,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] live reload defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the defect.","approach":"Update the affected behavior.","steps":["Change the implementation."],"considerations":[]}'
-        $fixChanged = '{"schemaVersion":"2.0","summary":"Fixed the defect.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixChanged = '{"schemaVersion":"3.0","summary":"Fixed the defect.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The solution is acceptable.","feedback":[]}'
         $clean = "No findings."
         $plans = @(
@@ -2026,7 +2046,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
-        $fixed = '{"schemaVersion":"2.0","summary":"Completed the partial work.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixed = '{"schemaVersion":"3.0","summary":"Completed the partial work.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
@@ -2071,7 +2091,7 @@ Describe "End-to-end orchestration with fake Codex" {
             ForEach-Object { $_ | ConvertFrom-Json })
         $fixerRecords = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "fixer-result-v2.schema.json"
+                "fixer-result-v3.schema.json"
         })
         $fixerRecords.Count | Should Be 2
         $fixerRecords[1].callKind | Should Be "exec"
@@ -2087,7 +2107,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] repeated partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
-        $fixed = '{"schemaVersion":"2.0","summary":"Applied a later clean fix.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixed = '{"schemaVersion":"3.0","summary":"Applied a later clean fix.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
@@ -2168,7 +2188,7 @@ Describe "End-to-end orchestration with fake Codex" {
                 -Attempt 1 -FailureReason "interrupted" -Correction 1 | Out-Null
         } $state $checkpoint.StatePath $ledger $checkpoint.LedgerPath $repo $checkpoint.RunRoot
 
-        $fixed = '{"schemaVersion":"2.0","summary":"Finished after restart.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixed = '{"schemaVersion":"3.0","summary":"Finished after restart.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
             [pscustomobject]@{
@@ -2206,10 +2226,10 @@ Describe "End-to-end orchestration with fake Codex" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v2.schema.json"
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v3.schema.json"
         $findingReview = "- [P1] cache defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the cache defect.","approach":"Update the affected cache behavior.","steps":[],"considerations":[]}'
-        $fixChanged = '{"schemaVersion":"2.0","summary":"Updated the cache.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixChanged = '{"schemaVersion":"3.0","summary":"Updated the cache.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $stillOpen = '{"schemaVersion":"3.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."]}'
         $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The defect is resolved.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
@@ -2230,7 +2250,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object {
             $_.callKind -eq "resume" -and
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
@@ -2247,7 +2267,7 @@ Describe "End-to-end orchestration with fake Codex" {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
-        $fixChanged = '{"schemaVersion":"2.0","summary":"Changed the implementation.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixChanged = '{"schemaVersion":"3.0","summary":"Changed the implementation.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $reproduced = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Try another approach."]}'
         $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
@@ -2287,7 +2307,7 @@ Describe "End-to-end orchestration with fake Codex" {
         @($ledger.Findings | Where-Object { $_.Status -eq "blocked" }).Count | Should Be 0
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json" -and
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json" -and
             $_.callKind -eq "exec"
         }).Count | Should Be 2
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 4
@@ -2361,13 +2381,13 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $ambiguousReview = "The cache lifetime changes when a caller repeats the operation."
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the cache behavior.","steps":[],"considerations":[]}'
-        $fixerV2 = '{"schemaVersion":"2.0","summary":"Applied the advice.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $ambiguousReview,
             '{"schemaVersion":"1.0","hasFindings":true}',
             $architectureV2,
-            $fixerV2,
+            $fixerV3,
             $verifierV3,
             "No findings."
         )
@@ -2483,10 +2503,10 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
     It "passes native review output and architect advice forward without side roles" {
         $nativeReview = "- [P1] first defect at src/A.cs:10`n- [P2] second defect at src/B.cs:20"
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Use one coherent change.","approach":"Change both affected paths together.","steps":["Update A.","Update B."],"considerations":["Keep the public behavior."]}'
-        $fixerV2 = '{"schemaVersion":"2.0","summary":"Applied the advice.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $nativeReview, $architectureV2, $fixerV2, $verifierV3,
+            $nativeReview, $architectureV2, $fixerV3, $verifierV3,
             'No findings.', 'No findings.'
         )
 
@@ -2500,7 +2520,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         ([string]$architectCalls[0].prompt).Replace("`r`n", "`n") |
             Should Match ([regex]::Escape($nativeReview))
         $fixerCall = @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         })[0]
         [string]$fixerCall.prompt | Should Match ([regex]::Escape(
             '"approach":"Change both affected paths together."'))
@@ -2515,14 +2535,14 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
 
     It "lets the verifier request another fixer call without adjudication" {
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
-        $fixerV2 = '{"schemaVersion":"2.0","summary":"Worked on it.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $fixerV3 = '{"schemaVersion":"3.0","summary":"Worked on it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $rejectV3 = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Handle the remaining case."]}'
         $acceptV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             '- [P1] defect at src/A.cs:10',
             $architectureV2,
-            $fixerV2, $rejectV3,
-            $fixerV2, $acceptV3,
+            $fixerV3, $rejectV3,
+            $fixerV3, $acceptV3,
             'No findings.', 'No findings.'
         )
 
@@ -2530,7 +2550,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $result.Status | Should Be "completed"
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "verifier-result-v3.schema.json"

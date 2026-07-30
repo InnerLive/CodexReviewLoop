@@ -389,7 +389,7 @@ function Invoke-ReviewLoopTargetedTests {
         [bool]$test.available
     }
     else {
-        $null -ne $test -and -not [string]::IsNullOrWhiteSpace([string]$test.filePath)
+        $null -ne $test -and -not [string]::IsNullOrWhiteSpace([string]$test.executable)
     }
     if ($null -ne $test -and -not $available) {
         $FixerResult | Add-Member -Force -NotePropertyName testExecution -NotePropertyValue ([pscustomobject]@{
@@ -409,7 +409,7 @@ function Invoke-ReviewLoopTargetedTests {
         }
     }
     if ($null -eq $test -or
-        [string]::IsNullOrWhiteSpace([string]$test.filePath) -or
+        [string]::IsNullOrWhiteSpace([string]$test.executable) -or
         $test.arguments -is [string]) {
         return [pscustomobject]@{
             Success = $false
@@ -421,20 +421,20 @@ function Invoke-ReviewLoopTargetedTests {
 
     $arguments = @($test.arguments | ForEach-Object { [string]$_ })
     try {
-        Resolve-ReviewLoopHostExecutable -RepoPath $RepoPath -FilePath ([string]$test.filePath) | Out-Null
+        Resolve-ReviewLoopHostExecutable -RepoPath $RepoPath -FilePath ([string]$test.executable) | Out-Null
     }
     catch {
         return [pscustomobject]@{
             Success = $false
             Correctable = $true
-            Feedback = "The targeted test executable '$($test.filePath)' could not be resolved: $($_.Exception.Message)"
+            Feedback = "The targeted test executable '$($test.executable)' could not be resolved: $($_.Exception.Message)"
             Results = @()
         }
     }
 
     $gate = @{
         Name = "Targeted regression test"
-        FilePath = [string]$test.filePath
+        FilePath = [string]$test.executable
         Arguments = $arguments
     }
     $result = Invoke-ReviewLoopHostGate `
@@ -456,7 +456,7 @@ function Invoke-ReviewLoopTargetedTests {
         Correctable = [int]$result.ExitCode -eq -1
         Feedback = if ($result.Success) { "" } else {
             $excerpt = @(Get-ReviewLoopTextExcerpt -Text $result.Output -MaxLines 6) -join " "
-            "Targeted regression test failed: $($test.filePath) $($arguments -join ' '). Exit code $($result.ExitCode). $excerpt"
+            "Targeted regression test failed: $($test.executable) $($arguments -join ' '). Exit code $($result.ExitCode). $excerpt"
         }
         Results = @($result)
     }
@@ -1389,12 +1389,12 @@ function Invoke-ReviewLoopAttemptAssessment {
         -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
         -Attempt $Attempt -CodexPath $CodexPath
     $targetedTest = $FixerCall.StructuredResult.targetedTest
-    $targetedCommand = "$($targetedTest.filePath) $(@($targetedTest.arguments) -join ' ')".Trim()
+    $targetedCommand = "$($targetedTest.executable) $(@($targetedTest.arguments) -join ' ')".Trim()
     $targetedAvailable = if ($targetedTest.PSObject.Properties.Name -contains "available") {
         [bool]$targetedTest.available
     }
     else {
-        -not [string]::IsNullOrWhiteSpace([string]$targetedTest.filePath)
+        -not [string]::IsNullOrWhiteSpace([string]$targetedTest.executable)
     }
     $targetedState = if (-not $targetedAvailable) {
         "not available"

@@ -203,8 +203,10 @@ decision layers.
   Verifier feedback.
 - Git determines the files actually changed; the Fixer response does not own
   patch scope.
-- A Fixer may return a structured executable plus argument array for one
-  targeted regression test, or state that no targeted test is available.
+- A Fixer may return `targetedTest.executable` plus
+  `targetedTest.arguments` for one targeted regression test, or state that no
+  targeted test is available. The executable is the program the orchestrator
+  starts; project, script, test, and filter paths are arguments.
 - Repository wrappers and arbitrary executables are valid targeted-test
   commands when they resolve from the repository or environment.
 - The orchestrator executes the targeted test independently and records its

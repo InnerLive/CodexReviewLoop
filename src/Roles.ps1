@@ -686,7 +686,7 @@ function Invoke-ReviewLoopFixer {
     }
     return Invoke-ConfiguredCodexRole `
         -Config $Config -Role "Fixer" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v2.schema.json" `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v3.schema.json" `
         -Mode $mode -ThreadId $ThreadId -CodexPath $CodexPath `
         -CallId $stableCallId -State $State -StatePath $StatePath
 }

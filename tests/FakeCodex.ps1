@@ -217,8 +217,8 @@ if ($exitCode -eq 0 -and
             "review-classification-v1.schema.json" {
                 '{"schemaVersion":"1.0","hasFindings":false}'
             }
-            "fixer-result-v2.schema.json" {
-                '{"schemaVersion":"2.0","summary":"No change.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+            "fixer-result-v3.schema.json" {
+                '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
             }
             "verifier-result-v3.schema.json" {
                 '{"schemaVersion":"3.0","accept":false,"summary":"More work is useful.","feedback":[]}'
@@ -259,7 +259,8 @@ if ($exitCode -eq 0 -and
         [System.IO.File]::WriteAllText($resultPath, $result, [System.Text.UTF8Encoding]::new($false))
     }
     $effectiveMutateSchema = switch ($mutateSchema) {
-        "fixer-result-v1.schema.json" { "fixer-result-v2.schema.json" }
+        "fixer-result-v1.schema.json" { "fixer-result-v3.schema.json" }
+        "fixer-result-v2.schema.json" { "fixer-result-v3.schema.json" }
         default { $mutateSchema }
     }
     if (-not [string]::IsNullOrWhiteSpace($effectiveMutateSchema) -and
