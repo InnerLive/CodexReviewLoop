@@ -62,6 +62,13 @@ host gates pass. With `AutoCommit = $false`, it stages that verified tree and
 stops at a resumable checkpoint. The user may create the prepared commit
 manually, or enable `AutoCommit` and resume the same run.
 
+The Verifier proposes a solution-oriented subject, rationale, and list of
+changes for an accepted patch. The orchestrator redacts and normalizes that
+content, prepends `CommitMessagePrefix`, and adds only the targeted-test and
+host-gate evidence that it actually observed passing. Multiple findings are
+listed when one accepted patch resolves them together. The complete message is
+sealed in the pending-commit checkpoint before Git creates the commit.
+
 ## Changes during an active run
 
 The loop reloads these settings from the active profile at safe role, review,
@@ -75,7 +82,8 @@ fix, and commit boundaries:
   gate starts. It is not changed underneath an already running process.
 - `AutoCommit`
 - `CommitMessagePrefix` applies to the next commit that has not yet entered
-  commit preparation. A pending commit keeps its sealed message.
+  commit preparation. A pending commit keeps its complete sealed subject and
+  body.
 - `HostGates` applies to future accepted patches.
 - `Roles` applies to future role calls.
 

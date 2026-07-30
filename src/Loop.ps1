@@ -1150,6 +1150,163 @@ function Assert-ReviewLoopVerifiedWorktreeIsFullyStaged {
     }
 }
 
+function ConvertTo-ReviewLoopCommitLine {
+    param(
+        [AllowNull()][string]$Text,
+        [ValidateRange(1, 4000)][int]$MaxLength
+    )
+
+    $line = ConvertTo-ReviewLoopRedactedText ([string]$Text)
+    $line = [regex]::Replace($line, "[\u0000-\u001f\u007f]+", " ")
+    $line = [regex]::Replace($line, "\s+", " ").Trim()
+    if ($line.Length -gt $MaxLength) {
+        $line = $line.Substring(0, $MaxLength).TrimEnd()
+    }
+    return $line
+}
+
+function Get-ReviewLoopCanonicalCommitMessage {
+    param([AllowNull()][string]$Message)
+
+    return ([string]$Message).
+        Replace("`r`n", "`n").
+        Replace("`r", "`n").
+        Trim()
+}
+
+function New-ReviewLoopCommitMessage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prefix,
+        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [AllowNull()][object]$FixerResult,
+        [AllowNull()][object]$VerificationResult,
+        [AllowEmptyCollection()][object[]]$GateResults = @()
+    )
+
+    $proposal = Get-ReviewLoopObjectProperty `
+        -Object $VerificationResult -Name "commitMessage"
+    $proposedSubject = [string](Get-ReviewLoopObjectProperty `
+        -Object $proposal -Name "subject" -Default "")
+    $subject = ConvertTo-ReviewLoopCommitLine -Text $proposedSubject -MaxLength 120
+    if ([string]::IsNullOrWhiteSpace($subject)) {
+        $fixerSummary = [string](Get-ReviewLoopObjectProperty `
+            -Object $FixerResult -Name "summary" -Default "")
+        $subject = ConvertTo-ReviewLoopCommitLine -Text $fixerSummary -MaxLength 120
+    }
+    if ([string]::IsNullOrWhiteSpace($subject) -and $Findings.Count -gt 0) {
+        $subject = ConvertTo-ReviewLoopCommitLine `
+            -Text ([string]$Findings[0].Title) -MaxLength 120
+    }
+    if ([string]::IsNullOrWhiteSpace($subject)) {
+        $subject = "Resolve verified review findings"
+    }
+
+    $safePrefix = ConvertTo-ReviewLoopCommitLine -Text $Prefix -MaxLength 200
+    $fullSubject = ConvertTo-ReviewLoopCommitLine `
+        -Text "$safePrefix`: $subject" -MaxLength 200
+
+    $rationale = ConvertTo-ReviewLoopCommitLine `
+        -Text ([string](Get-ReviewLoopObjectProperty `
+            -Object $proposal -Name "rationale" -Default "")) `
+        -MaxLength 1000
+    if ([string]::IsNullOrWhiteSpace($rationale)) {
+        $description = if ($Findings.Count -eq 1) {
+            [string](Get-ReviewLoopObjectProperty `
+                -Object $Findings[0] -Name "Description" -Default "")
+        }
+        else {
+            ""
+        }
+        $rationale = ConvertTo-ReviewLoopCommitLine -Text $description -MaxLength 1000
+    }
+    if ([string]::IsNullOrWhiteSpace($rationale)) {
+        $rationale = if ($Findings.Count -eq 1) {
+            "Address the verified review finding."
+        }
+        else {
+            "Address the verified review findings."
+        }
+    }
+
+    $changes = [System.Collections.Generic.List[string]]::new()
+    $seenChanges = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    foreach ($change in @((Get-ReviewLoopObjectProperty `
+        -Object $proposal -Name "changes" -Default @()))) {
+        if ($changes.Count -ge 8) {
+            break
+        }
+        $line = ConvertTo-ReviewLoopCommitLine -Text ([string]$change) -MaxLength 300
+        if (-not [string]::IsNullOrWhiteSpace($line) -and $seenChanges.Add($line)) {
+            [void]$changes.Add($line)
+        }
+    }
+    if ($changes.Count -eq 0) {
+        $fallbackChange = ConvertTo-ReviewLoopCommitLine `
+            -Text ([string](Get-ReviewLoopObjectProperty `
+                -Object $FixerResult -Name "summary" -Default "")) `
+            -MaxLength 300
+        if (-not [string]::IsNullOrWhiteSpace($fallbackChange)) {
+            [void]$changes.Add($fallbackChange)
+        }
+    }
+
+    $sections = [System.Collections.Generic.List[string]]::new()
+    [void]$sections.Add($fullSubject)
+    [void]$sections.Add($rationale)
+    if ($changes.Count -gt 0) {
+        [void]$sections.Add("Changes:`n- $($changes -join "`n- ")")
+    }
+
+    if ($Findings.Count -gt 1) {
+        $findingTitles = @($Findings | ForEach-Object {
+            ConvertTo-ReviewLoopCommitLine -Text ([string]$_.Title) -MaxLength 300
+        } | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        } | Select-Object -Unique)
+        if ($findingTitles.Count -gt 0) {
+            [void]$sections.Add(
+                "Findings addressed:`n- $($findingTitles -join "`n- ")")
+        }
+    }
+
+    $verified = [System.Collections.Generic.List[string]]::new()
+    $seenVerified = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    $testExecution = Get-ReviewLoopObjectProperty `
+        -Object $FixerResult -Name "testExecution"
+    if ($null -ne $testExecution -and
+        [bool](Get-ReviewLoopObjectProperty `
+            -Object $testExecution -Name "Passed" -Default $false) -and
+        -not [string]::IsNullOrWhiteSpace([string](Get-ReviewLoopObjectProperty `
+            -Object $testExecution -Name "FilePath" -Default ""))) {
+        [void]$seenVerified.Add("Targeted regression test")
+        [void]$verified.Add("Targeted regression test")
+    }
+    foreach ($gate in @($GateResults)) {
+        if (-not [bool](Get-ReviewLoopObjectProperty `
+            -Object $gate -Name "Success" -Default $false)) {
+            continue
+        }
+        $name = ConvertTo-ReviewLoopCommitLine `
+            -Text ([string](Get-ReviewLoopObjectProperty `
+                -Object $gate -Name "Name" -Default "")) `
+            -MaxLength 300
+        if (-not [string]::IsNullOrWhiteSpace($name) -and $seenVerified.Add($name)) {
+            [void]$verified.Add($name)
+        }
+    }
+    if ($verified.Count -gt 0) {
+        [void]$sections.Add("Verified:`n- $($verified -join "`n- ")")
+    }
+
+    $message = $sections -join "`n`n"
+    if ($message.Length -gt 4000) {
+        $message = $message.Substring(0, 4000).TrimEnd()
+    }
+    return Get-ReviewLoopCanonicalCommitMessage -Message $message
+}
+
 function Complete-ReviewLoopPendingCommit {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -1211,7 +1368,7 @@ function Complete-ReviewLoopPendingCommit {
             Stop-ReviewLoopBlocked `
                 -Message "Verified changes are staged and ready to commit, but AutoCommit is disabled." `
                 -NextSteps @(
-                    "Commit the staged tree with message '$($pending.Message)', then run the same command again."
+                    "Commit the staged tree with the exact prepared message stored in '$StatePath' under PendingCommit.Message, then run the same command again."
                     "Or set AutoCommit = `$true in the active profile and run the same command again so the loop creates the verified commit."
                 )
         }
@@ -1235,8 +1392,13 @@ function Complete-ReviewLoopPendingCommit {
     $parent = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD^")
     $tree = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD^{tree}")
     $subject = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("show", "-s", "--format=%s", "HEAD")
+    $message = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "show", "-s", "--format=%B", "HEAD"
+    )
     if ($parent -ne $preHead -or $tree -ne [string]$pending.ExpectedTree -or
-        $subject -ne [string]$pending.Message -or -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        (Get-ReviewLoopCanonicalCommitMessage -Message $message) -ne
+            (Get-ReviewLoopCanonicalCommitMessage -Message ([string]$pending.Message)) -or
+        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
         throw "The resulting commit does not match the verified pending commit."
     }
     if ([bool](Get-ReviewLoopObjectProperty -Object $pending -Name "NeedsCurrentGates" -Default $false)) {
@@ -1274,6 +1436,7 @@ function Complete-ReviewLoopFix {
         [Parameter(Mandatory = $true)][string]$LedgerPath,
         [Parameter(Mandatory = $true)][object[]]$Findings,
         [Parameter(Mandatory = $true)][object]$Verification,
+        [AllowNull()][object]$FixerResult = $null,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][object]$ExpectedSnapshot
@@ -1307,9 +1470,12 @@ function Complete-ReviewLoopFix {
         Write-ReviewLoopStatus -Message "No commit was needed; the finding is resolved on the current HEAD." -Kind Success
         return [pscustomobject]@{ Success = $true; Retryable = $false; Feedback = "" }
     }
-    $title = [regex]::Replace([string]$Findings[0].Title, "\s+", " ").Trim()
-    $message = "$($Config.CommitMessagePrefix): $title"
-    if ($message.Length -gt 200) { $message = $message.Substring(0, 200).TrimEnd() }
+    $message = New-ReviewLoopCommitMessage `
+        -Prefix ([string]$Config.CommitMessagePrefix) `
+        -Findings $Findings `
+        -FixerResult $FixerResult `
+        -VerificationResult $Verification.Result `
+        -GateResults @($gates.Results)
     foreach ($finding in $Findings) {
         $finding.Verification = $Verification.Result
     }
@@ -1416,7 +1582,8 @@ function Invoke-ReviewLoopAttemptAssessment {
         $completion = Complete-ReviewLoopFix `
             -Config $Config -State $State -StatePath $StatePath `
             -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
-            -Verification $verification -RepoPath $RepoPath -RunRoot $RunRoot `
+            -Verification $verification -FixerResult $FixerCall.StructuredResult `
+            -RepoPath $RepoPath -RunRoot $RunRoot `
             -ExpectedSnapshot $worktreeSnapshot
         if ($completion.Success) {
             return [pscustomobject]@{ Completed = $true; Feedback = "" }

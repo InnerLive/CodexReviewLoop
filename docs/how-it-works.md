@@ -86,6 +86,9 @@ The Verifier decides directly:
 - `accept = true` continues to host gates and commit.
 - `accept = false` sends its feedback back to the Fixer.
 
+For an accepted patch, it also proposes the semantic commit subject, rationale,
+and key changes. It does not own test claims or Git metadata.
+
 There are no confidence thresholds, majority decisions, or adjudication roles.
 
 ## 5. Gates and commit
@@ -93,6 +96,12 @@ There are no confidence thresholds, majority decisions, or adjudication roles.
 Configured `HostGates` run after acceptance and before every commit. The loop
 then rechecks the patch, stages the exact verified worktree, seals that Git
 tree, and advances `HEAD` only if the expected old value still matches.
+
+After the gates pass, the orchestrator builds the final commit message from the
+Verifier proposal and the test and gate results it directly observed. It
+redacts secrets, records all findings handled by a multi-finding patch, seals
+the complete message in the checkpoint, and verifies the full committed
+message during crash recovery.
 
 The orchestrator owns authoritative tests, staging, and commits. Analysis roles
 must leave the repository unchanged, and the Fixer may edit the worktree but

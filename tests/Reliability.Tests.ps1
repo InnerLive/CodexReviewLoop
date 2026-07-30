@@ -739,6 +739,167 @@ Describe "Unattended reliability boundaries" {
         $after | Should Be $before
     }
 
+    It "builds a redacted structured commit message from accepted evidence" {
+        $findings = @(
+            [pscustomobject]@{
+                Title = "first defect"
+                Description = "The first path is inconsistent."
+            },
+            [pscustomobject]@{
+                Title = "second defect"
+                Description = "The second path is inconsistent."
+            }
+        )
+        $verification = [pscustomobject]@{
+            commitMessage = [pscustomobject]@{
+                subject = "  Preserve`r`nconsistent behavior  "
+                rationale = "Remove password=super-secret-value from the explanation."
+                changes = @(
+                    "Update the first path.",
+                    "Update the first path.",
+                    "Update`n the second path."
+                )
+            }
+        }
+        $fixer = [pscustomobject]@{
+            summary = "Updated the affected behavior."
+            testExecution = [pscustomobject]@{
+                FilePath = "dotnet"
+                Passed = $true
+            }
+        }
+        $gates = @(
+            [pscustomobject]@{ Name = "Solution tests"; Success = $true },
+            [pscustomobject]@{ Name = "Solution tests"; Success = $true },
+            [pscustomobject]@{ Name = "Skipped gate"; Success = $false }
+        )
+
+        $message = & (Get-Module CodexReviewLoop) {
+            param($items, $fix, $decision, $checks)
+            New-ReviewLoopCommitMessage `
+                -Prefix "Reliability" -Findings $items -FixerResult $fix `
+                -VerificationResult $decision -GateResults $checks
+        } $findings $fixer $verification $gates
+
+        $message | Should Match "^Reliability: Preserve consistent behavior"
+        $message | Should Match "password=\[redacted\]"
+        @($message -split "`n" | Where-Object {
+            $_ -eq "- Update the first path."
+        }).Count | Should Be 1
+        $message | Should Match "Findings addressed:`n- first defect`n- second defect"
+        $message | Should Match "Verified:`n- Targeted regression test`n- Solution tests"
+        $message | Should Not Match "Skipped gate|super-secret-value|dotnet"
+    }
+
+    It "bounds commit-message content and falls back to fixer and finding text" {
+        $longText = "x" * 5000
+        $findings = @([pscustomobject]@{
+            Title = "fallback finding"
+            Description = ""
+        })
+        $fixer = [pscustomobject]@{
+            summary = "Fallback fixer summary"
+        }
+        $verification = [pscustomobject]@{
+            commitMessage = [pscustomobject]@{
+                subject = ""
+                rationale = $longText
+                changes = @($longText)
+            }
+        }
+
+        $message = & (Get-Module CodexReviewLoop) {
+            param($items, $fix, $decision)
+            New-ReviewLoopCommitMessage `
+                -Prefix ("p" * 180) -Findings $items -FixerResult $fix `
+                -VerificationResult $decision
+        } $findings $fixer $verification
+
+        ($message -split "`n")[0].Length | Should Be 200
+        ($message -split "`n")[0] | Should Match "Fallback fixer"
+        $message.Length | Should BeLessThan 4001
+        $message | Should Match "Changes:"
+        $message | Should Not Match "Verified:"
+    }
+
+    It "commits the structured message with authoritative gate evidence" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.HostGates = @(@{
+            Name = "Solution tests"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+        })
+        $runRoot = Join-Path $caseRoot "structured-message-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "structured-message-ledger.json"
+        $head = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fix"
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $head | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $head
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $verification = [pscustomobject]@{
+            Result = [pscustomobject]@{
+                schemaVersion = "4.0"
+                accept = $true
+                summary = "Accepted."
+                feedback = @()
+                commitMessage = [pscustomobject]@{
+                    subject = "Fix dependency-aware cache invalidation"
+                    rationale = "Keep cached values aligned with their dependencies."
+                    changes = @(
+                        "Track the missing dependency.",
+                        "Invalidate affected cache entries."
+                    )
+                }
+            }
+        }
+        $fixer = [pscustomobject]@{
+            summary = "Updated cache invalidation."
+            testExecution = [pscustomobject]@{
+                FilePath = "dotnet"
+                Passed = $true
+            }
+        }
+
+        $result = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger,
+                $loopLedgerPath, $loopFinding, $decision, $fix,
+                $repository, $logs, $expected)
+            Complete-ReviewLoopFix `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -Findings @($loopFinding) -Verification $decision `
+                -FixerResult $fix -RepoPath $repository -RunRoot $logs `
+                -ExpectedSnapshot $expected
+        } $config $state $statePath $ledger $ledgerPath $finding `
+            $verification $fixer $repo $runRoot $snapshot
+
+        $result.Success | Should Be $true
+        $subject = & git -C $repo show -s --format=%s HEAD
+        $message = (& git -C $repo show -s --format=%B HEAD | Out-String).Trim()
+        $subject | Should Be "Reliability: Fix dependency-aware cache invalidation"
+        $message | Should Match "Changes:`r?`n- Track the missing dependency\."
+        $message | Should Match "Verified:`r?`n- Targeted regression test`r?`n- Solution tests"
+        $message | Should Not Match "dotnet|-Command"
+        (Read-ReviewLoopState -Path $statePath).PendingCommit |
+            Should BeNullOrEmpty
+    }
+
     It "stages verified work when AutoCommit is disabled and resumes after it is enabled" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $config.AutoCommit = $false
@@ -774,7 +935,7 @@ Describe "Unattended reliability boundaries" {
             PreHead = $preHead
             PatchFingerprint = $fingerprint
             ExpectedTree = ""
-            Message = "Reliability: verified manual commit"
+            Message = "Reliability: verified manual commit`n`nKeep the staged tree intact.`n`nChanges:`n- update README"
             NeedsCurrentGates = $false
         }
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
@@ -796,11 +957,14 @@ Describe "Unattended reliability boundaries" {
         $failure | Should Not BeNullOrEmpty
         $failure.Exception.Data["ReviewLoopStatus"] | Should Be "failed"
         $failure.Exception.Message | Should Match "AutoCommit is disabled"
+        @($failure.Exception.Data["ReviewLoopNextSteps"])[0] |
+            Should Match ([regex]::Escape($statePath))
         (& git -C $repo rev-parse HEAD) | Should Be $preHead
         @(& git -C $repo diff --cached --name-only) | Should Be @("README.txt")
         (Read-ReviewLoopState -Path $statePath).Stage | Should Be "commit_pending"
 
         $config.AutoCommit = $true
+        $config.CommitMessagePrefix = "Changed after preparation"
         $completed = & (Get-Module CodexReviewLoop) {
             param($profile, $loopState, $loopStatePath, $loopLedger, $loopLedgerPath, $repository, $logs)
             Complete-ReviewLoopPendingCommit `
@@ -811,8 +975,81 @@ Describe "Unattended reliability boundaries" {
 
         $completed | Should Be $true
         (& git -C $repo rev-parse HEAD) | Should Not Be $preHead
+        (& git -C $repo show -s --format=%s HEAD) |
+            Should Be "Reliability: verified manual commit"
+        ((& git -C $repo show -s --format=%B HEAD | Out-String).Trim()) |
+            Should Match "Keep the staged tree intact"
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
+    }
+
+    It "recovers an already-created multiline commit from its sealed checkpoint" {
+        $runRoot = Join-Path $caseRoot "multiline-crash-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "multiline-crash-ledger.json"
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "committed before crash"
+        $fingerprint = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+        & git -C $repo add -A
+        $tree = & git -C $repo write-tree
+        $message = @"
+Reliability: recover a multiline commit
+
+Preserve the exact accepted message across restart.
+
+Changes:
+- update README
+"@.Trim()
+        & git -C $repo -c commit.gpgsign=false commit -q -m $message
+        $committedHead = & git -C $repo rev-parse HEAD
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $preHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.Verification = [pscustomobject]@{
+            schemaVersion = "4.0"
+            accept = $true
+            summary = "Accepted."
+        }
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $preHead
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.PendingCommit = [pscustomobject]@{
+            PreHead = $preHead
+            PatchFingerprint = $fingerprint
+            ExpectedTree = $tree
+            Message = $message
+            NeedsCurrentGates = $false
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $completed = & (Get-Module CodexReviewLoop) {
+            param($loopState, $loopStatePath, $loopLedger, $loopLedgerPath,
+                $repository, $logs)
+            Complete-ReviewLoopPendingCommit `
+                -Config @{ AutoCommit = $true; HostGates = @() } `
+                -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -RepoPath $repository -RunRoot $logs
+        } $state $statePath $ledger $ledgerPath $repo $runRoot
+
+        $completed | Should Be $true
+        (& git -C $repo rev-parse HEAD) | Should Be $committedHead
+        ((& git -C $repo show -s --format=%B HEAD | Out-String).Trim()).
+            Replace("`r`n", "`n") |
+            Should Be $message.Replace("`r`n", "`n")
+        (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status |
+            Should Be "resolved"
     }
 
     It "refuses a verified change that remains unstaged before advancing HEAD" {
@@ -877,7 +1114,7 @@ Describe "Unattended reliability boundaries" {
                 }
             }
         }
-        $result = '{"schemaVersion":"3.0","accept":false,"summary":"Still present.","feedback":["Inspect the current path."]}'
+        $result = '{"schemaVersion":"4.0","accept":false,"summary":"Still present.","feedback":["Inspect the current path."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
         $sequence = Join-Path $caseRoot "large-verifier-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($result)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence

@@ -1336,6 +1336,15 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         '{"schemaVersion":"3.0","summary":"Ambiguous.","targetedTest":{"available":true,"filePath":"tests/Project.Tests.csproj","arguments":[]}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
             Should Be $false
+        '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct.","changes":["Update the implementation."]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+            Should Be $false
     }
 
     It "keeps the complete free-role prompts stable" {
@@ -1406,8 +1415,13 @@ Fixer result and targeted-test execution:
 Workflow:
 Reviewer findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
+Commit message:
+When accepting, propose a solution-oriented subject, a brief rationale, and the key changes. Keep the subject concise, ideally within 72 characters before the configured prefix, and follow the repository's established language and style when clear. Leave test and host-gate evidence, Git trailers, and authorship out; the orchestrator adds verified evidence.
+
+When requesting changes, return an empty subject, an empty rationale, and an empty changes list.
+
 Result:
-Return your decision and any feedback in the supplied structured format.
+Return your decision, feedback, and commit-message proposal in the supplied structured format.
 '@
         }
         foreach ($name in $expected.Keys) {
@@ -1872,7 +1886,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] restart budget defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Handled it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifier = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the restart budget defect","rationale":"Keep restart budgets independent.","changes":["Preserve the resumed review state."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
             [pscustomobject]@{
@@ -1917,7 +1931,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] live reload defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the defect.","approach":"Update the affected behavior.","steps":["Change the implementation."],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Fixed the defect.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The solution is acceptable.","feedback":[]}'
+        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"The solution is acceptable.","feedback":[],"commitMessage":{"subject":"Fix the live reload defect","rationale":"Apply live settings at safe boundaries.","changes":["Reload the configured settings."]}}'
         $clean = "No findings."
         $plans = @(
             [pscustomobject]@{
@@ -2047,7 +2061,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
         $fixed = '{"schemaVersion":"3.0","summary":"Completed the partial work.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Complete the interrupted fix","rationale":"Preserve completed work across restart.","changes":["Finish the recovered implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
             [pscustomobject]@{ result = $architecture }
@@ -2108,7 +2122,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] repeated partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
         $fixed = '{"schemaVersion":"3.0","summary":"Applied a later clean fix.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Apply the recovered fix","rationale":"Retain the verified recovery result.","changes":["Complete the recovered implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
             [pscustomobject]@{ result = $architecture }
@@ -2189,7 +2203,7 @@ Describe "End-to-end orchestration with fake Codex" {
         } $state $checkpoint.StatePath $ledger $checkpoint.LedgerPath $repo $checkpoint.RunRoot
 
         $fixed = '{"schemaVersion":"3.0","summary":"Finished after restart.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Finish the restarted fix","rationale":"Complete the preserved work after restart.","changes":["Apply the remaining correction."]}}'
         $plans = @(
             [pscustomobject]@{
                 result = $fixed
@@ -2230,8 +2244,8 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] cache defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the cache defect.","approach":"Update the affected cache behavior.","steps":[],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Updated the cache.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $stillOpen = '{"schemaVersion":"3.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."]}'
-        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The defect is resolved.","feedback":[]}'
+        $stillOpen = '{"schemaVersion":"4.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"The defect is resolved.","feedback":[],"commitMessage":{"subject":"Fix the cache defect","rationale":"Keep cache behavior consistent.","changes":["Update the affected cache path."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $findingReview,
             $architecture,
@@ -2268,8 +2282,8 @@ Describe "End-to-end orchestration with fake Codex" {
         $findingReview = "- [P1] defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Changed the implementation.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $reproduced = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Try another approach."]}'
-        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $reproduced = '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":["Try another approach."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the reproduced defect","rationale":"Address the verified failure mode.","changes":["Apply the corrected implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
             [pscustomobject]@{ result = $architecture },
@@ -2382,13 +2396,13 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $ambiguousReview = "The cache lifetime changes when a caller repeats the operation."
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the cache behavior.","steps":[],"considerations":[]}'
         $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $verifierV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the cache behavior","rationale":"Keep repeated operations consistent.","changes":["Apply the architecture advice."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $ambiguousReview,
             '{"schemaVersion":"1.0","hasFindings":true}',
             $architectureV2,
             $fixerV3,
-            $verifierV3,
+            $verifierV4,
             "No findings."
         )
 
@@ -2504,9 +2518,9 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $nativeReview = "- [P1] first defect at src/A.cs:10`n- [P2] second defect at src/B.cs:20"
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Use one coherent change.","approach":"Change both affected paths together.","steps":["Update A.","Update B."],"considerations":["Keep the public behavior."]}'
         $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $verifierV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix both affected paths","rationale":"Keep the related behavior coherent.","changes":["Update the first path.","Update the second path."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $nativeReview, $architectureV2, $fixerV3, $verifierV3,
+            $nativeReview, $architectureV2, $fixerV3, $verifierV4,
             'No findings.', 'No findings.'
         )
 
@@ -2536,13 +2550,13 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
     It "lets the verifier request another fixer call without adjudication" {
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
         $fixerV3 = '{"schemaVersion":"3.0","summary":"Worked on it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $rejectV3 = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Handle the remaining case."]}'
-        $acceptV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $rejectV4 = '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":["Handle the remaining case."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $acceptV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Finish the remaining case","rationale":"Cover the complete affected behavior.","changes":["Handle the remaining case."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             '- [P1] defect at src/A.cs:10',
             $architectureV2,
-            $fixerV3, $rejectV3,
-            $fixerV3, $acceptV3,
+            $fixerV3, $rejectV4,
+            $fixerV3, $acceptV4,
             'No findings.', 'No findings.'
         )
 
@@ -2553,7 +2567,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
         @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "verifier-result-v3.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "verifier-result-v4.schema.json"
         }).Count | Should Be 2
         @($records | Where-Object {
             [string]$_.schemaPath -match 'confirm|tie'

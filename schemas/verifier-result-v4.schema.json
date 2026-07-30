@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "4.0" },
+    "accept": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "feedback": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "commitMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "subject": { "type": "string" },
+        "rationale": { "type": "string" },
+        "changes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["subject", "rationale", "changes"]
+    }
+  },
+  "required": ["schemaVersion", "accept", "summary", "feedback", "commitMessage"]
+}

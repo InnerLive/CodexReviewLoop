@@ -220,8 +220,8 @@ if ($exitCode -eq 0 -and
             "fixer-result-v3.schema.json" {
                 '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
             }
-            "verifier-result-v3.schema.json" {
-                '{"schemaVersion":"3.0","accept":false,"summary":"More work is useful.","feedback":[]}'
+            "verifier-result-v4.schema.json" {
+                '{"schemaVersion":"4.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
             }
             default {
                 '{}'

@@ -719,7 +719,7 @@ function Invoke-ReviewLoopVerifier {
     $verificationKey = (Get-ReviewLoopSha256 $fixerCallId).Substring(0, 12)
     $call = Invoke-ConfiguredCodexRole `
         -Config $Config -Role "Verifier" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v3.schema.json" `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v4.schema.json" `
         -CodexPath $CodexPath `
         -CallId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-verify-$verificationKey" `
         -State $State -StatePath $StatePath
