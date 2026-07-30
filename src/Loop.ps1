@@ -286,7 +286,8 @@ function Invoke-ReviewLoopHostGate {
         [Parameter(Mandatory = $true)][hashtable]$Gate,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$ClusterId,
-        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 1800
+        [Alias("TimeoutSeconds")][long]$InactivityTimeoutSeconds = 1800,
+        [long]$AbsoluteTimeoutSeconds = 0
     )
 
     $name = [string]$Gate.Name
@@ -307,7 +308,8 @@ function Invoke-ReviewLoopHostGate {
             -StdoutPath $logPath `
             -StderrPath $stderrPath `
             -EventKind HostGate `
-            -TimeoutSeconds $TimeoutSeconds
+            -InactivityTimeoutSeconds $InactivityTimeoutSeconds `
+            -AbsoluteTimeoutSeconds $AbsoluteTimeoutSeconds
         $exitCode = $observed.ExitCode
         $text = "$($observed.Stdout)`n$($observed.Stderr)"
         $duration = Format-ReviewLoopDuration -Duration $observed.Duration
@@ -344,13 +346,23 @@ function Invoke-ReviewLoopHostGates {
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$HostGates,
         [Parameter(Mandatory = $true)][string]$RunRoot,
-        [Parameter(Mandatory = $true)][string]$ClusterId
+        [Parameter(Mandatory = $true)][string]$ClusterId,
+        [long]$InactivityTimeoutSeconds = 1800,
+        [AllowNull()][hashtable]$Config = $null
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($gate in $HostGates) {
+        if ($null -ne $Config) {
+            Update-ReviewLoopLiveConfig -Config $Config
+            Assert-ReviewLoopExecutionUnchanged -Config $Config
+            $InactivityTimeoutSeconds =
+                Get-ReviewLoopInactivityTimeoutSeconds -Config $Config
+        }
         $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-        $result = Invoke-ReviewLoopHostGate -RepoPath $RepoPath -Gate $gate -RunRoot $RunRoot -ClusterId $ClusterId
+        $result = Invoke-ReviewLoopHostGate `
+            -RepoPath $RepoPath -Gate $gate -RunRoot $RunRoot -ClusterId $ClusterId `
+            -InactivityTimeoutSeconds $InactivityTimeoutSeconds
         Assert-ReviewLoopRepositoryUnchanged `
             -RepoPath $RepoPath -Snapshot $snapshot -Operation "Host gate '$($gate.Name)'"
         [void]$results.Add($result)
@@ -367,7 +379,8 @@ function Invoke-ReviewLoopTargetedTests {
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$ClusterId,
-        [Parameter(Mandatory = $true)][int]$Attempt
+        [Parameter(Mandatory = $true)][int]$Attempt,
+        [long]$InactivityTimeoutSeconds = 1800
     )
 
     $test = $FixerResult.targetedTest
@@ -428,7 +441,8 @@ function Invoke-ReviewLoopTargetedTests {
         -RepoPath $RepoPath `
         -Gate $gate `
         -RunRoot $RunRoot `
-        -ClusterId "$ClusterId-fix-$Attempt"
+        -ClusterId "$ClusterId-fix-$Attempt" `
+        -InactivityTimeoutSeconds $InactivityTimeoutSeconds
     $FixerResult | Add-Member -Force -NotePropertyName testExecution -NotePropertyValue ([pscustomobject]@{
         FilePath = [string]$result.FilePath
         Arguments = @($result.Arguments)
@@ -1042,6 +1056,12 @@ function Clear-ReviewLoopActiveCluster {
     $State.ActiveReviewText = ""
     $State.ActiveStrategy = $null
     $State.LastFixerResult = $null
+    if ($State.PSObject.Properties.Name -contains "PartialFixRecovery") {
+        $State.PartialFixRecovery = $null
+    }
+    else {
+        $State | Add-Member -NotePropertyName PartialFixRecovery -NotePropertyValue $null
+    }
     if ($State.PSObject.Properties.Name -contains "PendingCommit") {
         $State.PendingCommit = $null
     }
@@ -1088,7 +1108,8 @@ function Invoke-ReviewLoopGitStep {
         Name = $Name
         FilePath = "git"
         Arguments = $Arguments
-    } -RunRoot $RunRoot -ClusterId $ClusterId -TimeoutSeconds 300
+    } -RunRoot $RunRoot -ClusterId $ClusterId `
+        -InactivityTimeoutSeconds 0 -AbsoluteTimeoutSeconds 300
     if (-not $result.Success) {
         $excerpt = @(Get-ReviewLoopTextExcerpt -Text $result.Output -MaxLines 6) -join " "
         throw "$Name failed with exit code $($result.ExitCode): $excerpt"
@@ -1219,10 +1240,14 @@ function Complete-ReviewLoopPendingCommit {
         throw "The resulting commit does not match the verified pending commit."
     }
     if ([bool](Get-ReviewLoopObjectProperty -Object $pending -Name "NeedsCurrentGates" -Default $false)) {
+        Update-ReviewLoopLiveConfig -Config $Config
+        Assert-ReviewLoopExecutionUnchanged -Config $Config
         $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
         $gates = Invoke-ReviewLoopHostGates `
             -RepoPath $RepoPath -HostGates @($Config.HostGates) `
-            -RunRoot $RunRoot -ClusterId $State.ActiveClusterId
+            -RunRoot $RunRoot -ClusterId $State.ActiveClusterId `
+            -InactivityTimeoutSeconds (Get-ReviewLoopInactivityTimeoutSeconds -Config $Config) `
+            -Config $Config
         Assert-ReviewLoopRepositoryUnchanged `
             -RepoPath $RepoPath -Snapshot $snapshot -Operation "A requalification host gate"
         if (-not $gates.Success) {
@@ -1254,12 +1279,15 @@ function Complete-ReviewLoopFix {
         [Parameter(Mandatory = $true)][object]$ExpectedSnapshot
     )
 
+    Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $gates = Invoke-ReviewLoopHostGates `
         -RepoPath $RepoPath `
         -HostGates @($Config.HostGates) `
         -RunRoot $RunRoot `
-        -ClusterId $State.ActiveClusterId
+        -ClusterId $State.ActiveClusterId `
+        -InactivityTimeoutSeconds (Get-ReviewLoopInactivityTimeoutSeconds -Config $Config) `
+        -Config $Config
     Assert-ReviewLoopRepositoryUnchanged `
         -RepoPath $RepoPath -Snapshot $ExpectedSnapshot -Operation "A host gate"
     if (-not $gates.Success) {
@@ -1335,12 +1363,15 @@ function Invoke-ReviewLoopAttemptAssessment {
         -Kind $(if ($changedPaths.Count -gt 0) { "Success" } else { "Warning" })
 
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "testing"
+    Update-ReviewLoopLiveConfig -Config $Config
+    Assert-ReviewLoopExecutionUnchanged -Config $Config
     $tests = Invoke-ReviewLoopTargetedTests `
         -FixerResult $FixerCall.StructuredResult `
         -RepoPath $RepoPath `
         -RunRoot $RunRoot `
         -ClusterId $State.ActiveClusterId `
-        -Attempt $Attempt
+        -Attempt $Attempt `
+        -InactivityTimeoutSeconds (Get-ReviewLoopInactivityTimeoutSeconds -Config $Config)
     Assert-ReviewLoopRepositoryUnchanged `
         -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "The targeted test"
     if (-not $tests.Success) {
@@ -1416,15 +1447,28 @@ function Restart-ReviewLoopReviewRound {
         [Parameter(Mandatory = $true)][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
-        [Parameter(Mandatory = $true)][int]$Attempt
+        [Parameter(Mandatory = $true)][int]$Attempt,
+        [string]$Reason = ""
     )
 
     try {
-        $artifact = Get-ReviewLoopBlockedArtifact `
-            -State $State -RepoPath $RepoPath -RunRoot $RunRoot `
-            -ClusterId "$($State.ActiveClusterId)-c$($State.ReviewCycle)" -Attempt $Attempt
-        if ($null -ne $artifact) {
-            Restore-ReviewLoopBlockedWorktree -RepoPath $RepoPath -Cleanup $artifact
+        if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+            $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+            if ($null -eq $State.LastFixerResult) {
+                $State.LastFixerResult = [pscustomobject]@{}
+            }
+            $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeFingerprint `
+                -NotePropertyValue ([string]$snapshot.Fingerprint)
+            $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
+                -NotePropertyValue ([string]$snapshot.Head)
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+            $artifact = Get-ReviewLoopBlockedArtifact `
+                -State $State -RepoPath $RepoPath -RunRoot $RunRoot `
+                -ClusterId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-restart" `
+                -Attempt $Attempt
+            if ($null -ne $artifact) {
+                Restore-ReviewLoopBlockedWorktree -RepoPath $RepoPath -Cleanup $artifact
+            }
         }
     }
     catch {
@@ -1446,12 +1490,70 @@ function Restart-ReviewLoopReviewRound {
         $finding.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     }
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
+    $restartMessage = if ([string]::IsNullOrWhiteSpace($Reason)) {
+        "Fixer round reached $Attempt calls without acceptance; restarting with the native Reviewer."
+    }
+    else {
+        "$Reason Restarting with the native Reviewer."
+    }
     Write-ReviewLoopStatus `
-        -Message "Fixer round reached $Attempt calls without acceptance; restarting with the native Reviewer." `
+        -Message $restartMessage `
         -Kind Info
     Clear-ReviewLoopActiveCluster `
         -State $State -StatePath $StatePath -Stage "review_round_requested"
     return $false
+}
+
+function Save-ReviewLoopPartialFixRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][int]$Attempt,
+        [Parameter(Mandatory = $true)][string]$FailureReason,
+        [Parameter(Mandatory = $true)][int]$Correction
+    )
+
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$snapshot.Head -ne [string]$State.CurrentHead) {
+        Stop-ReviewLoopBlocked -Message "HEAD changed before partial Fixer work could be preserved."
+    }
+    if ($null -eq $State.LastFixerResult) {
+        $State.LastFixerResult = [pscustomobject]@{}
+    }
+    $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeFingerprint `
+        -NotePropertyValue ([string]$snapshot.Fingerprint)
+    $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
+        -NotePropertyValue ([string]$snapshot.Head)
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+
+    $artifact = Get-ReviewLoopBlockedArtifact `
+        -State $State -RepoPath $RepoPath -RunRoot $RunRoot `
+        -ClusterId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-partial" `
+        -Attempt $Attempt
+    if ($null -eq $artifact) {
+        throw "The Fixer reported partial mutation, but Git exposed no worktree change to preserve."
+    }
+    $recovery = [pscustomobject][ordered]@{
+        SchemaVersion = "1.0"
+        Attempt = $Attempt
+        Correction = $Correction
+        Head = [string]$artifact.Head
+        WorktreeFingerprint = [string]$artifact.WorktreeFingerprint
+        ArtifactRoot = [string]$artifact.ArtifactRoot
+        ManifestPath = [string]$artifact.ManifestPath
+        ChangedPaths = @($artifact.ChangedPaths)
+        FailureReason = $FailureReason
+        CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+    }
+    $State | Add-Member -Force -NotePropertyName PartialFixRecovery -NotePropertyValue $recovery
+    Set-ReviewLoopCheckpoint `
+        -State $State -StatePath $StatePath -Stage "fixer_partial_captured"
+    Write-ReviewLoopStatus `
+        -Message "Partial Fixer work was preserved at '$($artifact.ArtifactRoot)'; starting one fresh recovery thread." `
+        -Kind Warning
+    return $recovery
 }
 
 function Invoke-ReviewLoopFixWorkflow {
@@ -1472,9 +1574,11 @@ function Invoke-ReviewLoopFixWorkflow {
     $attempt = [int](@($Findings | ForEach-Object { [int]$_.FixAttempts } |
         Measure-Object -Maximum).Maximum)
     $threadId = [string]$Findings[0].FixerThreadId
+    $partialRecovery = Get-ReviewLoopObjectProperty -Object $State -Name "PartialFixRecovery"
     if ($Recover -and [string]::IsNullOrWhiteSpace($threadId) -and $attempt -gt 0 -and
         $null -eq (Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall") -and
-        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath) -and
+        $null -eq $partialRecovery) {
         Stop-ReviewLoopBlocked -Message "Interrupted legacy fixer checkpoint has no resumable role thread."
     }
     if (-not [string]::IsNullOrWhiteSpace($threadId)) {
@@ -1490,6 +1594,20 @@ function Invoke-ReviewLoopFixWorkflow {
     }
     else {
         0
+    }
+    if ($null -ne $partialRecovery) {
+        $threadId = ""
+        foreach ($finding in $Findings) { $finding.FixerThreadId = "" }
+        $technicalCorrections = [Math]::Max(
+            $technicalCorrections,
+            [int](Get-ReviewLoopObjectProperty `
+                -Object $partialRecovery -Name "Correction" -Default 1))
+        $retryCurrentAttempt = $true
+        $feedback = @(
+            "The previous Fixer process ended after changing the worktree without producing a resumable thread."
+            "Inspect the current diff, preserve correct partial work, and complete the same finding."
+            "Technical failure: $([string](Get-ReviewLoopObjectProperty -Object $partialRecovery -Name 'FailureReason' -Default 'unknown'))"
+        ) -join [Environment]::NewLine
     }
     $storedAttempt = [int](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "Attempt" -Default -1)
@@ -1540,9 +1658,13 @@ function Invoke-ReviewLoopFixWorkflow {
     elseif ($retryCurrentAttempt) {
         if ($storedFailureKind -eq "unsafe_partial_mutation" -and
             [string]::IsNullOrWhiteSpace($threadId)) {
-            Stop-ReviewLoopBlocked -Message "The interrupted fixer changed the worktree without a resumable Codex thread."
+            if ($null -eq $partialRecovery) {
+                Stop-ReviewLoopBlocked -Message "Interrupted legacy Fixer work has no preserved recovery artifact."
+            }
         }
-        $feedback = "The previous fixer process was interrupted. Inspect and preserve correct partial work before completing the same attempt."
+        if ($null -eq $partialRecovery) {
+            $feedback = "The previous fixer process was interrupted. Inspect and preserve correct partial work before completing the same attempt."
+        }
     }
 
     while ($true) {
@@ -1591,10 +1713,49 @@ function Invoke-ReviewLoopFixWorkflow {
             Attempt = $attempt
             Correction = $technicalCorrections
         }
+        $fixerSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeFingerprint `
+            -NotePropertyValue ([string]$fixerSnapshot.Fingerprint)
+        $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
+            -NotePropertyValue ([string]$fixerSnapshot.Head)
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage $(if ($fixer.Success) {
             "fix_attempted"
         } else { "fixing" })
+        if (-not $fixer.Success) {
+            if ($null -ne $partialRecovery) {
+                return Restart-ReviewLoopReviewRound `
+                    -State $State -StatePath $StatePath `
+                    -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
+                    -RepoPath $RepoPath -RunRoot $RunRoot -Attempt $attempt `
+                    -Reason "The fresh partial-work recovery Fixer also failed technically."
+            }
+            if ([string]$fixer.FailureKind -eq "unsafe_partial_mutation" -and
+                [string]::IsNullOrWhiteSpace([string]$fixer.ThreadId)) {
+                $technicalCorrections++
+                $partialRecovery = Save-ReviewLoopPartialFixRecovery `
+                    -State $State -StatePath $StatePath -RepoPath $RepoPath `
+                    -RunRoot $RunRoot -Attempt $attempt `
+                    -FailureReason ([string]$fixer.FailureReason) `
+                    -Correction $technicalCorrections
+                $threadId = ""
+                foreach ($finding in $Findings) { $finding.FixerThreadId = "" }
+                $feedback = @(
+                    "The previous Fixer process ended after changing the worktree without producing a resumable thread."
+                    "Inspect the current diff, preserve correct partial work, and complete the same finding."
+                    "Technical failure: $($fixer.FailureReason)"
+                ) -join [Environment]::NewLine
+                $retryCurrentAttempt = $true
+                continue
+            }
+            if ([string]$fixer.FailureKind -eq "timeout") {
+                return Restart-ReviewLoopReviewRound `
+                    -State $State -StatePath $StatePath `
+                    -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
+                    -RepoPath $RepoPath -RunRoot $RunRoot -Attempt $attempt `
+                    -Reason "The Fixer remained inactive after its technical recovery attempts."
+            }
+        }
         Assert-ReviewLoopRoleSuccess $fixer
         $assessment = Invoke-ReviewLoopAttemptAssessment `
             -Config $Config -State $State -StatePath $StatePath `
@@ -1684,7 +1845,7 @@ function Resume-ReviewLoopInterruptedFix {
 
     if ([string]$State.Stage -notin @(
         "cluster_selected", "strategy_ready", "fixing", "fix_attempted",
-        "testing", "tested", "test_failed", "verified", "gate_failed"
+        "fixer_partial_captured", "testing", "tested", "test_failed", "verified", "gate_failed"
     ) -or
         @($State.ActiveFindingIds).Count -eq 0) {
         return $false
@@ -1710,6 +1871,52 @@ function Resume-ReviewLoopInterruptedFix {
         -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot `
         -CodexPath $CodexPath -Recover | Out-Null
     return $true
+}
+
+function Test-ReviewLoopRestartReviewException {
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception)
+    return $Exception.Data.Contains("ReviewLoopRestartReview") -and
+        [bool]$Exception.Data["ReviewLoopRestartReview"]
+}
+
+function Restart-ReviewLoopAfterInactivity {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    $ids = @($State.ActiveFindingIds | ForEach-Object { [string]$_ })
+    $findings = if ($ids.Count -eq 0) {
+        @()
+    }
+    else {
+        @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
+    }
+    if ($findings.Count -gt 0) {
+        $attempt = [int](@($findings | ForEach-Object { [int]$_.FixAttempts } |
+            Measure-Object -Maximum).Maximum)
+        Restart-ReviewLoopReviewRound `
+            -State $State -StatePath $StatePath `
+            -Ledger $Ledger -LedgerPath $LedgerPath -Findings $findings `
+            -RepoPath $RepoPath -RunRoot $RunRoot -Attempt $attempt `
+            -Reason $Reason | Out-Null
+        return
+    }
+    if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        Stop-ReviewLoopBlocked -Message "$Reason The worktree changed without an active Fixer finding."
+    }
+    $State.ActiveRoleCall = $null
+    $State.ActiveReviewText = ""
+    $State.CleanPasses = 0
+    $State.CleanHead = ""
+    Set-ReviewLoopCheckpoint `
+        -State $State -StatePath $StatePath -Stage "review_round_requested"
+    Write-ReviewLoopStatus -Message "$Reason Starting a new native Reviewer round." -Kind Warning
 }
 
 function Invoke-ReviewLoopCore {
@@ -2088,9 +2295,22 @@ function Invoke-ReviewLoopCore {
                 $state.ReviewCyclesThisInvocation,
                 $config.MaxReviewCycles
             ) -Kind Review
-            $review = Invoke-ReviewLoopReview `
-                -Config $config -State $state -StatePath $statePath -Ledger $ledger -RepoPath $repo `
-                -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+            try {
+                $review = Invoke-ReviewLoopReview `
+                    -Config $config -State $state -StatePath $statePath -Ledger $ledger -RepoPath $repo `
+                    -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+            }
+            catch {
+                if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
+                    Restart-ReviewLoopAfterInactivity `
+                        -State $state -StatePath $statePath `
+                        -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                        -RepoPath $repo -RunRoot $paths.RunRoot `
+                        -Reason "The active review role remained inactive after its technical recovery attempts."
+                    continue
+                }
+                throw
+            }
             Merge-ReviewLoopFindings `
                 -Ledger $ledger -Findings @($review.Result.findings) `
                 -ReviewId $review.ReviewId -Head $review.Head | Out-Null
@@ -2143,10 +2363,23 @@ function Invoke-ReviewLoopCore {
             $state.CleanPasses = 0
             $state.CleanHead = ""
             Write-ReviewLoopStatus -Message "Clean-pass count reset; processing $($open.Count) open findings." -Kind Warning
-            Invoke-ReviewLoopOpenClusters `
-                -Config $config -State $state -StatePath $statePath `
-                -Ledger $ledger -LedgerPath $paths.LedgerPath `
-                -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+            try {
+                Invoke-ReviewLoopOpenClusters `
+                    -Config $config -State $state -StatePath $statePath `
+                    -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                    -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+            }
+            catch {
+                if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
+                    Restart-ReviewLoopAfterInactivity `
+                        -State $state -StatePath $statePath `
+                        -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                        -RepoPath $repo -RunRoot $paths.RunRoot `
+                        -Reason "The active finding role remained inactive after its technical recovery attempts."
+                    continue
+                }
+                throw
+            }
         }
     }
     catch {
@@ -2271,6 +2504,7 @@ function Invoke-CodexReviewLoop {
         -TranscriptPath ""
     [CodexReviewLoopCancellationLog]::Install()
     $lock = $null
+    $awakeGuardActive = $false
     try {
         $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
         $lockPath = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
@@ -2294,6 +2528,7 @@ function Invoke-CodexReviewLoop {
                     "After that process exits, run this command again. Do not delete the lock file manually."
                 ))
         }
+        $awakeGuardActive = Start-ReviewLoopAwakeGuard
         return Invoke-ReviewLoopCore @PSBoundParameters
     }
     catch {
@@ -2356,6 +2591,7 @@ function Invoke-CodexReviewLoop {
         }
     }
     finally {
+        Stop-ReviewLoopAwakeGuard -WasActive $awakeGuardActive
         if ($null -ne $lock) {
             $lock.Dispose()
         }

@@ -32,6 +32,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
+| `InactivityTimeoutMinutes` | `30` | Live-reloaded child-process inactivity limit; zero or less disables it |
 | `AutoCommit` | `$true` | Live-reloaded commit behavior |
 | `CommitMessagePrefix` | `Review-Loop` | Live-reloaded prefix for future verified commits |
 | `HostGates` | Detected checks | Required checks before every commit |
@@ -46,6 +47,7 @@ starting points are:
 - `CleanPassesRequired`: 2-3
 - `MaxReviewCycles`: 6-30
 - `MaxFixAttempts`: 2-5
+- `InactivityTimeoutMinutes`: 15-120
 
 The loop accepts integer values outside these ranges. The profile owner chooses
 the tradeoff appropriate for the repository and run.
@@ -69,6 +71,8 @@ fix, and commit boundaries:
 - `MaxReviewCycles` applies before the next native review call.
 - `MaxFixAttempts` applies before the next Fixer call. Reaching it restores the
   rejected round and starts another native review; it never blocks a finding.
+- `InactivityTimeoutMinutes` applies when the next role, targeted test, or host
+  gate starts. It is not changed underneath an already running process.
 - `AutoCommit`
 - `CommitMessagePrefix` applies to the next commit that has not yet entered
   commit preparation. A pending commit keeps its sealed message.

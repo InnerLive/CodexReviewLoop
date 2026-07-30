@@ -182,11 +182,11 @@ function Write-ReviewLoopAtomicJson {
     try {
         $json = $Value | ConvertTo-Json -Depth 50
         Write-ReviewLoopUtf8File -Path $temporary -Content $json
-        Move-Item -LiteralPath $temporary -Destination $absolute -Force
+        [System.IO.File]::Move($temporary, $absolute, $true)
     }
     finally {
         if (Test-Path -LiteralPath $temporary) {
-            Remove-Item -LiteralPath $temporary -Force
+            [System.IO.File]::Delete($temporary)
         }
     }
 }
@@ -456,6 +456,11 @@ function New-ReviewLoopProfile {
     # boundaries while a run is active.
     MaxFixAttempts = 2
 
+    # Recommended: 15-120 minutes without real child-process output. Zero or a
+    # negative value disables inactivity termination. Changes apply to the next
+    # role, targeted test, or host gate that starts.
+    InactivityTimeoutMinutes = 30
+
     # When false, verified changes are staged and the loop waits for a manual
     # commit or for AutoCommit to be enabled before continuing.
     AutoCommit = `$true
@@ -564,6 +569,7 @@ function Import-ReviewLoopConfig {
         CleanPassesRequired = 2
         MaxReviewCycles = 12
         MaxFixAttempts = 2
+        InactivityTimeoutMinutes = 30
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
     }
@@ -603,7 +609,8 @@ function Assert-ReviewLoopConfigValues {
     foreach ($name in @(
         "CleanPassesRequired",
         "MaxReviewCycles",
-        "MaxFixAttempts"
+        "MaxFixAttempts",
+        "InactivityTimeoutMinutes"
     )) {
         try {
             $value = [int]$Config[$name]
@@ -644,11 +651,30 @@ $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
     "MaxFixAttempts",
+    "InactivityTimeoutMinutes",
     "AutoCommit",
     "CommitMessagePrefix",
     "HostGates",
     "Roles"
 )
+
+function Get-ReviewLoopInactivityTimeoutSeconds {
+    param([Parameter(Mandatory = $true)][hashtable]$Config)
+
+    $minutes = if ($Config.ContainsKey("InactivityTimeoutMinutes")) {
+        [long]$Config.InactivityTimeoutMinutes
+    }
+    else {
+        30L
+    }
+    if ($minutes -le 0) {
+        return 0L
+    }
+    if ($minutes -gt [long]::MaxValue / 60L) {
+        return [long]::MaxValue
+    }
+    return $minutes * 60L
+}
 
 function ConvertTo-ReviewLoopFingerprintData {
     param([AllowNull()][object]$Value)

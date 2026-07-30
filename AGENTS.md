@@ -214,6 +214,15 @@ decision layers.
 - `MaxFixAttempts` limits Fixer calls in one review round. Reaching it preserves
   diagnostic evidence, safely restores the rejected patch, and starts another
   native review. It never blocks a finding.
+- A Fixer mutation without a resumable thread is checkpointed before one fresh
+  recovery Fixer starts. If that recovery fails, preserve the latest patch,
+  restore the clean checkpoint, and return to native review.
+- `InactivityTimeoutMinutes` limits silence rather than total process duration.
+  It is live-reloaded for the next role, targeted test, or host gate. Persistent
+  inactivity returns to native review under the normal review-cycle budget.
+- Hold a process-scoped Windows system-awake request while the repository lock
+  is owned. Do not keep the display on or change shutdown, update, or registry
+  policy.
 - `MaxReviewCycles` limits native reviews per script invocation. Every new
   invocation resets that counter while retaining the checkpoint. Reaching the
   limit returns `limit_reached`; running the same command continues with a
@@ -267,14 +276,15 @@ input, cached input, and output tokens.
 - Capture thread ID as soon as it appears.
 - Retry only classified technical failures and resume the same thread whenever
   possible.
-- Do not start a fresh automatic mutating retry after an uncheckpointed partial
-  mutation.
+- Do not start a fresh automatic mutating retry until the complete partial
+  mutation has been preserved in a durable recovery checkpoint.
 - Structured output is mandatory where a schema exists; invalid output is not a
   successful role.
 - Stream and flush stdout/stderr rather than waiting for process completion.
-- Bound role, targeted-test, and host-gate lifetimes.
-- On cancellation or timeout, terminate the complete owned Windows process
-  tree and preserve the last valid checkpoint.
+- Bound role, targeted-test, and host-gate inactivity while allowing productive
+  processes to run beyond any fixed wall-clock duration.
+- On cancellation or inactivity timeout, terminate the complete owned Windows
+  process tree and preserve the last valid checkpoint.
 - Test delayed output, partial JSONL, malformed auxiliary events, stderr,
   timeouts, Ctrl+C, and descendant cleanup.
 - Never treat an unchanged external state as proof that a process is healthy;

@@ -569,7 +569,8 @@ function Invoke-ReviewLoopObservedProcess {
         [AllowNull()][string]$InputText = $null,
         [ValidateSet("Codex", "NativeReview", "HostGate")][string]$EventKind = "Codex",
         [switch]$AppendLogs,
-        [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0,
+        [Alias("TimeoutSeconds")][long]$InactivityTimeoutSeconds = 0,
+        [long]$AbsoluteTimeoutSeconds = 0,
         [AllowNull()][scriptblock]$OnThreadStarted = $null
     )
 
@@ -603,6 +604,7 @@ function Invoke-ReviewLoopObservedProcess {
     $stdinClosed = $false
     $inputWriteFailed = $false
     $inputWriteFailureReason = ""
+    $timeoutMessage = ""
     try {
         $stdoutWriter = New-ReviewLoopStreamWriter -Path $StdoutPath -Append:$AppendLogs
         $stderrWriter = New-ReviewLoopStreamWriter -Path $StderrPath -Append:$AppendLogs
@@ -692,10 +694,24 @@ function Invoke-ReviewLoopObservedProcess {
             }
 
             $now = [DateTimeOffset]::UtcNow
-            if (-not $timedOut -and $TimeoutSeconds -gt 0 -and
-                ($now - $startedAt).TotalSeconds -ge $TimeoutSeconds) {
+            $inactiveSeconds = [Math]::Max(0, [int64]($now - $activity.LastActivity).TotalSeconds)
+            $inactivityExpired = $InactivityTimeoutSeconds -gt 0 -and
+                $inactiveSeconds -ge $InactivityTimeoutSeconds
+            $absoluteExpired = $AbsoluteTimeoutSeconds -gt 0 -and
+                ($now - $startedAt).TotalSeconds -ge $AbsoluteTimeoutSeconds
+            if (-not $timedOut -and ($inactivityExpired -or $absoluteExpired)) {
                 $timedOut = $true
-                Write-ReviewLoopStatus -Message "$DisplayName exceeded its ${TimeoutSeconds}s time limit; stopping its process tree." -Kind Warning
+                $elapsedSeconds = [Math]::Max(0, [int64]($now - $startedAt).TotalSeconds)
+                $timeoutMessage = if ($inactivityExpired) {
+                    "$DisplayName was inactive for ${inactiveSeconds}s after ${elapsedSeconds}s total; stopping its process tree. Logs: '$StdoutPath', '$StderrPath'."
+                }
+                else {
+                    "$DisplayName exceeded its ${AbsoluteTimeoutSeconds}s technical time limit after ${elapsedSeconds}s total; stopping its process tree. Logs: '$StdoutPath', '$StderrPath'."
+                }
+                Write-ReviewLoopStatus -Message $timeoutMessage -Kind Warning
+                $stderrWriter.WriteLine((ConvertTo-ReviewLoopRedactedText $timeoutMessage))
+                Add-ReviewLoopTextTailLine -Tail $stderrTail `
+                    -Line (ConvertTo-ReviewLoopRedactedText $timeoutMessage)
                 if (-not (Stop-ReviewLoopProcessTree -Process $process)) {
                     throw "$DisplayName did not stop after its time limit."
                 }
@@ -764,6 +780,7 @@ function Invoke-ReviewLoopObservedProcess {
         ActionCount = [int]$activity.ActionCount
         ThreadId = [string]$activity.ThreadId
         TimedOut = $timedOut
+        TimeoutMessage = $timeoutMessage
         AdvisoryErrorCount = [int]$activity.AdvisoryErrorCount
         EventStreamLossCount = [int]$activity.EventStreamLossCount
         MalformedEventCount = [int]$activity.MalformedEventCount
@@ -794,7 +811,7 @@ function Invoke-CodexCliRole {
         [ValidateRange(1, 5)][int]$MaxAttempts = 3,
         [string]$CallId = "",
         [string]$DeveloperInstructions = "",
-        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 2700,
+        [Alias("TimeoutSeconds")][long]$InactivityTimeoutSeconds = 1800,
         [AllowNull()][scriptblock]$OnThreadStarted = $null
     )
 
@@ -851,7 +868,7 @@ function Invoke-CodexCliRole {
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         if (Test-Path -LiteralPath $resultPath) {
-            Remove-Item -LiteralPath $resultPath -Force
+            [System.IO.File]::Delete($resultPath)
         }
         $arguments = Get-CodexRoleArguments `
             -RepoPath $repo `
@@ -878,7 +895,7 @@ function Invoke-CodexCliRole {
                 -InputText $(if ($isNativeReview) { $null } else { $currentPrompt }) `
                 -EventKind $(if ($isNativeReview) { "NativeReview" } else { "Codex" }) `
                 -AppendLogs:($attempt -gt 1 -and -not $isNativeReview) `
-                -TimeoutSeconds $TimeoutSeconds `
+                -InactivityTimeoutSeconds $InactivityTimeoutSeconds `
                 -OnThreadStarted $OnThreadStarted
             $stdout = $observed.Stdout
             $stderr = $observed.Stderr

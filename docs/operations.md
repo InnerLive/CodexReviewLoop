@@ -83,8 +83,12 @@ Resume requires the same repository, branch, symbolic review base, `HEAD`, and
 speed. The base commit recorded at run start remains pinned and must still
 exist.
 
-Interrupted fixer work can resume from its recorded thread and remaining
-call. A changed tool or execution-affecting profile fingerprint resets
+Interrupted fixer work resumes from its recorded thread when possible. If a
+Fixer changed files before a resumable thread ID was available, the loop first
+preserves that complete Git diff and gives one fresh Fixer the same semantic
+attempt. If that recovery also fails, the latest diff is retained as evidence,
+the clean checkpoint is restored, and native review starts again. A changed
+tool or execution-affecting profile fingerprint resets
 clean-pass evidence and starts a fresh native review when the repository is
 clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, host gates, and
 commit settings are reloaded at safe boundaries.
@@ -117,10 +121,17 @@ that cycle counter and retains the checkpoint. Reaching the limit leaves the
 checkpoint resumable, does not mark any finding blocked, and the same command
 continues with a fresh budget.
 
-Each Codex process attempt has a 45-minute timeout; technical retries can make a
-complete role take longer. Each targeted test and host gate has a 30-minute
-timeout. On timeout or cancellation, the loop terminates its owned Windows
-process tree and preserves the latest valid checkpoint.
+`InactivityTimeoutMinutes` defaults to 30. Codex roles, targeted tests, and host
+gates may run for any total duration while they continue producing real output.
+Heartbeats do not reset the inactivity clock. When the limit is reached, the
+loop terminates the owned Windows process tree, uses the normal technical
+recovery, and eventually returns to a new native review round instead of
+stopping on a finding. Short Git control operations retain separate technical
+deadlines.
+
+While the repository lock is held, Windows receives a process-scoped
+system-awake signal. It does not keep the display on, change update policy, or
+cancel shutdown. The signal is released when the loop exits.
 
 Pressing Ctrl+C writes a final interruption entry to `terminal.log` before the
 console process exits whenever Windows delivers the console cancellation

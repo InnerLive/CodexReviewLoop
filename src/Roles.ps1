@@ -73,7 +73,6 @@ function Get-ReviewLoopPrompt {
 function Assert-ReviewLoopExecutionUnchanged {
     param([Parameter(Mandatory = $true)][hashtable]$Config)
 
-    Update-ReviewLoopLiveConfig -Config $Config
     if ($Config.ContainsKey("__ExecutionFingerprint") -and
         $Config.ContainsKey("__ConfigPath") -and
         (Get-ReviewLoopExecutionFingerprint -ConfigPath ([string]$Config.__ConfigPath)) -ne
@@ -137,6 +136,7 @@ function Invoke-ConfiguredCodexRole {
         throw "Reviewer must use native Codex review without a prompt or output schema."
     }
 
+    Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $Role
     $schemaPath = if ([string]::IsNullOrWhiteSpace($SchemaName)) {
@@ -243,8 +243,13 @@ function Invoke-ConfiguredCodexRole {
             $pendingFingerprint = [string](Get-ReviewLoopObjectProperty `
                 -Object $pending -Name "WorktreeFingerprint" -Default "")
             $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-            if ($pendingHead -ne [string]$currentSnapshot.Head -or
-                $pendingFingerprint -ne [string]$currentSnapshot.Fingerprint) {
+            if ($pendingHead -ne [string]$currentSnapshot.Head) {
+                Stop-ReviewLoopBlocked -Message "Interrupted mutating role '$Role' changed HEAD without a resumable thread."
+            }
+            if ($pendingFingerprint -ne [string]$currentSnapshot.Fingerprint -and
+                -not ($Role -eq "Fixer" -and
+                    $null -ne (Get-ReviewLoopObjectProperty `
+                        -Object $State -Name "PartialFixRecovery"))) {
                 Stop-ReviewLoopBlocked -Message "Interrupted mutating role '$Role' has no resumable thread."
             }
             $State.ActiveRoleCall = $null
@@ -293,6 +298,7 @@ Continue the interrupted $Role work from the current repository state and return
         ThreadId = $effectiveThreadId
         ReviewBase = $ReviewBase
         CallId = $CallId
+        InactivityTimeoutSeconds = Get-ReviewLoopInactivityTimeoutSeconds -Config $Config
     }
     if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
         $arguments.CodexPath = $CodexPath
@@ -352,13 +358,17 @@ function Assert-ReviewLoopRoleSuccess {
     param([Parameter(Mandatory = $true)][object]$Call)
 
     if (-not $Call.Success) {
-        throw (New-ReviewLoopFailureException `
+        $exception = New-ReviewLoopFailureException `
             -Message "Codex role '$($Call.Role)' failed after its automatic recovery attempts ($($Call.FailureKind)): $($Call.FailureReason)" `
             -NextSteps @(
                 "Check the role logs in the run directory and correct the reported Codex, environment, or repository problem."
                 "Run the same command again to resume from the saved checkpoint."
                 "If the failure repeats, verify that the local Codex CLI is signed in and can complete a simple command."
-            ))
+            )
+        if ([string]$Call.FailureKind -eq "timeout") {
+            $exception.Data["ReviewLoopRestartReview"] = $true
+        }
+        throw $exception
     }
 }
 

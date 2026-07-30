@@ -51,6 +51,10 @@ and compact terminal output.
 The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
 when you deliberately want a fresh run; the finding ledger is retained.
 
+During unattended runs Windows is kept awake without keeping the display on or
+changing update policy. Long-running roles and tests are limited by inactivity,
+not by their total duration; the generated profile recommends 30 minutes.
+
 Normal invocations print only the human dashboard. Automation can request one
 machine-readable result document and no terminal dashboard with `-Json`.
 

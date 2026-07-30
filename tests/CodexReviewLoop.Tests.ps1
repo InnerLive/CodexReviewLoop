@@ -77,6 +77,7 @@ function New-TestConfig {
     CleanPassesRequired = 2
     MaxReviewCycles = 6
     MaxFixAttempts = 2
+    InactivityTimeoutMinutes = 30
     AutoCommit = `$true
     CommitMessagePrefix = "Test Review Loop"
     HostGates = @($gate)
@@ -127,6 +128,7 @@ function New-TestActiveCheckpoint {
         return [pscustomobject]@{
             RunRoot = $paths.RunRoot
             StatePath = $paths.StatePath
+            LedgerPath = $paths.LedgerPath
         }
     } $RepoPath $ConfigPath $Speed
 }
@@ -217,6 +219,7 @@ Describe "Optional profiles and command help" {
         } $repo
         $profile.RepositoryPath | Should Be $canonicalRepo
         $profile.LogRoot | Should Be ".\runs"
+        $profile.InactivityTimeoutMinutes | Should Be 30
         $profile.Roles.Keys.Count | Should Be 5
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
@@ -235,6 +238,7 @@ Describe "Optional profiles and command help" {
         $profile.CleanPassesRequired = 7
         $profile.MaxReviewCycles = 1
         $profile.MaxFixAttempts = 9
+        $profile.InactivityTimeoutMinutes = -5
         $profile.AutoCommit = $false
         $failure = $null
 
@@ -252,6 +256,28 @@ Describe "Optional profiles and command help" {
         $profile.CleanPassesRequired | Should Be 7
         $profile.MaxReviewCycles | Should Be 1
         $profile.MaxFixAttempts | Should Be 9
+        $profile.InactivityTimeoutMinutes | Should Be -5
+        (& (Get-Module CodexReviewLoop) {
+            param($config)
+            Get-ReviewLoopInactivityTimeoutSeconds -Config $config
+        } $profile) | Should Be 0
+    }
+
+    It "defaults old profiles to a 30-minute inactivity timeout" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "old-timeout-profile.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-timeout-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath).
+            Replace("    InactivityTimeoutMinutes = 30`r`n", "").
+            Replace("    InactivityTimeoutMinutes = 30`n", "")
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+
+        $profile = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+
+        $profile.InactivityTimeoutMinutes | Should Be 30
     }
 
     It "maps legacy fixer and verifier role names in existing profiles" {
@@ -1884,6 +1910,10 @@ Describe "End-to-end orchestration with fake Codex" {
                             new = "MaxReviewCycles = 3"
                         }
                         [pscustomobject]@{
+                            old = "InactivityTimeoutMinutes = 30"
+                            new = "InactivityTimeoutMinutes = 47"
+                        }
+                        [pscustomobject]@{
                             old = 'CommitMessagePrefix = "Test Review Loop"'
                             new = 'CommitMessagePrefix = "Reloaded"'
                         }
@@ -1917,6 +1947,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Reloaded live profile settings"
         $terminal | Should Match "MaxReviewCycles 2 -> 3"
+        $terminal | Should Match "InactivityTimeoutMinutes 30 -> 47"
         $terminal | Should Match "Review cycle 3"
         $terminal | Should Not Match "active profile changed"
     }
@@ -1987,6 +2018,187 @@ Describe "End-to-end orchestration with fake Codex" {
         @($records | Where-Object { ($_.arguments -join " ") -notmatch 'service_tier="fast"' }).Count | Should Be 0
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
             Should Match "Output:\s+detailed · heartbeat 0s · Never"
+    }
+
+    It "preserves partial fixer work without a thread and completes it in one fresh recovery" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $findingReview = "- [P1] partial recovery defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
+        $fixed = '{"schemaVersion":"2.0","summary":"Completed the partial work.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $plans = @(
+            [pscustomobject]@{ result = $findingReview }
+            [pscustomobject]@{ result = $architecture }
+            [pscustomobject]@{
+                emitThread = $false
+                result = "not json"
+                mutations = @([pscustomobject]@{
+                    path = "partial-recovery.txt"
+                    content = "partial"
+                })
+            }
+            [pscustomobject]@{
+                result = $fixed
+                mutations = @([pscustomobject]@{
+                    path = "partial-recovery.txt"
+                    content = "complete"
+                })
+            }
+            [pscustomobject]@{ result = $accepted }
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "partial-recovery-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "partial-recovery.txt")) |
+            Should Match "complete"
+        $ledger = Read-ReviewLoopLedger -Path $result.LedgerPath
+        $ledger.Findings[0].FixAttempts | Should Be 1
+        $state = Read-ReviewLoopState -Path $result.StatePath
+        $state.PartialFixRecovery | Should BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath (Join-Path $result.RunRoot "blocked") `
+            -Directory -Filter "*-partial-attempt-1").Count | Should Be 1
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $fixerRecords = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "fixer-result-v2.schema.json"
+        })
+        $fixerRecords.Count | Should Be 2
+        $fixerRecords[1].callKind | Should Be "exec"
+        $fixerRecords[1].prompt | Should Match "previous Fixer process ended"
+        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
+            Should Match "Partial Fixer work was preserved"
+    }
+
+    It "restores a failed partial-work recovery and returns to the native Reviewer" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 2")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $findingReview = "- [P1] repeated partial recovery defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
+        $fixed = '{"schemaVersion":"2.0","summary":"Applied a later clean fix.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $plans = @(
+            [pscustomobject]@{ result = $findingReview }
+            [pscustomobject]@{ result = $architecture }
+            [pscustomobject]@{
+                emitThread = $false
+                result = "not json"
+                mutations = @([pscustomobject]@{
+                    path = "failed-partial.txt"
+                    content = "partial"
+                })
+            }
+            [pscustomobject]@{ result = "not json" }
+            [pscustomobject]@{ result = "not json" }
+            [pscustomobject]@{ result = "not json" }
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "failed-partial-recovery-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        Test-Path -LiteralPath (Join-Path $repo "failed-partial.txt") | Should Be $false
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
+        @(Get-ChildItem -LiteralPath (Join-Path $result.RunRoot "blocked") `
+            -Directory -Filter "*-restart-attempt-1").Count | Should Be 1
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
+        $terminal | Should Match "fresh partial-work recovery Fixer also failed"
+        $terminal | Should Match "Review cycle 2"
+    }
+
+    It "continues a preserved partial-work recovery after a script restart" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $checkpoint = New-TestActiveCheckpoint `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-TestFinding)) `
+            -ReviewId "review-01" -Head $state.CurrentHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.FixAttempts = 1
+        $state.ReviewCycle = 1
+        $state.ActiveClusterId = [string]$finding.ClusterId
+        $state.ActiveFindingIds = @([string]$finding.Id)
+        $state.ActiveReviewText = "- [P1] restart recovery defect at src/A.cs:10"
+        $state.ActiveStrategy = [pscustomobject]@{
+            schemaVersion = "2.0"
+            summary = "Complete the existing work."
+            approach = "Inspect and finish the current worktree."
+            steps = @()
+            considerations = @()
+        }
+        $state.LastFixerResult = [pscustomobject]@{
+            Success = $false
+            FailureKind = "unsafe_partial_mutation"
+            FailureReason = "The process ended before returning a thread ID."
+            Attempt = 1
+            Correction = 1
+        }
+        Set-Content -LiteralPath (Join-Path $repo "restart-partial.txt") -Value "partial"
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $statePath, $ledgerValue, $ledgerPath, $repository, $runRoot)
+            Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledgerValue | Out-Null
+            Save-ReviewLoopPartialFixRecovery `
+                -State $loopState -StatePath $statePath `
+                -RepoPath $repository -RunRoot $runRoot `
+                -Attempt 1 -FailureReason "interrupted" -Correction 1 | Out-Null
+        } $state $checkpoint.StatePath $ledger $checkpoint.LedgerPath $repo $checkpoint.RunRoot
+
+        $fixed = '{"schemaVersion":"2.0","summary":"Finished after restart.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $accepted = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $plans = @(
+            [pscustomobject]@{
+                result = $fixed
+                mutations = @([pscustomobject]@{
+                    path = "restart-partial.txt"
+                    content = "complete"
+                })
+            }
+            [pscustomobject]@{ result = $accepted }
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "restart-recovery-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "restart-partial.txt")) |
+            Should Match "complete"
+        $resumed = Read-ReviewLoopState -Path $result.StatePath
+        $resumed.PartialFixRecovery | Should BeNullOrEmpty
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $records[0].callKind | Should Be "exec"
+        $records[0].prompt | Should Match "previous Fixer process ended"
     }
 
     It "uses the configured fixer-attempt budget and resumes only the cluster thread" {

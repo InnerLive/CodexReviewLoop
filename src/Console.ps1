@@ -85,6 +85,75 @@ public static class CodexReviewLoopCancellationLog
 '@
 }
 
+if ($null -eq ("CodexReviewLoopAwakeGuard" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class CodexReviewLoopAwakeGuard
+{
+    public const uint EsSystemRequired = 0x00000001;
+    public const uint EsContinuous = 0x80000000;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint flags);
+
+    public static uint RequiredFlags
+    {
+        get { return EsContinuous | EsSystemRequired; }
+    }
+
+    public static bool Start()
+    {
+        return SetThreadExecutionState(RequiredFlags) != 0;
+    }
+
+    public static bool Stop()
+    {
+        return SetThreadExecutionState(EsContinuous) != 0;
+    }
+}
+'@
+}
+
+function Start-ReviewLoopAwakeGuard {
+    try {
+        $active = [CodexReviewLoopAwakeGuard]::Start()
+        if (-not $active) {
+            Write-ReviewLoopStatus `
+                -Message "Windows could not enable the system-awake signal; the review loop will continue." `
+                -Kind Warning
+        }
+        return [bool]$active
+    }
+    catch {
+        Write-ReviewLoopStatus `
+            -Message "Windows system-awake signal failed; the review loop will continue: $($_.Exception.Message)" `
+            -Kind Warning
+        return $false
+    }
+}
+
+function Stop-ReviewLoopAwakeGuard {
+    param([bool]$WasActive)
+
+    if (-not $WasActive) {
+        return
+    }
+    try {
+        if (-not [CodexReviewLoopAwakeGuard]::Stop()) {
+            Write-ReviewLoopStatus `
+                -Message "Windows did not confirm release of the system-awake signal." `
+                -Kind Warning
+        }
+    }
+    catch {
+        Write-ReviewLoopStatus `
+            -Message "Windows system-awake signal could not be released explicitly: $($_.Exception.Message)" `
+            -Kind Warning
+    }
+}
+
 $script:ReviewLoopConsole = [ordered]@{
     OutputMode       = "compact"
     HeartbeatSeconds = 30

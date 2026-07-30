@@ -64,6 +64,11 @@ as a diagnostic artifact, restores the clean repository state, discards the
 old Fixer round, and immediately starts another native review. It does not
 block the finding or stop the run.
 
+If a Fixer process leaves partial changes before a resumable thread ID is
+available, those changes are preserved and one fresh Fixer completes the same
+semantic attempt. A second technical failure preserves the latest evidence,
+restores the clean checkpoint, and returns to native review.
+
 The Fixer may provide one targeted test as an executable plus argument array.
 It may also report that no targeted test is available.
 

@@ -46,6 +46,7 @@ function New-ReliabilityConfig {
     CleanPassesRequired = 2
     MaxReviewCycles = 6
     MaxFixAttempts = 2
+    InactivityTimeoutMinutes = 30
     AutoCommit = `$true
     CommitMessagePrefix = 'Reliability'
     HostGates = @()
@@ -412,7 +413,7 @@ Describe "Unattended reliability boundaries" {
         $childPidPath = Join-Path $caseRoot "child.pid"
         Write-ReliabilityJsonArray -Path $planPath -Values @(
             [pscustomobject]@{
-                hangMs = 5000
+                hangMs = 10000
                 commands = @()
                 childPidPath = $childPidPath
                 childSleepSeconds = 60
@@ -421,9 +422,12 @@ Describe "Unattended reliability boundaries" {
         $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
 
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
-            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1 -TimeoutSeconds 1
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1 -TimeoutSeconds 3
         $call.Success | Should Be $false
         $call.FailureKind | Should Be "timeout"
+        $call.FailureReason | Should Match "inactive for 3s"
+        $call.FailureReason | Should Match "after \d+s total"
+        $call.FailureReason | Should Match "Logs:"
         Test-Path -LiteralPath $childPidPath | Should Be $true
         $childPid = [int](Get-Content -Raw -LiteralPath $childPidPath)
         Start-Sleep -Milliseconds 200
@@ -435,6 +439,59 @@ Describe "Unattended reliability boundaries" {
             if ($null -ne $remainingChild) {
                 Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
             }
+        }
+    }
+
+    It "allows a role to outlive the inactivity limit while output remains active" {
+        $planPath = Join-Path $caseRoot "active-invocations.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{
+                commands = @(
+                    [pscustomobject]@{ delayMs = 1200; output = "first" }
+                    [pscustomobject]@{ delayMs = 1200; output = "second" }
+                )
+            }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1 `
+            -TimeoutSeconds 2
+
+        $call.Success | Should Be $true
+        ([DateTimeOffset]::Parse($call.FinishedAt) -
+            [DateTimeOffset]::Parse($call.StartedAt)).TotalSeconds | Should BeGreaterThan 2
+    }
+
+    It "disables inactivity termination when the configured duration is zero" {
+        $planPath = Join-Path $caseRoot "unbounded-invocations.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{ hangMs = 1500; commands = @() }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
+            -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1 `
+            -TimeoutSeconds 0
+
+        $call.Success | Should Be $true
+    }
+
+    It "uses the process-scoped Windows system-awake flags without display or restart policy flags" {
+        [CodexReviewLoopAwakeGuard]::RequiredFlags |
+            Should Be ([CodexReviewLoopAwakeGuard]::EsContinuous -bor
+                [CodexReviewLoopAwakeGuard]::EsSystemRequired)
+        ([CodexReviewLoopAwakeGuard]::RequiredFlags -band 0x00000002) | Should Be 0
+
+        $active = & (Get-Module CodexReviewLoop) { Start-ReviewLoopAwakeGuard }
+        try {
+            $active | Should Be $true
+        }
+        finally {
+            & (Get-Module CodexReviewLoop) {
+                param($wasActive)
+                Stop-ReviewLoopAwakeGuard -WasActive $wasActive
+            } $active
         }
     }
 
