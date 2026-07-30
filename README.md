@@ -3,25 +3,22 @@
 **Turn AI-generated branch changes into professionally reviewed, tested, and
 verified code.**
 
-Codex Review Loop reviews the complete branch diff, fixes evidence-backed
-defects, independently verifies each patch, runs the repository's quality
-gates, and commits only accepted work. It repeats this process unattended until
-the branch is demonstrably clean or reaches a useful checkpoint.
+Codex Review Loop uses Codex's native review function on the complete branch
+diff, lets free Architect and Fixer roles choose the solution, asks a Verifier
+to accept or reject it, runs the repository's quality gates, and commits only
+accepted work. It repeats unattended until the branch is demonstrably clean.
 
 ## What it does
 
-1. Reviews the branch for correctness, security, reliability, and material
-   performance defects.
-2. Tracks findings across review cycles and groups only semantically related
-   defects.
-3. Applies a bounded fix and requires a targeted regression test.
-4. Independently runs the test, verifies the patch, and executes configured host
-   gates before committing the exact verified tree.
-5. Repeats until the configured number of reviews are clean on the same
+1. Runs native Codex review without a custom reviewer prompt or JSON schema.
+2. Passes the review output unchanged to an Architect.
+3. Passes the Architect's advice unchanged to a Fixer.
+4. Lets a Verifier directly accept the solution or return feedback to the Fixer.
+5. Executes configured host gates and commits the exact accepted tree.
+6. Starts a new native review instead of blocking when a Fixer round is
+   exhausted.
+7. Repeats until the configured number of reviews are clean on the same
    unchanged `HEAD` (two is the recommended default).
-
-Architecture work is considered only when the evidence supports it. A focused
-point fix remains the default.
 
 ## Requirements
 

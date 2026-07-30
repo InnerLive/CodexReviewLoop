@@ -135,6 +135,27 @@ for ($index = 0; $index -lt $arguments.Count; $index++) {
             $resumeThreadId = [string]$arguments[$index + 1]
         }
     }
+    if ($arguments[$index] -eq "review") {
+        $callKind = "review"
+    }
+}
+
+if ($callKind -eq "review") {
+    $reviewIndex = [Array]::IndexOf([string[]]$arguments, "review")
+    foreach ($globalOption in @(
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            "-m",
+            "-c",
+            "--enable"
+        )) {
+        $optionIndex = [Array]::IndexOf([string[]]$arguments, $globalOption)
+        if ($optionIndex -gt $reviewIndex) {
+            [Console]::Error.WriteLine(
+                "fake: global option '$globalOption' must precede the review subcommand")
+            exit 2
+        }
+    }
 }
 
 if (-not [string]::IsNullOrWhiteSpace($logPath)) {
@@ -163,7 +184,9 @@ if (-not [string]::IsNullOrWhiteSpace($exitText)) {
     $exitCode = [int]$exitText
 }
 
-if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
+$nativeReviewResult = ""
+if ($exitCode -eq 0 -and
+    ($callKind -eq "review" -or -not [string]::IsNullOrWhiteSpace($resultPath))) {
     if ($null -ne $plannedResult) {
         $result = [string]$plannedResult
     }
@@ -188,36 +211,56 @@ if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultPath)) {
     else {
         $schemaName = [System.IO.Path]::GetFileName($schemaPath)
         $result = switch ($schemaName) {
-            "review-result-v1.schema.json" {
-                '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+            "architecture-advice-v2.schema.json" {
+                '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'
             }
-            "trigger-decision-v2.schema.json" {
-                '{"schemaVersion":"2.0","decisions":[]}'
+            "fixer-result-v2.schema.json" {
+                '{"schemaVersion":"2.0","summary":"No change.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
             }
-            "architecture-proposal-v1.schema.json" {
-                '{"schemaVersion":"1.0","recommendation":"point_fix","summary":"point","sharedRootCause":"","minimalAlternative":"point","findings":[],"steps":[],"risks":[],"breaksPublicContract":false}'
-            }
-            "architecture-critique-v1.schema.json" {
-                '{"schemaVersion":"1.0","decision":"reject_to_point_fix","confidence":"high","rationale":"bounded","coherentRootCause":false,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":false,"missingPaths":[],"requiredChanges":[]}'
-            }
-            "fixer-result-v1.schema.json" {
-                '{"schemaVersion":"1.0","outcome":"no_change","summary":"none","changedPaths":[],"targetedTest":{"filePath":"dotnet","arguments":["test"],"rationale":"targeted regression"},"remainingRisk":""}'
-            }
-            "verifier-result-v2.schema.json" {
-                '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still present","regressions":[],"evidence":[]}'
+            "verifier-result-v3.schema.json" {
+                '{"schemaVersion":"3.0","accept":false,"summary":"More work is useful.","feedback":[]}'
             }
             default {
                 '{}'
             }
         }
     }
-    $parent = Split-Path -Parent $resultPath
-    if (-not [string]::IsNullOrWhiteSpace($parent)) {
-        [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+    if ($callKind -eq "review") {
+        $legacyNativeReview = $null
+        try {
+            $legacyNativeReview = $result | ConvertFrom-Json
+        }
+        catch {
+            $legacyNativeReview = $null
+        }
+        if ($null -ne $legacyNativeReview -and
+            $legacyNativeReview.PSObject.Properties.Name -contains "classification") {
+            if ([string]$legacyNativeReview.classification -eq "clean") {
+                $result = "No findings."
+            }
+            else {
+                $lines = @([string]$legacyNativeReview.summary)
+                $lines += @($legacyNativeReview.findings | ForEach-Object {
+                    "- $($_.title) ($($_.path):$($_.line)): $($_.evidence)"
+                })
+                $result = $lines -join [Environment]::NewLine
+            }
+        }
+        $nativeReviewResult = $result
     }
-    [System.IO.File]::WriteAllText($resultPath, $result, [System.Text.UTF8Encoding]::new($false))
-    if (-not [string]::IsNullOrWhiteSpace($mutateSchema) -and
-        [System.IO.Path]::GetFileName($schemaPath) -eq $mutateSchema -and
+    if (-not [string]::IsNullOrWhiteSpace($resultPath)) {
+        $parent = Split-Path -Parent $resultPath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+        }
+        [System.IO.File]::WriteAllText($resultPath, $result, [System.Text.UTF8Encoding]::new($false))
+    }
+    $effectiveMutateSchema = switch ($mutateSchema) {
+        "fixer-result-v1.schema.json" { "fixer-result-v2.schema.json" }
+        default { $mutateSchema }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($effectiveMutateSchema) -and
+        [System.IO.Path]::GetFileName($schemaPath) -eq $effectiveMutateSchema -and
         -not [string]::IsNullOrWhiteSpace($repoPath)) {
         [System.IO.File]::AppendAllText(
             (Join-Path $repoPath "fake-review-loop-change.test.txt"),
@@ -286,6 +329,34 @@ if ($null -ne $profileMutation) {
         $profileMutationPath,
         $profileText,
         [System.Text.UTF8Encoding]::new($false))
+}
+
+if ($callKind -eq "review") {
+    if (-not [string]::IsNullOrWhiteSpace($eventDelayText)) {
+        Start-Sleep -Milliseconds ([int]$eventDelayText)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($stderrText) -and
+        -not [string]::IsNullOrWhiteSpace($stderrDelayText)) {
+        Start-Sleep -Milliseconds ([int]$stderrDelayText)
+        [Console]::Error.WriteLine($stderrText)
+        [Console]::Error.Flush()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($hangText)) {
+        if ($hangText -eq "infinite") {
+            while ($true) {
+                Start-Sleep -Seconds 60
+            }
+        }
+        Start-Sleep -Milliseconds ([int]$hangText)
+    }
+    if ($exitCode -eq 0) {
+        [Console]::Out.Write($nativeReviewResult)
+        [Console]::Out.Flush()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($tailDelayText)) {
+        Start-Sleep -Milliseconds ([int]$tailDelayText)
+    }
+    exit $exitCode
 }
 
 if (Test-FakeBoolean $emitThread) {

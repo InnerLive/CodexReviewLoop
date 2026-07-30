@@ -32,19 +32,17 @@ function New-TestFinding {
         [string]$Invariant = "cache invalidates",
         [string[]]$FixPaths = @("src/A.cs")
     )
-    return [pscustomobject]@{
-        priority = "P1"
-        title = "test finding"
+    $locations = @([pscustomobject]@{
         path = $Path
         line = 10
-        component = $Component
-        rootCause = $RootCause
-        invariant = $Invariant
-        evidence = "evidence"
-        reproduction = "reproduction"
-        suggestedFix = "fix"
-        suggestedTest = "test"
-        fixPaths = $FixPaths
+    })
+    foreach ($fixPath in @($FixPaths | Where-Object { $_ -ne $Path })) {
+        $locations += [pscustomobject]@{ path = $fixPath; line = 0 }
+    }
+    return [pscustomobject]@{
+        title = "test finding"
+        description = "$Component · $RootCause · $Invariant"
+        locations = $locations
     }
 }
 
@@ -79,24 +77,14 @@ function New-TestConfig {
     CleanPassesRequired = 2
     MaxReviewCycles = 6
     MaxFixAttempts = 2
-    MaxArchitectureRevisions = 1
     AutoCommit = `$true
     CommitMessagePrefix = "Test Review Loop"
     HostGates = @($gate)
     Roles = @{
         Reviewer = @{ Model = "fake"; Thinking = "high" }
-        TriggerJudge = @{ Model = "fake"; Thinking = "low" }
-        TriggerConfirm = @{ Model = "fake"; Thinking = "low" }
-        TriggerTieBreak = @{ Model = "fake"; Thinking = "medium" }
-        Architect = @{ Model = "fake"; Thinking = "max" }
-        ArchitectureCritic = @{ Model = "fake"; Thinking = "medium" }
-        ArchitectureVeto = @{ Model = "fake"; Thinking = "medium" }
-        ArchitectureTieBreak = @{ Model = "fake"; Thinking = "high" }
-        PointFixer = @{ Model = "fake"; Thinking = "high" }
-        ArchitectureFixer = @{ Model = "fake"; Thinking = "max" }
-        FindingVerifier = @{ Model = "fake"; Thinking = "low" }
-        VerifierConfirm = @{ Model = "fake"; Thinking = "low" }
-        VerifierTieBreak = @{ Model = "fake"; Thinking = "medium" }
+        Architect = @{ Model = "fake"; Thinking = "high" }
+        Fixer = @{ Model = "fake"; Thinking = "high" }
+        Verifier = @{ Model = "fake"; Thinking = "low" }
     }
 }
 "@
@@ -170,7 +158,9 @@ Describe "Codex Review Loop module" {
             New-ReviewLoopProfile -RepoPath $repository -Path $path
         } $repo $profilePath
         $profile = Import-PowerShellDataFile -LiteralPath $generated
-        $profile.Roles.Keys.Count | Should Be 13
+        $profile.Roles.Keys.Count | Should Be 4
+        @($profile.Roles.Keys | Sort-Object) | Should Be @(
+            "Architect", "Fixer", "Reviewer", "Verifier")
     }
 }
 
@@ -217,7 +207,8 @@ Describe "Optional profiles and command help" {
         $content | Should Match "# Role settings:"
         $content | Should Match "# Host gates"
         $content | Should Match "Recommended: 2-3 clean passes"
-        $content | Should Match "Recommended ranges: 6-30 review cycles, 2-5 fix attempts"
+        $content | Should Match "Recommended: 6-30 native review cycles per script invocation"
+        $content | Should Match "Recommended: 2-5 fixer calls"
         $profile = Import-PowerShellDataFile -LiteralPath $resolved
         $profile.Name | Should Be "automatic-profile-repo"
         $canonicalRepo = & $module {
@@ -226,7 +217,7 @@ Describe "Optional profiles and command help" {
         } $repo
         $profile.RepositoryPath | Should Be $canonicalRepo
         $profile.LogRoot | Should Be ".\runs"
-        $profile.Roles.Keys.Count | Should Be 13
+        $profile.Roles.Keys.Count | Should Be 4
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -244,7 +235,6 @@ Describe "Optional profiles and command help" {
         $profile.CleanPassesRequired = 7
         $profile.MaxReviewCycles = 1
         $profile.MaxFixAttempts = 9
-        $profile.MaxArchitectureRevisions = 4
         $profile.AutoCommit = $false
         $failure = $null
 
@@ -262,7 +252,26 @@ Describe "Optional profiles and command help" {
         $profile.CleanPassesRequired | Should Be 7
         $profile.MaxReviewCycles | Should Be 1
         $profile.MaxFixAttempts | Should Be 9
-        $profile.MaxArchitectureRevisions | Should Be 4
+    }
+
+    It "maps legacy fixer and verifier role names in existing profiles" {
+        $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
+            -Path (Join-Path $TestDrive "legacy-roles.psd1") `
+            -LogRoot (Join-Path $TestDrive "legacy-role-logs"))
+        $profile.Roles.PointFixer = $profile.Roles.Fixer
+        $profile.Roles.FindingVerifier = $profile.Roles.Verifier
+        $profile.Roles.Remove("Fixer")
+        $profile.Roles.Remove("Verifier")
+        $resolved = & (Get-Module CodexReviewLoop) {
+            param($config)
+            Assert-ReviewLoopConfigValues -Config $config
+            [pscustomobject]@{
+                Fixer = Get-ReviewLoopRoleConfig -Config $config -Role Fixer
+                Verifier = Get-ReviewLoopRoleConfig -Config $config -Role Verifier
+            }
+        } $profile
+        $resolved.Fixer.Model | Should Be "fake"
+        $resolved.Verifier.Thinking | Should Be "low"
     }
 
     It "reuses the profile matched by canonical repository path" {
@@ -398,7 +407,7 @@ Describe "Optional profiles and command help" {
 Describe "Global CLI arguments" {
     BeforeEach {
         $repo = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))) -Force
-        $schema = Join-Path $root "schemas\review-result-v1.schema.json"
+        $schema = Join-Path $root "schemas\architecture-advice-v2.schema.json"
         $result = Join-Path $TestDrive "result.json"
     }
 
@@ -464,6 +473,18 @@ Describe "Global CLI arguments" {
     It "builds resume arguments with the same tier" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking medium -Speed fast -Mode Resume -ThreadId thread-1
         ($args -join " ") | Should Match 'service_tier="fast".*resume thread-1 -$'
+    }
+
+    It "builds the native Codex review command without an output schema" {
+        $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m `
+            -Thinking high -Mode Review -ReviewBase origin/main
+        ($args -join " ") | Should Match "^--dangerously-bypass-approvals-and-sandbox .* review --base origin/main$"
+        @($args | Select-Object -Last 3) | Should Be @("review", "--base", "origin/main")
+        ($args -contains "exec") | Should Be $false
+        ($args -contains "--json") | Should Be $false
+        @($args | Where-Object { $_ -eq "--output-schema" }).Count | Should Be 0
+        @($args | Where-Object { $_ -eq "-o" }).Count | Should Be 0
+        ($args -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
     }
 
     It "requires a thread id for resume" {
@@ -538,6 +559,15 @@ Describe "Finding identity and ledger" {
         $ledger.Findings[0].Status | Should Be "open"
     }
 
+    It "reopens a blocked history entry when the native review reports it again" {
+        $finding = New-TestFinding
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @($finding) -ReviewId r1 -Head h1 | Out-Null
+        $ledger.Findings[0].Status = "blocked"
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @($finding) -ReviewId r2 -Head h1 | Out-Null
+        @($ledger.Findings).Count | Should Be 1
+        $ledger.Findings[0].Status | Should Be "open"
+    }
+
     It "persists and reads the ledger" {
         $path = Join-Path $TestDrive "ledger.json"
         Write-ReviewLoopLedger -Path $path -Ledger $ledger | Out-Null
@@ -595,107 +625,6 @@ Describe "Finding identity and ledger" {
     }
 }
 
-Describe "Semantic trigger candidates" {
-    BeforeEach {
-        $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
-        $ledger = New-ReviewLoopLedger -RepoPath $repo
-    }
-
-    It "selects the same component" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path a -Component cache -RootCause one -Invariant x),
-            (New-TestFinding -Path b -Component cache -RootCause two -Invariant y)
-        ) -ReviewId r -Head h | Out-Null
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 1
-    }
-
-    It "selects the same root cause" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path a -Component one -RootCause shared -Invariant x),
-            (New-TestFinding -Path b -Component two -RootCause shared -Invariant y)
-        ) -ReviewId r -Head h | Out-Null
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 1
-    }
-
-    It "selects the same invariant" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path a -Component one -RootCause x -Invariant shared),
-            (New-TestFinding -Path b -Component two -RootCause y -Invariant shared)
-        ) -ReviewId r -Head h | Out-Null
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 1
-    }
-
-    It "does not select the same primary path without another semantic signal" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path same -Component one -RootCause x -Invariant a -FixPaths @("same")),
-            (New-TestFinding -Path same -Component two -RootCause y -Invariant b -FixPaths @("same"))
-        ) -ReviewId r -Head h | Out-Null
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 0
-    }
-
-    It "excludes duplicate findings" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path a -Component cache -RootCause x -Invariant a),
-            (New-TestFinding -Path b -Component cache -RootCause y -Invariant b)
-        ) -ReviewId r -Head h | Out-Null
-        $ledger.Findings[1].Status = "duplicate"
-        @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger).Count | Should Be 0
-    }
-
-    It "reports overlapping paths only as supporting evidence" {
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @(
-            (New-TestFinding -Path a -Component cache -RootCause x -Invariant a -FixPaths @("shared")),
-            (New-TestFinding -Path b -Component cache -RootCause y -Invariant b -FixPaths @("shared"))
-        ) -ReviewId r -Head h | Out-Null
-        $candidate = @(Get-ReviewLoopTriggerCandidates -Finding $ledger.Findings[0] -Ledger $ledger)[0]
-        $candidate.OverlappingFixPaths | Should Be $true
-    }
-}
-
-Describe "Verifier evidence matching" {
-    It "accepts resolved only with orchestrator-owned passing test evidence" {
-        $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
-        $module = Get-Module CodexReviewLoop
-        $matches = & $module {
-            param($repository)
-            $fixer = [pscustomobject]@{ testExecution = [pscustomobject]@{ Passed = $true } }
-            $verification = [pscustomobject]@{
-                verdict = "resolved"
-                patchSafety = "safe"
-                confidence = "high"
-                regressions = @()
-                evidence = @([pscustomobject]@{ path = "README.txt"; line = 1; claim = "fixed" })
-            }
-            Test-ReviewLoopResolvedWithTestEvidence `
-                -FixerResult $fixer -VerificationResult $verification -RepoPath $repository
-        } $repo
-
-        $matches | Should Be $true
-    }
-
-    It "rejects resolved when the orchestrator-owned test failed" {
-        $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
-        $module = Get-Module CodexReviewLoop
-        $matches = & $module {
-            param($repository)
-            Test-ReviewLoopResolvedWithTestEvidence `
-                -FixerResult ([pscustomobject]@{
-                    testExecution = [pscustomobject]@{ Passed = $false }
-                }) `
-                -VerificationResult ([pscustomobject]@{
-                    verdict = "resolved"
-                    patchSafety = "safe"
-                    confidence = "high"
-                    regressions = @()
-                    evidence = @([pscustomobject]@{ path = "README.txt"; line = 1; claim = "claimed" })
-                }) `
-                -RepoPath $repository
-        } $repo
-
-        $matches | Should Be $false
-    }
-}
-
 Describe "Run state" {
     BeforeEach {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
@@ -741,7 +670,6 @@ Describe "Run state" {
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 5").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 24").
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 7").
-            Replace("MaxArchitectureRevisions = 1", "MaxArchitectureRevisions = 3").
             Replace("AutoCommit = `$true", "AutoCommit = `$false").
             Replace(
                 'CommitMessagePrefix = "Test Review Loop"',
@@ -754,8 +682,8 @@ Describe "Run state" {
         $liveChanged | Should Be $initial
 
         $content = $content.Replace(
-            'Reviewer = @{ Model = "fake"; Thinking = "high" }',
-            'Reviewer = @{ Model = "fake"; Thinking = "medium" }')
+            'ReviewBase = "HEAD"',
+            'ReviewBase = "HEAD^"')
         Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
         $executionChanged = & $module {
             param($path)
@@ -843,7 +771,7 @@ Describe "Fake Codex integration" {
     }
 
     It "runs a structured role through the CLI" {
-        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -SchemaPath (Join-Path $root "schemas\review-result-v1.schema.json") -CodexPath $fakeCodex
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -SchemaPath (Join-Path $root "schemas\architecture-advice-v2.schema.json") -CodexPath $fakeCodex
         $call.Success | Should Be $true
     }
 
@@ -931,7 +859,7 @@ Describe "Fake Codex integration" {
 
     It "fails invalid structured output" {
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = "not json"
-        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -SchemaPath (Join-Path $root "schemas\review-result-v1.schema.json") -CodexPath $fakeCodex
+        $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -SchemaPath (Join-Path $root "schemas\architecture-advice-v2.schema.json") -CodexPath $fakeCodex
         $call.Success | Should Be $false
         $call.FailureKind | Should Be "invalid_structured_output"
     }
@@ -1028,9 +956,9 @@ Describe "Live terminal and streaming process observation" {
             Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
             & (Get-Module CodexReviewLoop) {
                 param($profile, $loopState, $loopStatePath, $repository, $runRoot, $fakePath)
-                Invoke-ConfiguredCodexRole -Config $profile -Role Reviewer -RepoPath $repository `
+                Invoke-ConfiguredCodexRole -Config $profile -Role Architect -RepoPath $repository `
                     -Speed standard -Prompt review -LogRoot $runRoot `
-                    -SchemaName "review-result-v1.schema.json" -CallId "review-01" `
+                    -SchemaName "architecture-advice-v2.schema.json" -CallId "architect-01" `
                     -State $loopState -StatePath $loopStatePath -CodexPath $fakePath
             } $config $state $checkpointPath $repoPath $logs $fake | Out-Null
         } -ArgumentList $modulePath, $configPath, $repo, $logRoot, $statePath, $fakeCodex
@@ -1052,7 +980,7 @@ Describe "Live terminal and streaming process observation" {
                 }
                 Start-Sleep -Milliseconds 100
             }
-            $checkpoint.ActiveRoleCall.CallId | Should Be "review-01"
+            $checkpoint.ActiveRoleCall.CallId | Should Be "architect-01"
             $checkpoint.ActiveRoleCall.ThreadId | Should Be "fake-thread-001"
             $job.State | Should Be "Running"
             Wait-Job -Job $job -Timeout 15 | Out-Null
@@ -1330,13 +1258,93 @@ Describe "Schemas, prompts, and CLI-only invariants" {
     }
 
     It "contains every production prompt" {
-        @("trigger-judge.md", "architect.md", "architecture-critic.md", "fixer.md", "verifier.md") |
+        @("architect.md", "fixer.md", "verifier.md") |
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
+    }
+
+    It "accepts free architecture advice and an unavailable targeted test" {
+        '{"schemaVersion":"2.0","summary":"Any approach.","approach":"Replace the subsystem if useful.","steps":[],"considerations":[]}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\architecture-advice-v2.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"2.0","summary":"Done.","targetedTest":{"available":false,"filePath":"","arguments":[]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v2.schema.json") |
+            Should Be $true
+    }
+
+    It "keeps the complete free-role prompts stable" {
+        $expected = @{
+            "architect.md" = @'
+Role:
+You are the architect for this software project.
+
+Goal:
+Decide how the current findings should be handled.
+
+Current findings:
+{{FINDINGS}}
+
+Repository context:
+{{REPOSITORY_CONTEXT}}
+
+Recent history:
+{{HISTORY}}
+
+Result:
+Return your advice in the supplied structured format.
+'@
+            "fixer.md" = @'
+Role:
+You are the fixer for the current findings.
+
+Goal:
+Use your judgment to improve the repository in response to the findings and architectural advice.
+
+Current findings:
+{{FINDINGS}}
+
+Architectural advice:
+{{ARCHITECT_ADVICE}}
+
+Previous feedback:
+{{FEEDBACK}}
+
+Execution context:
+The orchestrator observes repository changes, can execute the returned targeted test, runs the configured host gates, and owns the commit.
+
+Result:
+Return your work summary and targeted-test information in the supplied structured format.
+'@
+            "verifier.md" = @'
+Role:
+You are the verifier for the current solution.
+
+Goal:
+Decide whether the current repository state is a satisfactory response to the findings.
+
+Current findings:
+{{FINDINGS}}
+
+Architectural advice:
+{{ARCHITECT_ADVICE}}
+
+Fixer result and targeted-test execution:
+{{FIXER_RESULT}}
+
+Result:
+Return your decision and any feedback in the supplied structured format.
+'@
+        }
+        foreach ($name in $expected.Keys) {
+            $actual = (Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$name")).
+                Replace("`r`n", "`n").TrimEnd()
+            $actual | Should Be $expected[$name].Replace("`r`n", "`n").TrimEnd()
+        }
     }
 
     It "replaces only placeholders from the original prompt template" {
         $values = @{
             FINDINGS = 'Finding contains {{DIFF}}.'
+            ARCHITECT_ADVICE = 'Advice contains {{ROOT}}.'
             FIXER_RESULT = 'Generated code contains {{heading}}.'
         }
         $rendered = & (Get-Module CodexReviewLoop) {
@@ -1354,6 +1362,7 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             & (Get-Module CodexReviewLoop) {
                 Get-ReviewLoopPrompt -Name "verifier.md" -Values @{
                     FINDINGS = "findings"
+                    ARCHITECT_ADVICE = "advice"
                 }
             } | Out-Null
         }
@@ -1365,25 +1374,22 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $message | Should Match "FIXER_RESULT"
     }
 
-    It "keeps analysis commands narrow and reserves full gates for the orchestrator" {
-        $roles = Get-Content -Raw -LiteralPath (Join-Path $root "src\Roles.ps1")
-        $roles | Should Match 'authoritative and owned by the orchestrator'
-        $roles | Should Match 'do not run a full repository or solution test suite'
-        $roles | Should Match 'must not edit repository files'
-        $roles | Should Match 'Preserve tracked and untracked repository state'
+    It "keeps role instructions factual and leaves decisions to the models" {
+        $prompts = (Get-ChildItem -LiteralPath (Join-Path $root "prompts") -Filter "*.md" |
+            ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
+        $prompts | Should Not Match '(?i)\bmust\b|\bnever\b|fail closed|\bprefer\b|\bonly\b|smallest|bounded'
+        $prompts | Should Match 'Use your judgment'
     }
 
-    It "uses the orchestrator-owned verifier test result" {
+    It "gives the verifier the fixer result and test execution" {
         $verifier = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\verifier.md")
-        $verifier | Should Match 'orchestrator supplies the independently executed targeted-test result'
+        $verifier | Should Match 'Fixer result and targeted-test execution'
     }
 
-    It "keeps fixer tests targeted while retaining independent orchestration" {
+    It "describes the fixer's mechanical orchestration context" {
         $fixer = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\fixer.md")
-        $fixer | Should Match 'narrowest useful project or filtered regression tests'
-        $fixer | Should Match 'Do not run the configured full repository host gates'
-        $fixer | Should Match 'exactly one structured `targetedTest`'
-        $fixer | Should Match 'independent execution by the orchestrator'
+        $fixer | Should Match 'observes repository changes'
+        $fixer | Should Match 'owns the commit'
     }
 
     It "has no direct HTTP model invocation in active code" {
@@ -1615,20 +1621,99 @@ Describe "End-to-end orchestration with fake Codex" {
         $result.CleanPasses | Should Be 2
         $result.ReviewCycles | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Review cycle 1/6"
+        $terminal | Should Match "Review cycle 1"
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Clean pass 2/2"
         $terminal | Should Match "Review Loop completed"
+    }
+
+    It "resets the MaxReviewCycles counter when the same command resumes" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            "No findings."
+        )
+
+        $limited = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $limited.Status | Should Be "limit_reached"
+        $limited.ExitCode | Should Be 4
+        $limited.ReviewCycles | Should Be 1
+        $limited.CleanPasses | Should Be 1
+        $limited.Reason | Should Match "review-cycle limit 1"
+        @((Read-ReviewLoopLedger -Path $limited.LedgerPath).Findings |
+            Where-Object { $_.Status -eq "blocked" }).Count | Should Be 0
+
+        $completed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $completed.Status | Should Be "completed"
+        $completed.ReviewCycles | Should Be 2
+        $state = Read-ReviewLoopState -Path $completed.StatePath
+        $state.ReviewCyclesThisInvocation | Should Be 1
+        $state.CleanPasses | Should Be 2
+    }
+
+    It "resets the MaxReviewCycles counter after any script restart" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $findingReview = "- [P1] restart budget defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
+        $fixer = '{"schemaVersion":"2.0","summary":"Handled it.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $verifier = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        $plans = @(
+            [pscustomobject]@{ result = $findingReview },
+            [pscustomobject]@{
+                exitCode = 1
+                stderr = "Not logged in; login required"
+            },
+            [pscustomobject]@{ result = $architecture },
+            [pscustomobject]@{ result = $fixer },
+            [pscustomobject]@{ result = $verifier },
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "restart-budget-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $failed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $failed.Status | Should Be "failed"
+        (Read-ReviewLoopState -Path $failed.StatePath).ReviewCyclesThisInvocation |
+            Should Be 1
+
+        $completed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $completed.Status | Should Be "completed"
+        $completed.ReviewCycles | Should Be 2
+        $state = Read-ReviewLoopState -Path $completed.StatePath
+        $state.ReviewCyclesThisInvocation | Should Be 1
+        @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json }) |
+            Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
     }
 
     It "reloads live profile settings without stopping the active run" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 2")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
-        $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"live reload defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]}]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["live-reload.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
-        $clean = '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+        $findingReview = "- [P1] live reload defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address the defect.","approach":"Update the affected behavior.","steps":["Change the implementation."],"considerations":[]}'
+        $fixChanged = '{"schemaVersion":"2.0","summary":"Fixed the defect.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The solution is acceptable.","feedback":[]}'
+        $clean = "No findings."
         $plans = @(
             [pscustomobject]@{
                 result = $findingReview
@@ -1646,6 +1731,7 @@ Describe "End-to-end orchestration with fake Codex" {
                     )
                 }
             },
+            [pscustomobject]@{ result = $architecture },
             [pscustomobject]@{
                 result = $fixChanged
                 mutations = @([pscustomobject]@{
@@ -1672,7 +1758,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Reloaded live profile settings"
         $terminal | Should Match "MaxReviewCycles 2 -> 3"
-        $terminal | Should Match "Review cycle 3/3"
+        $terminal | Should Match "Review cycle 3"
         $terminal | Should Not Match "active profile changed"
     }
 
@@ -1749,18 +1835,20 @@ Describe "End-to-end orchestration with fake Codex" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
-        $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"one","findings":[{"priority":"P1","title":"cache defect","path":"src/A.cs","line":10,"component":"cache","rootCause":"missing dependency","invariant":"cache invalidates","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs","tests/A.Tests.cs"]}]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt","fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $stillOpen = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v2.schema.json"
+        $findingReview = "- [P1] cache defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address the cache defect.","approach":"Update the affected cache behavior.","steps":[],"considerations":[]}'
+        $fixChanged = '{"schemaVersion":"2.0","summary":"Updated the cache.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $stillOpen = '{"schemaVersion":"3.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."]}'
+        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"The defect is resolved.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $findingReview,
+            $architecture,
             $fixChanged, $stillOpen,
             $fixChanged, $stillOpen,
             $fixChanged, $resolved,
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+            'No findings.',
+            'No findings.'
         )
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun
@@ -1769,40 +1857,45 @@ Describe "End-to-end orchestration with fake Codex" {
         $ledger.Findings[0].Status | Should Be "resolved"
         $ledger.Findings[0].FixAttempts | Should Be 3
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 2
+        @($records | Where-Object {
+            $_.callKind -eq "resume" -and
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+        }).Count | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
-        $terminal | Should Match "Fixer · attempt 3/3 · resuming thread"
-        $terminal | Should Match "Fixer: changed · 1 changed paths"
-        $terminal | Should Match "Verifier: resolved"
+        $terminal | Should Match "Fixer · call 3 · resuming thread"
+        $terminal | Should Match "Fixer: Updated the cache"
+        $terminal | Should Match "Verifier: accepted"
         $terminal | Should Match "Host-Gate: fake gate"
         $terminal | Should Match "Committed"
     }
 
-    It "rolls back an exhausted cluster before committing an independent cluster" {
-        $findingReview = '{"schemaVersion":"1.0","classification":"findings","summary":"two independent findings","findings":[{"priority":"P1","title":"first defect","path":"src/A.cs","line":10,"component":"first","rootCause":"first cause","invariant":"first invariant","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second defect","path":"src/B.cs","line":20,"component":"second","rootCause":"second cause","invariant":"second invariant","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"changed","changedPaths":[],"targetedTest":{"filePath":"pwsh","arguments":["-NoProfile","-Command","exit 0"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $reproduced = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"still present"}]}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"fixed"}]}'
-        $clean = '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+    It "starts a new native review round instead of blocking after MaxFixAttempts" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("MaxFixAttempts = 2", "MaxFixAttempts = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $findingReview = "- [P1] defect at src/A.cs:10"
+        $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
+        $fixChanged = '{"schemaVersion":"2.0","summary":"Changed the implementation.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $reproduced = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Try another approach."]}'
+        $resolved = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
+            [pscustomobject]@{ result = $architecture },
             [pscustomobject]@{
                 result = $fixChanged
-                mutations = @([pscustomobject]@{ path = "first.txt"; content = "abandoned attempt one" })
+                mutations = @([pscustomobject]@{ path = "fixed.txt"; content = "attempt one" })
             },
             [pscustomobject]@{ result = $reproduced },
+            [pscustomobject]@{ result = $findingReview },
+            [pscustomobject]@{ result = $architecture },
             [pscustomobject]@{
                 result = $fixChanged
-                mutations = @([pscustomobject]@{ path = "first.txt"; content = "abandoned attempt two" })
-            },
-            [pscustomobject]@{ result = $reproduced },
-            [pscustomobject]@{
-                result = $fixChanged
-                mutations = @([pscustomobject]@{ path = "second.txt"; content = "independent verified fix" })
+                mutations = @([pscustomobject]@{ path = "fixed.txt"; content = "attempt two" })
             },
             [pscustomobject]@{ result = $resolved },
-            [pscustomobject]@{ result = $clean }
+            [pscustomobject]@{ result = "No findings." },
+            [pscustomobject]@{ result = "No findings." }
         )
         $invocationPlanPath = Join-Path $caseRoot "rollback-invocations.json"
         Set-Content -LiteralPath $invocationPlanPath `
@@ -1813,26 +1906,22 @@ Describe "End-to-end orchestration with fake Codex" {
             -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun `
             -HeartbeatSeconds 0 -ColorMode Never
 
-        $result.Status | Should Be "blocked"
+        $result.Status | Should Be "completed"
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
-        Test-Path -LiteralPath (Join-Path $repo "first.txt") | Should Be $false
-        (Get-Content -Raw -LiteralPath (Join-Path $repo "second.txt")) | Should Match "independent verified fix"
-        $committedPaths = @(& git -C $repo show --format= --name-only HEAD -- | Where-Object { $_ })
-        $committedPaths | Should Be @("second.txt")
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "fixed.txt")) | Should Match "attempt two"
         $ledger = Read-ReviewLoopLedger -Path $result.LedgerPath
-        $blockedFinding = @($ledger.Findings | Where-Object {
-            $_.Status -eq "blocked" -and $_.FixAttempts -eq 2
-        })[0]
-        $blockedFinding | Should Not BeNullOrEmpty
-        Test-Path -LiteralPath $blockedFinding.BlockedArtifactRoot | Should Be $true
-        @($ledger.Findings | Where-Object { $_.Status -eq "resolved" -and $_.FixAttempts -eq 1 }).Count | Should Be 1
+        @($ledger.Findings | Where-Object {
+            $_.Status -eq "resolved" -and $_.FixAttempts -eq 1
+        }).Count | Should Be 1
+        @($ledger.Findings | Where-Object { $_.Status -eq "blocked" }).Count | Should Be 0
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
-        }).Count | Should Be 3
-        @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-proposal-v1.schema.json"
-        }).Count | Should Be 0
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json" -and
+            $_.callKind -eq "exec"
+        }).Count | Should Be 2
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 4
+        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
+            Should Match "restarting with the native Reviewer"
     }
 
     It "leaves the target repository unchanged during prompt-independent clean orchestration" {
@@ -1846,218 +1935,60 @@ Describe "End-to-end orchestration with fake Codex" {
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
     }
 
-    It "requires critic and veto agreement for a semantic finding cluster" {
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
-        $twoFindings = '{"schemaVersion":"1.0","classification":"findings","summary":"two","findings":[{"priority":"P1","title":"first","path":"src/A.cs","line":10,"component":"shared","rootCause":"cause-a","invariant":"invariant-a","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second","path":"src/B.cs","line":20,"component":"shared","rootCause":"cause-b","invariant":"invariant-b","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
-        $firstId = Get-ReviewLoopFindingId `
-            -Path "src/A.cs" -Component "shared" -RootCause "cause-a" -Invariant "invariant-a"
-        $triggerArchitecture = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
-        $architectureId = Get-ReviewLoopFindingId `
-            -Path "src/B.cs" -Component "shared" -RootCause "cause-b" -Invariant "invariant-b"
-        $proposal = '{"schemaVersion":"1.0","recommendation":"consolidation","summary":"shared","sharedRootCause":"contract","minimalAlternative":"two points","findings":[{"findingId":"' + $firstId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"},{"findingId":"' + $architectureId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"}],"steps":[{"path":"src/Shared.cs","change":"centralize","productionCode":true,"findingIds":["' + $firstId + '","' + $architectureId + '"],"regressionTest":"test"}],"risks":[],"breaksPublicContract":false}'
-        $approve = '{"schemaVersion":"1.0","decision":"approve","confidence":"high","rationale":"complete","coherentRootCause":true,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":true,"missingPaths":[],"requiredChanges":[]}'
-        $reject = '{"schemaVersion":"1.0","decision":"reject_to_point_fix","confidence":"high","rationale":"artificial","coherentRootCause":false,"allFindingsCovered":true,"allRequiredPathsCovered":true,"minimalEnough":false,"missingPaths":[],"requiredChanges":[]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+    It "passes native review output and architect advice forward without side roles" {
+        $nativeReview = "- [P1] first defect at src/A.cs:10`n- [P2] second defect at src/B.cs:20"
+        $architectureV2 = '{"schemaVersion":"2.0","summary":"Use one coherent change.","approach":"Change both affected paths together.","steps":["Update A.","Update B."],"considerations":["Keep the public behavior."]}'
+        $fixerV2 = '{"schemaVersion":"2.0","summary":"Applied the advice.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $twoFindings,
-            $triggerArchitecture, $triggerArchitecture,
-            $proposal, $approve, $reject, $reject,
-            $fixChanged, $resolved,
-            $fixChanged, $resolved,
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+            $nativeReview, $architectureV2, $fixerV2, $verifierV3,
+            'No findings.', 'No findings.'
         )
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun
         $result.Status | Should Be "completed"
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         $architectCalls = @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-proposal-v1.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-advice-v2.schema.json"
         })
         $architectCalls.Count | Should Be 1
-        [regex]::Matches([string]$architectCalls[0].prompt, '"Id":"F-[^"]+"').Count | Should Be 2
-        @($records | Where-Object { [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-critique-v1.schema.json" }).Count | Should Be 3
-        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Trigger: same_contract_different_edge · multiple_active_findings"
-        $terminal | Should Match "Proposal r0: consolidation"
-        $terminal | Should Match "Terra-Critic: approve"
-        $terminal | Should Match "Sol-Veto: reject_to_point_fix"
-        $terminal | Should Match "Terra-Tie-Break: reject_to_point_fix"
+        ([string]$architectCalls[0].prompt).Replace("`r`n", "`n") |
+            Should Match ([regex]::Escape($nativeReview))
+        $fixerCall = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+        })[0]
+        [string]$fixerCall.prompt | Should Match ([regex]::Escape(
+            '"approach":"Change both affected paths together."'))
+        @($records | Where-Object {
+            [string]$_.schemaPath -match 'trigger|critique|veto|tie'
+        }).Count | Should Be 0
     }
 
-    It "falls back to point fixing after the configured architecture revision budget" {
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
-        $twoFindings = '{"schemaVersion":"1.0","classification":"findings","summary":"two","findings":[{"priority":"P1","title":"first","path":"src/A.cs","line":10,"component":"shared","rootCause":"cause-a","invariant":"invariant-a","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/A.cs"]},{"priority":"P1","title":"second","path":"src/B.cs","line":20,"component":"shared","rootCause":"cause-b","invariant":"invariant-b","evidence":"e","reproduction":"r","suggestedFix":"f","suggestedTest":"t","fixPaths":["src/B.cs"]}]}'
-        $firstId = Get-ReviewLoopFindingId `
-            -Path "src/A.cs" -Component "shared" -RootCause "cause-a" -Invariant "invariant-a"
-        $triggerArchitecture = '{"schemaVersion":"2.0","decisions":[{"candidateFindingId":"' + $firstId + '","relation":"same_contract_different_edge","candidateStatus":"active","confidence":"high","rationale":"shared contract","evidence":[{"path":"README.txt","line":1,"claim":"the findings share a contract"}]}]}'
-        $architectureId = Get-ReviewLoopFindingId `
-            -Path "src/B.cs" -Component "shared" -RootCause "cause-b" -Invariant "invariant-b"
-        $proposal = '{"schemaVersion":"1.0","recommendation":"consolidation","summary":"shared","sharedRootCause":"contract","minimalAlternative":"two points","findings":[{"findingId":"' + $firstId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"},{"findingId":"' + $architectureId + '","disposition":"fixed","reproduction":"r","regressionTest":"test"}],"steps":[{"path":"src/Shared.cs","change":"centralize","productionCode":true,"findingIds":["' + $firstId + '","' + $architectureId + '"],"regressionTest":"test"}],"risks":[],"breaksPublicContract":false}'
-        $revise = '{"schemaVersion":"1.0","decision":"revise","confidence":"high","rationale":"missing path","coherentRootCause":true,"allFindingsCovered":false,"allRequiredPathsCovered":false,"minimalEnough":true,"missingPaths":["src/Missing.cs"],"requiredChanges":["add missing path"]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
+    It "lets the verifier request another fixer call without adjudication" {
+        $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
+        $fixerV2 = '{"schemaVersion":"2.0","summary":"Worked on it.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $rejectV3 = '{"schemaVersion":"3.0","accept":false,"summary":"Continue.","feedback":["Handle the remaining case."]}'
+        $acceptV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $twoFindings,
-            $triggerArchitecture, $triggerArchitecture,
-            $proposal, $revise,
-            $proposal, $revise,
-            $fixChanged, $resolved,
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
+            '- [P1] defect at src/A.cs:10',
+            $architectureV2,
+            $fixerV2, $rejectV3,
+            $fixerV2, $acceptV3,
+            'No findings.', 'No findings.'
         )
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun
         $result.Status | Should Be "completed"
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object { [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json" }).Count | Should Be 1
-        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
-            Should Match "falling back to point fixing"
-    }
-
-    It "recovers an interrupted dirty fix and uses only the remaining attempt" {
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "fixer-result-v1.schema.json"
-        $config = Import-PowerShellDataFile -LiteralPath $configPath
-        $profileRoot = & (Get-Module CodexReviewLoop) {
-            param($profile, $repository)
-            (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository).ProfileRoot
-        } $config $repo
-        $runRoot = Join-Path $profileRoot "99999999-active"
-        New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
-        $statePath = Join-Path $runRoot "run-v1.json"
-        $ledgerPath = Join-Path $profileRoot "ledger-v2.json"
-        $ledger = New-ReviewLoopLedger -RepoPath $repo
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-TestFinding)) -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
-        $finding = $ledger.Findings[0]
-        $finding.Status = "fixing"
-        $finding.FixAttempts = 1
-        $finding.FixerThreadId = "cluster-thread"
-        $finding.FixPaths = @($finding.FixPaths) + "interrupted.txt"
-        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
-
-        $reviewBaseCommit = & git -C $repo rev-parse HEAD
-        $executionFingerprint = & (Get-Module CodexReviewLoop) {
-            param($path)
-            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
-        } $configPath
-        $state = New-ReviewLoopState `
-            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot `
-            -ReviewBaseCommit $reviewBaseCommit -ExecutionFingerprint $executionFingerprint
-        $state.Stage = "fix_attempted"
-        $state.ActiveClusterId = $finding.ClusterId
-        $state.ActiveFindingIds = @($finding.Id)
-        $state.LastFixerResult = [pscustomobject]@{
-            StructuredResult = [pscustomobject]@{
-                schemaVersion = "1.0"
-                outcome = "changed"
-                summary = "interrupted"
-                changedPaths = @("interrupted.txt")
-                targetedTest = [pscustomobject]@{
-                    filePath = "dotnet"
-                    arguments = @("test", ".\review-loop-test.proj", "--no-restore", "--nologo")
-                    rationale = "targeted regression"
-                }
-                remainingRisk = ""
-            }
-            ThreadId = "cluster-thread"
-            Attempt = 1
-        }
-        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
-        Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "dirty"
-
-        $stillOpen = '{"schemaVersion":"2.0","verdict":"reproduced","patchSafety":"safe","confidence":"high","rationale":"still open","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect remains"}]}'
-        $fixChanged = '{"schemaVersion":"1.0","outcome":"changed","summary":"fixed","changedPaths":["fake-review-loop-change.test.txt"],"targetedTest":{"filePath":"dotnet","arguments":["test",".\\review-loop-test.proj","--no-restore","--nologo"],"rationale":"targeted regression"},"remainingRisk":""}'
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
-        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $stillOpen, $fixChanged, $resolved,
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
-        )
-
-        $result = Invoke-CodexReviewLoop `
-            -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex `
-            -OutputMode balanced -HeartbeatSeconds 0 -ColorMode Never
-        $result.Status | Should Be "completed"
-        $updated = Read-ReviewLoopLedger -Path $ledgerPath
-        $updated.Findings[0].FixAttempts | Should Be 2
-        $updated.Findings[0].Status | Should Be "resolved"
-        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object { ($_.arguments -join " ") -match ' resume cluster-thread -' }).Count | Should Be 1
-        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
-            Should Match "Output:\s+balanced · heartbeat 0s · Never"
-    }
-
-    It "resumes a failed verifier checkpoint without rerunning the completed fixer attempt" {
-        $config = Import-PowerShellDataFile -LiteralPath $configPath
-        $profileRoot = & (Get-Module CodexReviewLoop) {
-            param($profile, $repository)
-            (New-ReviewLoopRunPaths -Config $profile -RepoPath $repository).ProfileRoot
-        } $config $repo
-        $runRoot = Join-Path $profileRoot "99999999-failed"
-        New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
-        $statePath = Join-Path $runRoot "run-v1.json"
-        $ledgerPath = Join-Path $profileRoot "ledger-v2.json"
-        $ledger = New-ReviewLoopLedger -RepoPath $repo
-        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-TestFinding)) -ReviewId r1 -Head (& git -C $repo rev-parse HEAD) | Out-Null
-        $finding = $ledger.Findings[0]
-        $finding.Status = "fixing"
-        $finding.FixAttempts = 1
-        $finding.FixerThreadId = "cluster-thread"
-        $finding.FixPaths = @($finding.FixPaths) + "interrupted.txt"
-        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
-
-        $reviewBaseCommit = & git -C $repo rev-parse HEAD
-        $executionFingerprint = & (Get-Module CodexReviewLoop) {
-            param($path)
-            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
-        } $configPath
-        $state = New-ReviewLoopState `
-            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot `
-            -ReviewBaseCommit $reviewBaseCommit -ExecutionFingerprint $executionFingerprint
-        $state.Status = "failed"
-        $state.ExitCode = 2
-        $state.Stage = "stopped"
-        $state.BlockedReason = "Prompt 'verifier.md' contains unreplaced placeholders."
-        $state.ActiveClusterId = $finding.ClusterId
-        $state.ActiveFindingIds = @($finding.Id)
-        $state.LastFixerResult = [pscustomobject]@{
-            StructuredResult = [pscustomobject]@{
-                schemaVersion = "1.0"
-                outcome = "changed"
-                summary = "fix already completed"
-                changedPaths = @("interrupted.txt")
-                targetedTest = [pscustomobject]@{
-                    filePath = "dotnet"
-                    arguments = @("test", ".\review-loop-test.proj", "--no-restore", "--nologo")
-                    rationale = "targeted regression"
-                }
-                remainingRisk = ""
-            }
-            ThreadId = "cluster-thread"
-            Attempt = 1
-        }
-        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
-        Set-Content -LiteralPath (Join-Path $repo "interrupted.txt") -Value "dirty"
-
-        $resolved = '{"schemaVersion":"2.0","verdict":"resolved","patchSafety":"safe","confidence":"high","rationale":"fixed","regressions":[],"evidence":[{"path":"README.txt","line":1,"claim":"the defect is fixed"}]}'
-        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $resolved,
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
-        )
-
-        $result = Invoke-CodexReviewLoop `
-            -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex `
-            -HeartbeatSeconds 0 -ColorMode Never
-
-        $result.Status | Should Be "completed"
-        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v1.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v2.schema.json"
+        }).Count | Should Be 2
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "verifier-result-v3.schema.json"
+        }).Count | Should Be 2
+        @($records | Where-Object {
+            [string]$_.schemaPath -match 'confirm|tie'
         }).Count | Should Be 0
-        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Not Match "Resuming the previous failed checkpoint at stage 'fix_attempted'"
-        $terminal | Should Match "Resuming interrupted fix cluster"
     }
+
 }

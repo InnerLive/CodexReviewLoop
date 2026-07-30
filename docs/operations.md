@@ -84,36 +84,38 @@ speed. The base commit recorded at run start remains pinned and must still
 exist.
 
 Interrupted fixer work can resume from its recorded thread and remaining
-attempt. A changed tool or execution-affecting profile fingerprint resets
-clean-pass evidence and forces completed model work to be requalified before
-commit. `MaxReviewCycles` and `CommitMessagePrefix` are live profile settings;
-they are reloaded at safe boundaries without invalidating the checkpoint.
+call. A changed tool or execution-affecting profile fingerprint resets
+clean-pass evidence and starts a fresh native review when the repository is
+clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, host gates, and
+commit settings are reloaded at safe boundaries.
 
-Use `-NewRun` when a blocked or interrupted finding should receive a fresh
-two-attempt budget. It still requires a clean worktree, respects the repository
-lock, and keeps compatible finding history. It is not a way to discard the
-ledger or bypass safety checks.
+Use `-NewRun` when you deliberately want a new run checkpoint. It still
+requires a clean worktree, respects the repository lock, and keeps compatible
+finding history. It is not needed to refresh an exhausted Fixer round because
+that happens automatically.
 
 ## Outcomes
 
 | Status | Exit code | Meaning |
 |---|---:|---|
-| `completed` | `0` | Two clean passes on unchanged `HEAD`; no open or blocked findings |
+| `completed` | `0` | Required clean passes on unchanged `HEAD` |
 | Invocation error | `1` | Validation or preflight failed before a run checkpoint was created |
 | `failed` | `2` | An initialized run failed; its latest checkpoint is preserved |
-| `blocked` | `3` | The loop cannot safely claim completion; checkpoint preserved |
+| `limit_reached` | `4` | The configured per-invocation review budget was used; run the same command to continue |
 
-Independent clusters continue after one cluster is blocked. The run stops as
-blocked only after useful independent work is exhausted or a hard invariant
-requires it.
+Rejected solutions and exhausted Fixer rounds are not terminal outcomes. After
+`MaxFixAttempts` unsuccessful Fixer calls, the loop writes a binary Git patch,
+copies untracked files, and records hashes under the run directory. It then
+restores only the exact captured Fixer changes, verifies a clean worktree, and
+starts another native review. A changed `HEAD`, unexpected paths or contents,
+damaged artifacts, submodules, or reparse points are genuine technical failures
+and stop cleanup without deleting uncertain state.
 
-After the second unsuccessful fix attempt, the loop writes a binary Git patch,
-copies untracked files, and records hashes under
-`<RunRoot>\blocked\<ClusterId>-attempt-<n>`. It then restores only the exact
-captured fixer changes, verifies a clean worktree, and continues independent
-clusters. Cleanup can resume after a crash. A changed `HEAD`, unexpected paths
-or contents, damaged artifacts, submodules, or reparse points stop cleanup
-without deleting the uncertain state.
+`MaxReviewCycles` is deliberately different: it lets a user cap one unattended
+script invocation for token or time control. Every new invocation resets only
+that cycle counter and retains the checkpoint. Reaching the limit leaves the
+checkpoint resumable, does not mark any finding blocked, and the same command
+continues with a fresh budget.
 
 Each Codex process attempt has a 45-minute timeout; technical retries can make a
 complete role take longer. Each targeted test and host gate has a 30-minute
@@ -126,11 +128,8 @@ process tree and preserves the latest valid checkpoint.
 2. Open the single reported detail path when more diagnosis is needed.
 3. Fix external prerequisites or repository state without editing the
    checkpoint.
-4. Run the same command to resume, or use `-NewRun` only when a fresh semantic
-   attempt budget is intentional.
+4. Run the same command to resume after repairing the technical problem.
 
 Old dirty `cluster_blocked` checkpoints are not cleaned automatically because
-they cannot prove which changes belong to the fixer. Their failure guidance
-provides a concrete `git stash push --include-untracked` and `-NewRun` route,
-plus the alternative of deliberately inspecting, committing, or reverting the
-changes.
+they cannot prove which changes belong to the Fixer. This is legacy recovery,
+not an outcome produced by the current four-role loop.

@@ -14,12 +14,10 @@ function Get-ReviewLoopOperationalInstructions {
     )
 
     $instructions = @"
-This is an unattended Windows PowerShell run.
-Prefer repository-relative paths. Do not inspect credentials or stop unrelated processes.
-Do not change Git refs or the index. The orchestrator owns process lifetime, retries, verification, and commits.
-You have unattended command access. Use any repository-specific tool needed to finish the role without asking for approval.
-Before naming an uncertain path, discover it with rg --files, rg, or Get-ChildItem. Prefer direct PowerShell commands over nested shell quoting.
-If an exploratory command fails, correct it and continue; do not treat the miss as a blocker.
+This role runs unattended in a Windows PowerShell repository workspace.
+The repository root, local tools, and repository instructions are available to the role.
+The orchestrator records repository state, owns Git refs and commits, executes configured host gates, and manages the Codex process.
+The role returns its result through the supplied structured format.
 "@
     $hostGateCommands = @($Config.HostGates | ForEach-Object {
         $arguments = @($_.Arguments | ForEach-Object { [string]$_ }) -join " "
@@ -33,14 +31,14 @@ If an exploratory command fails, correct it and continue; do not treat the miss 
     }
     $testOwnership = @"
 
-The following full repository gates are authoritative and owned by the orchestrator:
+Configured host gates:
 $hostGateText
-Do not execute these configured gate commands inside this role. The orchestrator runs them after independent verification.
+The orchestrator executes these gates after verification.
 "@
-    if ($Role -in @("PointFixer", "ArchitectureFixer")) {
-        return "$instructions$testOwnership`nEdit the repository files needed for the supplied findings. While iterating, run only the narrowest useful project or filtered regression tests. If no narrower durable regression command exists, return the full command as the structured targeted test without running it yourself. Return one structured targeted regression test for the orchestrator to execute independently."
+    if ($Role -eq "Fixer") {
+        return "$instructions$testOwnership`nThe fixer workspace is the worktree observed by the orchestrator."
     }
-    return "$instructions$testOwnership`nPreserve tracked and untracked repository state. Use supplied test evidence and narrow investigative commands; do not run a full repository or solution test suite. You must not edit repository files."
+    return "$instructions$testOwnership`nThis role contributes analysis; the orchestrator compares repository state before and after the call."
 }
 
 function Get-ReviewLoopPrompt {
@@ -118,16 +116,23 @@ function Invoke-ConfiguredCodexRole {
         [Parameter(Mandatory = $true)][string]$Role,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$Speed,
-        [Parameter(Mandatory = $true)][string]$Prompt,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [string]$SchemaName = "",
-        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
+        [ValidateSet("Exec", "Resume", "Review")][string]$Mode = "Exec",
         [string]$ThreadId = "",
+        [string]$ReviewBase = "",
         [string]$CodexPath = "",
         [string]$CallId = "",
         [object]$State = $null,
         [string]$StatePath = ""
     )
+
+    if ($Role -eq "Reviewer" -and
+        ($Mode -ne "Review" -or -not [string]::IsNullOrWhiteSpace($Prompt) -or
+         -not [string]::IsNullOrWhiteSpace($SchemaName))) {
+        throw "Reviewer must use native Codex review without a prompt or output schema."
+    }
 
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $Role
@@ -160,14 +165,23 @@ function Invoke-ConfiguredCodexRole {
             $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
             if ([string]$record.RepositoryHead -ne [string]$current.Head -or
                 [string]$record.WorktreeFingerprint -ne [string]$current.Fingerprint) {
-                Stop-ReviewLoopBlocked -Message "Completed role call '$CallId' no longer matches the repository checkpoint."
+                if (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
+                    Write-ReviewLoopStatus `
+                        -Message "$Role checkpoint '$CallId' is stale; starting the role again." `
+                        -Kind Info
+                }
+                else {
+                    Stop-ReviewLoopBlocked -Message "Completed role call '$CallId' no longer matches the repository checkpoint."
+                }
             }
-            Write-ReviewLoopStatus -Message "$Role reused completed checkpoint '$CallId'." -Kind Info
-            return ConvertFrom-ReviewLoopRoleCallRecord -Record $record
+            else {
+                Write-ReviewLoopStatus -Message "$Role reused completed checkpoint '$CallId'." -Kind Info
+                return ConvertFrom-ReviewLoopRoleCallRecord -Record $record
+            }
         }
     }
 
-    $mayEditRepository = $Role -in @("PointFixer", "ArchitectureFixer")
+    $mayEditRepository = $Role -eq "Fixer"
     $pending = if ($null -ne $State) {
         Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
     }
@@ -185,8 +199,7 @@ function Invoke-ConfiguredCodexRole {
         $pendingExecution = [string](Get-ReviewLoopObjectProperty `
             -Object $pending -Name "ExecutionFingerprint" -Default "")
         if ($pendingExecution -ne $executionFingerprint) {
-            if ([string]$pendingSnapshot.Head -eq [string]$currentSnapshot.Head -and
-                [string]$pendingSnapshot.Fingerprint -eq [string]$currentSnapshot.Fingerprint) {
+            if (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
                 $State.ActiveRoleCall = $null
                 Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
                 $pending = $null
@@ -204,6 +217,14 @@ function Invoke-ConfiguredCodexRole {
         elseif (-not $mayEditRepository -and
             [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint) {
             Stop-ReviewLoopBlocked -Message "Read-only role '$Role' changed the repository before interruption."
+        }
+        elseif ($Mode -eq "Review" -and $Role -eq "Reviewer") {
+            $State.ActiveRoleCall = $null
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+            $pending = $null
+            Write-ReviewLoopStatus `
+                -Message "Interrupted native review will start again from the current clean checkpoint." `
+                -Kind Info
         }
     }
 
@@ -230,8 +251,7 @@ function Invoke-ConfiguredCodexRole {
         else {
             $effectiveMode = "Resume"
             $effectivePrompt = @"
-Resume the interrupted $Role role. Do not repeat completed investigation or edits.
-Inspect current repository state only as needed and return the required final structured result for the original role task.
+Continue the interrupted $Role work from the current repository state and return the role result in the supplied structured format.
 "@
         }
     }
@@ -268,12 +288,18 @@ Inspect current repository state only as needed and return the required final st
         SchemaPath = $schemaPath
         Mode = $effectiveMode
         ThreadId = $effectiveThreadId
+        ReviewBase = $ReviewBase
         CallId = $CallId
     }
     if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
         $arguments.CodexPath = $CodexPath
     }
-    $operationalInstructions = Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
+    $operationalInstructions = if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
+        ""
+    }
+    else {
+        Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
+    }
     $arguments.DeveloperInstructions = $operationalInstructions
     $worktreeBefore = if ($mayEditRepository) {
         ""
@@ -333,61 +359,56 @@ function Assert-ReviewLoopRoleSuccess {
     }
 }
 
-function Assert-ReviewLoopReviewResult {
-    param([Parameter(Mandatory = $true)][object]$Result)
+function Get-ReviewLoopRecentHistory {
+    param(
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [ValidateRange(0, 50)][int]$Limit = 50
+    )
 
-    $findings = @($Result.findings)
-    if ([string]$Result.classification -eq "clean" -and $findings.Count -ne 0) {
-        throw "Reviewer reported clean but returned $($findings.Count) findings."
+    if ($Limit -eq 0) {
+        return @()
     }
-    if ([string]$Result.classification -eq "findings" -and $findings.Count -eq 0) {
-        throw "Reviewer reported findings but returned no finding."
-    }
-    foreach ($finding in $findings) {
-        foreach ($name in @(
-            "title", "path", "component", "rootCause", "invariant",
-            "evidence", "reproduction", "suggestedFix", "suggestedTest"
-        )) {
-            if ([string]::IsNullOrWhiteSpace([string]$finding.$name)) {
-                throw "Reviewer finding contains an empty '$name' field."
+    return @($Ledger.Findings |
+        Sort-Object UpdatedAt -Descending |
+        Select-Object -First $Limit |
+        ForEach-Object {
+            [pscustomobject][ordered]@{
+                id = [string]$_.Id
+                status = [string]$_.Status
+                title = [string]$_.Title
+                description = [string](Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "Description" -Default (
+                        Get-ReviewLoopObjectProperty -Object $_ -Name "Evidence" -Default ""))
+                locations = @((Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "Locations" -Default @([pscustomobject]@{
+                        path = [string]$_.Path
+                        line = [int]$_.Line
+                    })))
+                resolutionCommit = [string]$_.ResolutionCommit
+                updatedAt = [string]$_.UpdatedAt
             }
-        }
-        if (-not (Test-ReviewLoopRepositoryRelativePath -Path ([string]$finding.path))) {
-            throw "Reviewer finding path must be repository-relative: $($finding.path)"
-        }
-        $fixPaths = @($finding.fixPaths)
-        if ($fixPaths.Count -eq 0) {
-            throw "Reviewer finding must contain at least one fixPath."
-        }
-        foreach ($path in $fixPaths) {
-            if ([string]::IsNullOrWhiteSpace([string]$path) -or
-                -not (Test-ReviewLoopRepositoryRelativePath -Path ([string]$path))) {
-                throw "Reviewer finding contains an invalid fix path: $path"
-            }
-        }
-        $canonicalPath = ConvertTo-ReviewLoopCanonicalText ([string]$finding.path)
-        if ($canonicalPath -notin @($fixPaths | ForEach-Object {
-            ConvertTo-ReviewLoopCanonicalText ([string]$_)
-        })) {
-            throw "Reviewer finding fixPaths must include its primary path '$($finding.path)'."
-        }
-    }
+        })
 }
 
-function Normalize-ReviewLoopReviewResult {
-    param([Parameter(Mandatory = $true)][object]$Result)
+function Get-ReviewLoopRepositoryContext {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
 
-    $findings = @($Result.findings)
-    $Result.classification = if ($findings.Count -eq 0) { "clean" } else { "findings" }
-    foreach ($finding in $findings) {
-        $paths = @(
-            [string]$finding.path
-            @($finding.fixPaths | ForEach-Object { [string]$_ })
-        ) | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_) -and
-            (Test-ReviewLoopRepositoryRelativePath -Path $_)
-        } | ForEach-Object { $_.Replace("\", "/") } | Sort-Object -Unique
-        $finding.fixPaths = $paths
+    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    $changed = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "diff", "--name-only", "$($State.ReviewBaseCommit)...$head", "--"
+    )
+    return [pscustomobject][ordered]@{
+        repositoryRoot = $RepoPath
+        branch = [string]$State.Branch
+        reviewBase = [string]$State.ReviewBase
+        reviewBaseCommit = [string]$State.ReviewBaseCommit
+        head = $head
+        changedPaths = @($changed -split "\r?\n" | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        })
     }
 }
 
@@ -404,657 +425,94 @@ function Invoke-ReviewLoopReview {
     )
 
     $cycle = [int]$State.ReviewCycle
-    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    $context = Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath
+    $head = [string]$context.head
     if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
-        throw "The worktree changed before the read-only review started."
+        throw "The worktree changed before the reviewer started."
     }
-    $changedPathText = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
-        "diff", "--name-only", "$($State.ReviewBaseCommit)...$head", "--"
-    )
-    $changedPaths = @($changedPathText -split "\r?\n" | ForEach-Object {
-        ConvertTo-ReviewLoopCanonicalText $_
-    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $identityCatalog = @($Ledger.Findings | Where-Object {
-        if ([string]$_.Status -in @("duplicate", "superseded")) {
-            return $false
-        }
-        if ([string]$_.Status -in @("pending", "open", "fixing")) {
-            return $true
-        }
-        return @($_.FixPaths | Where-Object {
-            (ConvertTo-ReviewLoopCanonicalText $_) -in $changedPaths
-        }).Count -gt 0
-    } | Sort-Object UpdatedAt -Descending | Select-Object -First 200 | ForEach-Object {
-        [pscustomobject]@{
-            id = $_.Id
-            status = $_.Status
-            path = $_.Path
-            component = $_.Component
-            rootCause = $_.RootCause
-            invariant = $_.Invariant
-        }
-    })
-    $reviewPrompt = @"
-Review the complete branch diff against commit $($State.ReviewBaseCommit).
-Report only discrete, actionable correctness, security, reliability, or material performance defects.
-Ignore style-only cleanup and optional architecture ideas. Verify each finding against current code.
-Keep investigation scoped to changed hunks, their direct dependencies, and relevant tests.
-For a recurrence of an existing defect, reuse its path, component, rootCause, and invariant text verbatim
-so its ledger identity remains stable. Existing identity catalog:
-$(ConvertTo-ReviewLoopJsonCompact $identityCatalog)
-Return the final review only in the supplied structured schema. Do not emit a native review summary as the final answer.
-"@
-    $reviewCall = Invoke-ConfiguredCodexRole `
-        -Config $Config `
-        -Role "Reviewer" `
-        -RepoPath $RepoPath `
-        -Speed $Speed `
-        -Prompt $reviewPrompt `
-        -LogRoot $RunRoot `
-        -SchemaName "review-result-v1.schema.json" `
-        -Mode Exec `
-        -CodexPath $CodexPath `
-        -CallId ("review-{0:d2}" -f $cycle) `
-        -State $State `
-        -StatePath $StatePath
-    Assert-ReviewLoopRoleSuccess $reviewCall
-    for ($validationAttempt = 1; $validationAttempt -le 3; $validationAttempt++) {
-        $validationError = $null
-        try {
-            Normalize-ReviewLoopReviewResult -Result $reviewCall.StructuredResult
-            Assert-ReviewLoopReviewResult -Result $reviewCall.StructuredResult
-        }
-        catch {
-            $validationError = $_.Exception.Message
-        }
-        if ($null -eq $validationError) {
-            break
-        }
-        if ($validationAttempt -ge 3 -or
-            [string]::IsNullOrWhiteSpace([string]$reviewCall.ThreadId)) {
-            throw "Reviewer result remained semantically invalid after correction: $validationError"
-        }
-        Write-ReviewLoopStatus -Message "Reviewer result needs a structural correction: $validationError" -Kind Warning
-        $reviewCall = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "Reviewer" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt "Correct only the structured review result: $validationError. Preserve the completed review and return the full corrected result." `
-            -LogRoot $RunRoot -SchemaName "review-result-v1.schema.json" `
-            -Mode Resume -ThreadId ([string]$reviewCall.ThreadId) -CodexPath $CodexPath `
-            -CallId ("review-{0:d2}-correction-{1}" -f $cycle, $validationAttempt) `
-            -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $reviewCall
-    }
+    $call = Invoke-ConfiguredCodexRole `
+        -Config $Config -Role "Reviewer" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt "" -LogRoot $RunRoot `
+        -Mode Review -ReviewBase ([string]$State.ReviewBase) `
+        -CodexPath $CodexPath -CallId ("review-{0:d2}" -f $cycle) `
+        -State $State -StatePath $StatePath
+    Assert-ReviewLoopRoleSuccess $call
 
     $headAfter = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
     if ($headAfter -ne $head -or -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
-        Stop-ReviewLoopBlocked -Message "Repository HEAD or worktree changed during the read-only review."
+        Stop-ReviewLoopBlocked -Message "Repository HEAD or worktree changed during the reviewer role."
     }
-    $result = $reviewCall.StructuredResult
-    $findingCount = @($result.findings).Count
 
-    if ([string]$result.classification -eq "clean") {
-        Write-ReviewLoopStatus -Message "Review is clean: $($result.summary)" -Kind Success
+    $reviewText = [string]$call.FinalMessage
+    $isClean = $reviewText.Trim() -match (
+        "(?is)^(?:no\s+(?:actionable\s+)?findings?|the\s+review\s+found\s+no\s+(?:actionable\s+)?findings?)\s*[.!]?\s*$")
+    $summary = @($reviewText -split "\r?\n" | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    } | Select-Object -First 1) -join ""
+    $findings = if ($isClean) {
+        @()
     }
     else {
-        Write-ReviewLoopStatus -Message "$findingCount Finding(s): $($result.summary)" -Kind Review
-        foreach ($finding in @($result.findings)) {
-            $location = [string]$finding.path
-            if ($null -ne $finding.line -and [int]$finding.line -gt 0) {
-                $location += ":$($finding.line)"
-            }
-            Write-ReviewLoopStatus -Message "$($finding.priority) · $($finding.title) · $location" -Kind Review -Indent 1
-            if (Test-ReviewLoopOutputLevel -Minimum balanced) {
-                Write-ReviewLoopStatus -Message "Root cause: $($finding.rootCause)" -Kind Muted -Indent 2
-            }
-        }
+        @([pscustomobject]@{
+            title = "Codex review cycle $cycle"
+            description = $reviewText
+            locations = @()
+        })
+    }
+    if ($isClean) {
+        Write-ReviewLoopStatus -Message "Review is clean: $summary" -Kind Success
+    }
+    else {
+        Write-ReviewLoopStatus -Message "Reviewer returned findings: $summary" -Kind Review
+    }
+    $State | Add-Member -Force -NotePropertyName ActiveReviewText -NotePropertyValue $reviewText
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    $result = [pscustomobject]@{
+        summary = $summary
+        findings = $findings
+        text = $reviewText
+        clean = $isClean
     }
 
     return [pscustomobject]@{
         ReviewId = "review-{0:d2}" -f $cycle
         Head = $head
-        Call = $reviewCall
+        Call = $call
         Result = $result
     }
 }
 
-function Test-ReviewLoopPathLineEvidence {
-    param(
-        [Parameter(Mandatory = $true)][object]$Decision,
-        [Parameter(Mandatory = $true)][string]$RepoPath
-    )
-
-    foreach ($item in @($Decision.evidence)) {
-        $path = [string](Get-ReviewLoopObjectProperty -Object $item -Name "path" -Default "")
-        $line = [int](Get-ReviewLoopObjectProperty -Object $item -Name "line" -Default 0)
-        $claim = [string](Get-ReviewLoopObjectProperty -Object $item -Name "claim" -Default "")
-        if ([string]::IsNullOrWhiteSpace($path) -or
-            [string]::IsNullOrWhiteSpace($claim) -or
-            $line -lt 1 -or
-            -not (Test-ReviewLoopRepositoryRelativePath -Path $path)) {
-            continue
-        }
-        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $RepoPath $path))
-        $relative = [System.IO.Path]::GetRelativePath($RepoPath, $fullPath)
-        if ($relative -eq ".." -or $relative.StartsWith("..\") -or
-            -not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
-            continue
-        }
-        $reader = $null
-        try {
-            $reader = [System.IO.File]::OpenText($fullPath)
-            $currentLine = 0
-            while ($currentLine -lt $line -and $null -ne $reader.ReadLine()) {
-                $currentLine++
-            }
-            if ($currentLine -ge $line) {
-                return $true
-            }
-        }
-        finally {
-            if ($null -ne $reader) {
-                $reader.Dispose()
-            }
-        }
-    }
-    return $false
-}
-
-function ConvertTo-ReviewLoopRelationFindingPayload {
-    param([Parameter(Mandatory = $true)][object]$Finding)
-
-    return [pscustomobject][ordered]@{
-        id = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Id" -Default "")
-        status = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Status" -Default "unknown")
-        resolutionCommit = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "ResolutionCommit" -Default "")
-        path = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Path" -Default "")
-        line = [int](Get-ReviewLoopObjectProperty -Object $Finding -Name "Line" -Default 0)
-        component = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Component" -Default "")
-        rootCause = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "RootCause" -Default "")
-        invariant = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Invariant" -Default "")
-        evidence = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Evidence" -Default "")
-        reproduction = [string](Get-ReviewLoopObjectProperty -Object $Finding -Name "Reproduction" -Default "")
-        fixPaths = @((Get-ReviewLoopObjectProperty -Object $Finding -Name "FixPaths" -Default @()))
-    }
-}
-
-function Get-ReviewLoopTriggerDecision {
-    param(
-        [Parameter(Mandatory = $true)][object]$Result,
-        [Parameter(Mandatory = $true)][string]$CandidateId
-    )
-
-    $matches = @($Result.decisions | Where-Object {
-        [string]$_.candidateFindingId -eq $CandidateId
-    })
-    if ($matches.Count -ne 1) {
-        return $null
-    }
-    return $matches[0]
-}
-
-function Test-ReviewLoopTriggerResultShape {
-    param(
-        [Parameter(Mandatory = $true)][object]$Result,
-        [Parameter(Mandatory = $true)][string[]]$CandidateIds
-    )
-
-    $decisions = @($Result.decisions)
-    $actualIds = @($decisions | ForEach-Object {
-        [string]$_.candidateFindingId
-    })
-    return $decisions.Count -eq $CandidateIds.Count -and
-        @($actualIds | Sort-Object -Unique).Count -eq $CandidateIds.Count -and
-        @($actualIds | Where-Object { $_ -notin $CandidateIds }).Count -eq 0 -and
-        @($CandidateIds | Where-Object { $_ -notin $actualIds }).Count -eq 0
-}
-
-function Test-ReviewLoopTriggerDecisionSupported {
-    param(
-        [AllowNull()][object]$Decision,
-        [Parameter(Mandatory = $true)][string]$RepoPath
-    )
-
-    return $null -ne $Decision -and
-        [string]$Decision.confidence -eq "high" -and
-        ([string]$Decision.relation -eq "insufficient_evidence" -or
-            (Test-ReviewLoopPathLineEvidence -Decision $Decision -RepoPath $RepoPath))
-}
-
-function New-ReviewLoopUnsupportedTriggerDecision {
-    param([Parameter(Mandatory = $true)][string]$CandidateId)
-
-    return [pscustomobject][ordered]@{
-        candidateFindingId = $CandidateId
-        relation = "insufficient_evidence"
-        candidateStatus = "unknown"
-        confidence = "low"
-        rationale = "Independent judges did not produce one supported high-confidence decision."
-        evidence = @()
-    }
-}
-
-function Invoke-ReviewLoopTriggerJudge {
+function Invoke-ReviewLoopArchitect {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
         [Parameter(Mandatory = $true)][object]$State,
         [Parameter(Mandatory = $true)][string]$StatePath,
-        [Parameter(Mandatory = $true)][string]$RepoPath,
-        [Parameter(Mandatory = $true)][string]$Speed,
-        [Parameter(Mandatory = $true)][string]$RunRoot,
-        [Parameter(Mandatory = $true)][object]$Finding,
-        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][object[]]$Candidates,
-        [string]$CodexPath = ""
-    )
-
-    $candidateList = @($Candidates)
-    if ($candidateList.Count -eq 0) {
-        return [pscustomobject]@{
-            ArchitectureRecommended = $false
-            Relation = "insufficient_evidence"
-            Confidence = "high"
-            Rationale = "No semantic candidates in the ledger."
-            Decision = [pscustomobject]@{ schemaVersion = "2.0"; decisions = @() }
-            Relations = @()
-            Calls = @()
-        }
-    }
-
-    $relatedRelations = @(
-        "same_root_cause",
-        "same_contract_different_edge",
-        "regression_from_fix"
-    )
-    $calls = [System.Collections.Generic.List[object]]::new()
-    $relations = [System.Collections.Generic.List[object]]::new()
-    $currentPayload = ConvertTo-ReviewLoopRelationFindingPayload -Finding $Finding
-    for ($offset = 0; $offset -lt $candidateList.Count; $offset += 20) {
-        $batch = @($candidateList | Select-Object -Skip $offset -First 20)
-        $candidatePayload = @($batch | ForEach-Object {
-            [pscustomobject]@{
-                candidateFindingId = [string]$_.Finding.Id
-                finding = ConvertTo-ReviewLoopRelationFindingPayload -Finding $_.Finding
-                semanticSignals = [pscustomobject]@{
-                    sameComponent = $_.SameComponent
-                    sameRootCause = $_.SameRootCause
-                    sameInvariant = $_.SameInvariant
-                    sameCluster = $_.SameCluster
-                    overlappingFixPaths = $_.OverlappingFixPaths
-                }
-            }
-        })
-        $batchIds = @($candidatePayload | ForEach-Object {
-            [string]$_.candidateFindingId
-        })
-        $prompt = Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
-            CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
-            CANDIDATES = ConvertTo-ReviewLoopJsonCompact $candidatePayload
-        }
-        $primary = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "TriggerJudge" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $prompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
-            -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-primary" -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $primary
-        [void]$calls.Add($primary)
-
-        $primaryShapeValid = Test-ReviewLoopTriggerResultShape `
-            -Result $primary.StructuredResult -CandidateIds $batchIds
-        $confirmIds = [System.Collections.Generic.List[string]]::new()
-        foreach ($id in $batchIds) {
-            $decision = if ($primaryShapeValid) {
-                Get-ReviewLoopTriggerDecision -Result $primary.StructuredResult -CandidateId $id
-            }
-            else {
-                $null
-            }
-            $supported = Test-ReviewLoopTriggerDecisionSupported `
-                -Decision $decision -RepoPath $RepoPath
-            if ($supported -and [string]$decision.relation -eq "independent" -and
-                [string]$decision.candidateStatus -ne "unknown") {
-                [void]$relations.Add($decision)
-            }
-            else {
-                [void]$confirmIds.Add($id)
-            }
-        }
-        if ($confirmIds.Count -eq 0) {
-            continue
-        }
-
-        $confirmPayload = @($candidatePayload | Where-Object {
-            [string]$_.candidateFindingId -in $confirmIds
-        })
-        $confirmPrompt = @"
-$(Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
-    CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
-    CANDIDATES = ConvertTo-ReviewLoopJsonCompact $confirmPayload
-})
-
-Independently classify these related, uncertain, or structurally invalid primary cases. Do not copy the first judge.
-"@
-        $confirm = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "TriggerConfirm" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $confirmPrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
-            -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-confirm" -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $confirm
-        [void]$calls.Add($confirm)
-
-        $confirmShapeValid = Test-ReviewLoopTriggerResultShape `
-            -Result $confirm.StructuredResult -CandidateIds $confirmIds.ToArray()
-        $unresolvedIds = [System.Collections.Generic.List[string]]::new()
-        foreach ($id in $confirmIds) {
-            $left = if ($primaryShapeValid) {
-                Get-ReviewLoopTriggerDecision -Result $primary.StructuredResult -CandidateId $id
-            }
-            else {
-                $null
-            }
-            $right = if ($confirmShapeValid) {
-                Get-ReviewLoopTriggerDecision -Result $confirm.StructuredResult -CandidateId $id
-            }
-            else {
-                $null
-            }
-            $leftSupported = Test-ReviewLoopTriggerDecisionSupported `
-                -Decision $left -RepoPath $RepoPath
-            $rightSupported = Test-ReviewLoopTriggerDecisionSupported `
-                -Decision $right -RepoPath $RepoPath
-            if ($leftSupported -and $rightSupported -and
-                [string]$left.relation -eq [string]$right.relation -and
-                [string]$left.candidateStatus -eq [string]$right.candidateStatus) {
-                [void]$relations.Add($right)
-            }
-            elseif (-not $leftSupported -and $rightSupported -and
-                [string]$right.relation -eq "independent") {
-                [void]$relations.Add($right)
-            }
-            else {
-                [void]$unresolvedIds.Add($id)
-            }
-        }
-        if ($unresolvedIds.Count -eq 0) {
-            continue
-        }
-
-        $tiePayload = @($candidatePayload | Where-Object {
-            [string]$_.candidateFindingId -in $unresolvedIds
-        })
-        $tiePrompt = @"
-$(Get-ReviewLoopPrompt -Name "trigger-judge.md" -Values @{
-    CURRENT_FINDING = ConvertTo-ReviewLoopJsonCompact $currentPayload
-    CANDIDATES = ConvertTo-ReviewLoopJsonCompact $tiePayload
-})
-
-Luna decisions:
-$(ConvertTo-ReviewLoopJsonCompact $primary.StructuredResult)
-
-Sol decisions:
-$(ConvertTo-ReviewLoopJsonCompact $confirm.StructuredResult)
-
-Adjudicate every supplied disagreement once. Keep relation and candidate status independent.
-"@
-        $tie = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "TriggerTieBreak" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "trigger-decision-v2.schema.json" `
-            -CodexPath $CodexPath -CallId "$($Finding.Id)-c$($State.ReviewCycle)-relation-$offset-tie" -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $tie
-        [void]$calls.Add($tie)
-        $tieShapeValid = Test-ReviewLoopTriggerResultShape `
-            -Result $tie.StructuredResult -CandidateIds $unresolvedIds.ToArray()
-        foreach ($id in $unresolvedIds) {
-            $final = if ($tieShapeValid) {
-                Get-ReviewLoopTriggerDecision -Result $tie.StructuredResult -CandidateId $id
-            }
-            else {
-                $null
-            }
-            if (Test-ReviewLoopTriggerDecisionSupported -Decision $final -RepoPath $RepoPath) {
-                [void]$relations.Add($final)
-            }
-            else {
-                [void]$relations.Add((New-ReviewLoopUnsupportedTriggerDecision -CandidateId $id))
-            }
-        }
-    }
-
-    $architecture = @($relations | Where-Object {
-        [string]$_.relation -in $relatedRelations -and
-        [string]$_.candidateStatus -in @("active", "resolved")
-    }).Count -gt 0
-    $summary = @($relations | Group-Object relation | ForEach-Object {
-        "$($_.Name)=$($_.Count)"
-    }) -join ", "
-    return [pscustomobject]@{
-        ArchitectureRecommended = $architecture
-        Relation = if ($architecture) {
-            [string](@($relations | Where-Object {
-                [string]$_.relation -in $relatedRelations
-            } | Select-Object -First 1).relation)
-        }
-        else { "independent" }
-        Confidence = if (@($relations | Where-Object {
-            [string]$_.confidence -ne "high"
-        }).Count -eq 0) { "high" } else { "low" }
-        Rationale = $summary
-        Decision = [pscustomobject]@{
-            schemaVersion = "2.0"
-            decisions = $relations.ToArray()
-        }
-        Relations = $relations.ToArray()
-        Calls = $calls.ToArray()
-    }
-}
-
-function Get-ReviewLoopArchitectureScope {
-    param([Parameter(Mandatory = $true)][object]$Proposal)
-
-    $paths = @($Proposal.steps | ForEach-Object { [string]$_.path } | Sort-Object -Unique)
-    $productionPaths = @($Proposal.steps | Where-Object {
-        $path = ConvertTo-ReviewLoopCanonicalText ([string]$_.path)
-        $clearlyNonProduction = $path -match '(^|/)(tests?|specs?|__tests__|docs?)(/|$)' -or
-            $path -match '\.(md|markdown|rst|adoc)$'
-        [bool]$_.productionCode -or -not $clearlyNonProduction
-    } | ForEach-Object { [string]$_.path } | Sort-Object -Unique)
-    return [pscustomobject]@{
-        Paths = $paths
-        ProductionPaths = $productionPaths
-        PathCount = $paths.Count
-        ProductionPathCount = $productionPaths.Count
-        BreaksPublicContract = [bool]$Proposal.breaksPublicContract
-    }
-}
-
-function Assert-ReviewLoopArchitectureProposal {
-    param(
-        [Parameter(Mandatory = $true)][object]$Proposal,
-        [Parameter(Mandatory = $true)][object[]]$Findings
-    )
-
-    if ([string]$Proposal.recommendation -ne "consolidation") {
-        return
-    }
-    $activeIds = @($Findings | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
-    $proposalFindings = @($Proposal.findings)
-    $proposalIds = @($proposalFindings | ForEach-Object {
-        [string]$_.findingId
-    } | Sort-Object -Unique)
-    if ($proposalFindings.Count -ne $activeIds.Count -or
-        $proposalIds.Count -ne $activeIds.Count -or
-        @($activeIds | Where-Object { $_ -notin $proposalIds }).Count -gt 0 -or
-        @($proposalIds | Where-Object { $_ -notin $activeIds }).Count -gt 0) {
-        throw "Architecture proposal must cover exactly the active finding IDs."
-    }
-    foreach ($finding in $proposalFindings) {
-        if ([string]$finding.disposition -eq "out_of_scope" -or
-            [string]::IsNullOrWhiteSpace([string]$finding.reproduction) -or
-            [string]::IsNullOrWhiteSpace([string]$finding.regressionTest)) {
-            throw "Architecture proposal contains an incomplete finding disposition."
-        }
-    }
-    $steps = @($Proposal.steps)
-    if ($steps.Count -eq 0) {
-        throw "A consolidation proposal must contain at least one bounded change step."
-    }
-    $coveredIds = [System.Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::Ordinal)
-    foreach ($step in $steps) {
-        if ([string]::IsNullOrWhiteSpace([string]$step.path) -or
-            -not (Test-ReviewLoopRepositoryRelativePath -Path ([string]$step.path)) -or
-            [string]::IsNullOrWhiteSpace([string]$step.change) -or
-            [string]::IsNullOrWhiteSpace([string]$step.regressionTest)) {
-            throw "Architecture proposal contains an invalid or incomplete change step."
-        }
-        $stepIds = @($step.findingIds | ForEach-Object { [string]$_ })
-        if ($stepIds.Count -eq 0 -or
-            @($stepIds | Where-Object { $_ -notin $activeIds }).Count -gt 0) {
-            throw "Every architecture step must reference active finding IDs only."
-        }
-        foreach ($id in $stepIds) {
-            [void]$coveredIds.Add($id)
-        }
-    }
-    if (@($activeIds | Where-Object { -not $coveredIds.Contains($_) }).Count -gt 0) {
-        throw "Architecture proposal does not connect every finding to a change step."
-    }
-}
-
-function Test-ReviewLoopCritiquesAgree {
-    param(
-        [Parameter(Mandatory = $true)][object]$Left,
-        [Parameter(Mandatory = $true)][object]$Right
-    )
-    return [string]$Left.decision -eq [string]$Right.decision
-}
-
-function Test-ReviewLoopArchitectureApproval {
-    param([Parameter(Mandatory = $true)][object]$Decision)
-
-    return [string]$Decision.decision -eq "approve" -and
-        [string]$Decision.confidence -eq "high" -and
-        [bool]$Decision.coherentRootCause -and
-        [bool]$Decision.allFindingsCovered -and
-        [bool]$Decision.allRequiredPathsCovered -and
-        [bool]$Decision.minimalEnough -and
-        @($Decision.missingPaths).Count -eq 0 -and
-        @($Decision.requiredChanges).Count -eq 0
-}
-
-function Invoke-ReviewLoopArchitectureGate {
-    param(
-        [Parameter(Mandatory = $true)][hashtable]$Config,
-        [Parameter(Mandatory = $true)][object]$State,
-        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$Speed,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][object[]]$Findings,
-        [Parameter(Mandatory = $true)][object]$Trigger,
         [string]$CodexPath = ""
     )
 
-    $findingJson = ConvertTo-ReviewLoopJsonCompact $Findings
-    $architectPrompt = Get-ReviewLoopPrompt -Name "architect.md" -Values @{
-        FINDINGS = $findingJson
-        TRIGGER = ConvertTo-ReviewLoopJsonCompact $Trigger
-        EVIDENCE = "Inspect current repository code and tests directly. Treat this supplied cluster as the complete allowed scope."
+    $prompt = Get-ReviewLoopPrompt -Name "architect.md" -Values @{
+        FINDINGS = [string]$State.ActiveReviewText
+        REPOSITORY_CONTEXT = ConvertTo-ReviewLoopJsonCompact (
+            Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath)
+        HISTORY = ConvertTo-ReviewLoopJsonCompact @(
+            Get-ReviewLoopRecentHistory -Ledger $Ledger -Limit 50)
     }
-    $revision = 0
-    while ($true) {
-        $architect = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $architectPrompt -LogRoot $RunRoot -SchemaName "architecture-proposal-v1.schema.json" `
-            -CodexPath $CodexPath -CallId ("$($State.ActiveClusterId)-c$($State.ReviewCycle)-architecture-r$revision") -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $architect
-        $proposal = $architect.StructuredResult
-        try {
-            Assert-ReviewLoopArchitectureProposal -Proposal $proposal -Findings $Findings
-        }
-        catch {
-            Write-ReviewLoopStatus -Message "Architecture proposal is structurally incomplete; falling back to point fixing: $($_.Exception.Message)" -Kind Warning
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $null }
-        }
-        Write-ReviewLoopStatus -Message "Proposal r${revision}: $($proposal.recommendation) · $($proposal.summary)" -Kind Architecture
-        if ([string]$proposal.recommendation -in @("point_fix", "no_architecture")) {
-            Write-ReviewLoopStatus -Message "Architect limited the cluster to a point fix." -Kind Warning -Indent 1
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $null }
-        }
-
-        $scope = Get-ReviewLoopArchitectureScope $proposal
-        Write-ReviewLoopStatus -Message "Scope: $($scope.PathCount) paths, $($scope.ProductionPathCount) production" -Kind Architecture -Indent 1
-        if ($scope.BreaksPublicContract) {
-            Write-ReviewLoopStatus -Message "Architecture proposal may break a public contract; falling back to point fixing." -Kind Warning
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $null }
-        }
-
-        $criticPrompt = Get-ReviewLoopPrompt -Name "architecture-critic.md" -Values @{
-            FINDINGS = $findingJson
-            PROPOSAL = ConvertTo-ReviewLoopJsonCompact $proposal
-            EVIDENCE = "Inspect current repository code and tests directly. Fail closed on missing paths or unsupported causal links."
-        }
-        $critic = Invoke-ConfiguredCodexRole `
-            -Config $Config -Role "ArchitectureCritic" -RepoPath $RepoPath -Speed $Speed `
-            -Prompt $criticPrompt -LogRoot $RunRoot -SchemaName "architecture-critique-v1.schema.json" `
-            -CodexPath $CodexPath -CallId ("$($State.ActiveClusterId)-c$($State.ReviewCycle)-critic-r$revision") -State $State -StatePath $StatePath
-        Assert-ReviewLoopRoleSuccess $critic
-        $decision = $critic.StructuredResult
-        Write-ReviewLoopStatus -Message "Terra-Critic: $($decision.decision) · Confidence $($decision.confidence)" -Kind Architecture
-
-        if ([string]$decision.decision -eq "approve") {
-            $veto = Invoke-ConfiguredCodexRole `
-                -Config $Config -Role "ArchitectureVeto" -RepoPath $RepoPath -Speed $Speed `
-                -Prompt $criticPrompt -LogRoot $RunRoot -SchemaName "architecture-critique-v1.schema.json" `
-                -CodexPath $CodexPath -CallId ("$($State.ActiveClusterId)-c$($State.ReviewCycle)-critic-veto-r$revision") -State $State -StatePath $StatePath
-            Assert-ReviewLoopRoleSuccess $veto
-            Write-ReviewLoopStatus -Message "Sol-Veto: $($veto.StructuredResult.decision) · Confidence $($veto.StructuredResult.confidence)" -Kind Architecture
-            if ((Test-ReviewLoopCritiquesAgree $decision $veto.StructuredResult) -and
-                (Test-ReviewLoopArchitectureApproval $decision) -and
-                (Test-ReviewLoopArchitectureApproval $veto.StructuredResult)) {
-                return [pscustomobject]@{ Approved = $true; PointFix = $false; Proposal = $proposal; Critique = $veto.StructuredResult }
-            }
-
-            $tiePrompt = "$criticPrompt`n`nTerra critique:`n$(ConvertTo-ReviewLoopJsonCompact $decision)`n`nSol veto:`n$(ConvertTo-ReviewLoopJsonCompact $veto.StructuredResult)`n`nAdjudicate once, fail closed."
-            $tie = Invoke-ConfiguredCodexRole `
-                -Config $Config -Role "ArchitectureTieBreak" -RepoPath $RepoPath -Speed $Speed `
-                -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "architecture-critique-v1.schema.json" `
-                -CodexPath $CodexPath -CallId ("$($State.ActiveClusterId)-c$($State.ReviewCycle)-critic-tie-r$revision") -State $State -StatePath $StatePath
-            Assert-ReviewLoopRoleSuccess $tie
-            $decision = $tie.StructuredResult
-            Write-ReviewLoopStatus -Message "Terra-Tie-Break: $($decision.decision) · Confidence $($decision.confidence)" -Kind Architecture
-            if ([string]$decision.confidence -ne "high") {
-                Write-ReviewLoopStatus -Message "Architecture critique remains unclear; falling back to point fixing." -Kind Warning
-                return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
-            }
-            if (Test-ReviewLoopArchitectureApproval $decision) {
-                return [pscustomobject]@{ Approved = $true; PointFix = $false; Proposal = $proposal; Critique = $decision }
-            }
-            if ([string]$decision.decision -eq "approve") {
-                Write-ReviewLoopStatus -Message "Architecture approval remained incomplete; falling back to point fixing." -Kind Warning
-                return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
-            }
-        }
-
-        if ([string]$decision.decision -eq "reject_to_point_fix") {
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
-        }
-        if ([string]$decision.decision -eq "blocked") {
-            Write-ReviewLoopStatus -Message "Architecture critic blocked consolidation; falling back to point fixing." -Kind Warning
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
-        }
-        if ([string]$decision.decision -ne "revise") {
-            throw "Unsupported architecture decision: $($decision.decision)"
-        }
-        Update-ReviewLoopLiveConfig -Config $Config
-        if ($revision -ge [int]$Config.MaxArchitectureRevisions) {
-            Write-ReviewLoopStatus -Message "Architecture revision budget exhausted; falling back to point fixing." -Kind Warning
-            return [pscustomobject]@{ Approved = $false; PointFix = $true; Proposal = $proposal; Critique = $decision }
-        }
-        $revision++
-        Write-ReviewLoopStatus `
-            -Message "Requesting architecture-proposal revision $revision/$($Config.MaxArchitectureRevisions)." `
-            -Kind Warning
-        $State.ArchitectureRevision = $revision
-        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-        $architectPrompt += "`n`nRequired critic changes for revision ${revision}:`n$(ConvertTo-ReviewLoopJsonCompact $decision)"
-    }
+    $call = Invoke-ConfiguredCodexRole `
+        -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "architecture-advice-v2.schema.json" `
+        -CodexPath $CodexPath `
+        -CallId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-architect" `
+        -State $State -StatePath $StatePath
+    Assert-ReviewLoopRoleSuccess $call
+    Write-ReviewLoopStatus `
+        -Message "Architect: $($call.StructuredResult.summary)" `
+        -Kind Architecture
+    return $call
 }
 
 function Invoke-ReviewLoopFixer {
@@ -1068,78 +526,30 @@ function Invoke-ReviewLoopFixer {
         [Parameter(Mandatory = $true)][object[]]$Findings,
         [Parameter(Mandatory = $true)][AllowNull()][object]$Strategy,
         [Parameter(Mandatory = $true)][int]$Attempt,
-        [ValidateRange(0, 2)][int]$Correction = 0,
+        [int]$Correction = 0,
         [string]$CallId = "",
         [string]$ThreadId = "",
         [string]$CodexPath = "",
         [string]$Feedback = "None."
     )
 
-    $role = if ($null -ne $Strategy -and [bool]$Strategy.Approved) { "ArchitectureFixer" } else { "PointFixer" }
-    $strategyPayload = if ($null -eq $Strategy) { "Bounded point fix." } else { ConvertTo-ReviewLoopJsonCompact $Strategy }
     $prompt = Get-ReviewLoopPrompt -Name "fixer.md" -Values @{
-        FINDINGS = ConvertTo-ReviewLoopJsonCompact $Findings
-        STRATEGY = $strategyPayload
+        FINDINGS = [string]$State.ActiveReviewText
+        ARCHITECT_ADVICE = ConvertTo-ReviewLoopJsonCompact $Strategy
         FEEDBACK = $Feedback
     }
     $mode = if ([string]::IsNullOrWhiteSpace($ThreadId)) { "Exec" } else { "Resume" }
     $stableCallId = if (-not [string]::IsNullOrWhiteSpace($CallId)) {
         $CallId
     }
-    elseif ($Correction -gt 0) {
-        "$($State.ActiveClusterId)-fix-$Attempt-correction-$Correction"
-    }
     else {
-        "$($State.ActiveClusterId)-fix-$Attempt"
+        "$($State.ActiveClusterId)-c$($State.ReviewCycle)-fix-a$Attempt-c$Correction"
     }
     return Invoke-ConfiguredCodexRole `
-        -Config $Config -Role $role -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v1.schema.json" `
+        -Config $Config -Role "Fixer" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v2.schema.json" `
         -Mode $mode -ThreadId $ThreadId -CodexPath $CodexPath `
         -CallId $stableCallId -State $State -StatePath $StatePath
-}
-
-function Test-ReviewLoopResolvedWithTestEvidence {
-    param(
-        [Parameter(Mandatory = $true)][object]$FixerResult,
-        [Parameter(Mandatory = $true)][object]$VerificationResult,
-        [Parameter(Mandatory = $true)][string]$RepoPath
-    )
-
-    return [string]$VerificationResult.verdict -eq "resolved" -and
-        [string]$VerificationResult.patchSafety -eq "safe" -and
-        @($VerificationResult.regressions).Count -eq 0 -and
-        [string]$VerificationResult.confidence -eq "high" -and
-        (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath) -and
-        [bool](Get-ReviewLoopObjectProperty `
-            -Object $FixerResult.testExecution -Name "Passed" -Default $false)
-}
-
-function Test-ReviewLoopRejectedVerification {
-    param(
-        [Parameter(Mandatory = $true)][object]$VerificationResult,
-        [Parameter(Mandatory = $true)][string]$RepoPath
-    )
-
-    $regressions = @($VerificationResult.regressions)
-    $patchRegression = [string]$VerificationResult.patchSafety -eq "regression_detected" -and
-        $regressions.Count -gt 0
-    return [string]$VerificationResult.confidence -eq "high" -and
-        (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath) -and
-        ([string]$VerificationResult.verdict -eq "reproduced" -or $patchRegression)
-}
-
-function Test-ReviewLoopSafeObsoleteVerification {
-    param(
-        [Parameter(Mandatory = $true)][object]$VerificationResult,
-        [Parameter(Mandatory = $true)][string]$RepoPath
-    )
-
-    return [string]$VerificationResult.verdict -eq "obsolete" -and
-        [string]$VerificationResult.patchSafety -eq "safe" -and
-        @($VerificationResult.regressions).Count -eq 0 -and
-        [string]$VerificationResult.confidence -eq "high" -and
-        (Test-ReviewLoopPathLineEvidence -Decision $VerificationResult -RepoPath $RepoPath)
 }
 
 function Invoke-ReviewLoopVerifier {
@@ -1157,97 +567,28 @@ function Invoke-ReviewLoopVerifier {
     )
 
     $prompt = Get-ReviewLoopPrompt -Name "verifier.md" -Values @{
-        FINDINGS = ConvertTo-ReviewLoopJsonCompact $Findings
+        FINDINGS = [string]$State.ActiveReviewText
+        ARCHITECT_ADVICE = ConvertTo-ReviewLoopJsonCompact $State.ActiveStrategy
         FIXER_RESULT = ConvertTo-ReviewLoopJsonCompact $FixerCall.StructuredResult
     }
-    $primary = Invoke-ConfiguredCodexRole `
-        -Config $Config -Role "FindingVerifier" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
-        -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-primary" -State $State -StatePath $StatePath
-    Assert-ReviewLoopRoleSuccess $primary
-    $result = $primary.StructuredResult
-    if (Test-ReviewLoopResolvedWithTestEvidence `
-        -FixerResult $FixerCall.StructuredResult `
-        -VerificationResult $result `
-        -RepoPath $RepoPath) {
-        return [pscustomobject]@{
-            Accepted = $true
-            Result = $result
-            Calls = @($primary)
-            Basis = "Luna + matching fixer test evidence"
-        }
+    $fixerCallId = [string](Get-ReviewLoopObjectProperty `
+        -Object $FixerCall -Name "CallId" -Default "")
+    if ([string]::IsNullOrWhiteSpace($fixerCallId)) {
+        $fixerCallId = "a$Attempt-c$([int](Get-ReviewLoopObjectProperty `
+            -Object $State.LastFixerResult -Name "Correction" -Default 0))"
     }
-    if (Test-ReviewLoopRejectedVerification -VerificationResult $result -RepoPath $RepoPath) {
-        return [pscustomobject]@{
-            Accepted = $false
-            Result = $result
-            Calls = @($primary)
-            Basis = "Luna"
-        }
-    }
-
-    $confirm = Invoke-ConfiguredCodexRole `
-        -Config $Config -Role "VerifierConfirm" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
-        -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-confirm" -State $State -StatePath $StatePath
-    Assert-ReviewLoopRoleSuccess $confirm
-    $confirmed = $confirm.StructuredResult
-    if ([string]$confirmed.verdict -eq [string]$result.verdict -and
-        [string]$confirmed.patchSafety -eq [string]$result.patchSafety -and
-        [string]$confirmed.confidence -eq "high" -and
-        ((Test-ReviewLoopRejectedVerification `
-                -VerificationResult $confirmed -RepoPath $RepoPath) -or
-            (Test-ReviewLoopSafeObsoleteVerification `
-                -VerificationResult $confirmed -RepoPath $RepoPath) -or
-            (Test-ReviewLoopResolvedWithTestEvidence `
-                -FixerResult $FixerCall.StructuredResult `
-                -VerificationResult $confirmed `
-                -RepoPath $RepoPath))) {
-        return [pscustomobject]@{
-            Accepted = [string]$confirmed.verdict -eq "resolved"
-            Result = $confirmed
-            Calls = @($primary, $confirm)
-            Basis = "Luna + Sol confirmation"
-        }
-    }
-
-    $tiePrompt = "$prompt`n`nLuna verification:`n$(ConvertTo-ReviewLoopJsonCompact $result)`n`nSol verification:`n$(ConvertTo-ReviewLoopJsonCompact $confirmed)`n`nAdjudicate the disagreement once."
-    $tie = Invoke-ConfiguredCodexRole `
-        -Config $Config -Role "VerifierTieBreak" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $tiePrompt -LogRoot $RunRoot -SchemaName "verifier-result-v2.schema.json" `
-        -CodexPath $CodexPath -CallId "$($State.ActiveClusterId)-verify-a$Attempt-tie" -State $State -StatePath $StatePath
-    Assert-ReviewLoopRoleSuccess $tie
-    $final = $tie.StructuredResult
-    $finalSupported = (Test-ReviewLoopResolvedWithTestEvidence `
-            -FixerResult $FixerCall.StructuredResult `
-            -VerificationResult $final `
-            -RepoPath $RepoPath) -or
-        (Test-ReviewLoopRejectedVerification `
-            -VerificationResult $final -RepoPath $RepoPath) -or
-        (Test-ReviewLoopSafeObsoleteVerification `
-            -VerificationResult $final -RepoPath $RepoPath)
-    if (-not $finalSupported) {
-        $inconclusiveBasis = if ([string]$final.verdict -eq "resolved") {
-            "Resolved verdict lacked orchestrator-owned test evidence or a safe patch"
-        }
-        else {
-            "Terra adjudication remained inconclusive"
-        }
-        return [pscustomobject]@{
-            Accepted = $false
-            Result = $final
-            Calls = @($primary, $confirm, $tie)
-            Basis = $inconclusiveBasis
-        }
-    }
-    $finalAccepted = Test-ReviewLoopResolvedWithTestEvidence `
-        -FixerResult $FixerCall.StructuredResult `
-        -VerificationResult $final `
-        -RepoPath $RepoPath
+    $verificationKey = (Get-ReviewLoopSha256 $fixerCallId).Substring(0, 12)
+    $call = Invoke-ConfiguredCodexRole `
+        -Config $Config -Role "Verifier" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v3.schema.json" `
+        -CodexPath $CodexPath `
+        -CallId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-verify-$verificationKey" `
+        -State $State -StatePath $StatePath
+    Assert-ReviewLoopRoleSuccess $call
     return [pscustomobject]@{
-        Accepted = $finalAccepted
-        Result = $final
-        Calls = @($primary, $confirm, $tie)
-        Basis = "Terra adjudication"
+        Accepted = [bool]$call.StructuredResult.accept
+        Result = $call.StructuredResult
+        Calls = @($call)
+        Basis = "Verifier decision"
     }
 }

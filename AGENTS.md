@@ -7,21 +7,20 @@ tests, profiles, documentation, or release behavior.
 ## Product mission
 
 Codex Review Loop exists so a developer can start a review/fix cycle and walk
-away. It must review a branch, identify real defects, make bounded fixes,
+away. It must review a branch, identify real defects, make useful fixes,
 independently verify them, run repository-owned quality gates, commit only
-verified work, and stop only at a trustworthy completion or a useful
-checkpoint.
+verified work, and continue until trustworthy completion unless the user-owned
+review-cycle budget or a genuine technical failure stops the invocation.
 
 The scarce resource is the user's attention. Requiring the user to inspect
 architecture proposals, classify findings, approve routine commands, repair
 state, or repeatedly restart the tool defeats the product. "Unattended" is not
 an optional mode; it is the primary requirement.
 
-A long loop is not evidence of diligence by itself. Twenty iterations that
-rediscover, rename, regress, or ambiguously close the same defects are a product
-failure. Progress must be measured through stable finding identity, verified
-state transitions, bounded attempts, passing evidence, and clean reviews on an
-unchanged HEAD.
+A long loop is not evidence of diligence by itself. Rejected Fixer rounds must
+return to native review instead of becoming durable blocked findings. Progress
+is demonstrated by accepted commits and clean native reviews on an unchanged
+HEAD.
 
 ## What the user is optimizing for
 
@@ -75,7 +74,7 @@ recover from ordinary exploratory mistakes.
 
 Do not build a second command-policy engine, path allowlist, shell parser, or
 per-role sandbox matrix into this tool. Every role uses the same central Codex
-CLI process path with:
+CLI process adapter. Structured `exec` and `resume` calls use:
 
 - `--ignore-user-config`
 - `--ignore-rules`
@@ -83,6 +82,12 @@ CLI process path with:
 - an explicit model
 - an explicit reasoning effort
 - an explicit service tier
+
+The Reviewer uses the direct `codex review --base ...` command with the shared
+model, reasoning, service-tier, repository, and unattended settings supported
+by that command. It receives no custom prompt, developer instructions, JSONL
+switch, result schema, or output-file switch; its plain review output is the
+authoritative reviewer result.
 
 Control model behavior through clear role contracts and enforce outcomes with
 postconditions:
@@ -101,12 +106,10 @@ Codex process failure or an invalid role result. Conversely, do not hide a real
 process failure, `turn.failed`, invalid structured result, unsafe mutation, or
 broken process lifecycle behind an advisory classification.
 
-Model-run tests are exploratory evidence only. Configured host gates and the
-fixer's structured targeted test are authoritative. Avoid redundant full-suite
-tests inside Reviewer, Judge, Critic, or Verifier turns by supplying useful
-evidence and clear instructions, but do not reintroduce a general command
-allowlist. Long-running commands must not leave orphaned Windows child
-processes.
+Model-run tests are exploratory evidence only. Configured host gates and an
+available structured targeted test are authoritative. Do not add instructions
+to the native Reviewer, and do not reintroduce a general command allowlist.
+Long-running commands must not leave orphaned Windows child processes.
 
 ## Public interface invariants
 
@@ -144,99 +147,68 @@ The current quality/cost allocation is intentional:
 | Role | Model | Reasoning |
 |---|---|---|
 | Reviewer | `gpt-5.6-sol` | `high` |
-| Trigger Judge | `gpt-5.6-luna` | `low` |
-| Trigger Confirmation | `gpt-5.6-sol` | `low` |
-| Trigger Tie-Break | `gpt-5.6-terra` | `medium` |
 | Architect | `gpt-5.6-sol` | `high` |
-| Architecture Critic | `gpt-5.6-terra` | `medium` |
-| Architecture Veto | `gpt-5.6-sol` | `medium` |
-| Architecture Tie-Break | `gpt-5.6-terra` | `high` |
-| Point Fixer | `gpt-5.6-sol` | `high` |
-| Architecture Fixer | `gpt-5.6-sol` | `high` |
-| Finding Verifier | `gpt-5.6-luna` | `low` |
-| Verifier Confirmation | `gpt-5.6-sol` | `low` |
-| Verifier Tie-Break | `gpt-5.6-terra` | `medium` |
+| Fixer | `gpt-5.6-sol` | `high` |
+| Verifier | `gpt-5.6-sol` | `low` |
 
-The Reviewer emits the versioned review schema directly. Do not add a separate
-normalization model call without measured evidence that the additional cost
-improves correctness.
+The Reviewer is the native Codex review function. It receives no custom prompt,
+developer instructions, or output schema. Its review text goes unchanged to
+the Architect.
 
-Luna handles well-structured classification. A supported high-confidence
-independent trigger result is accepted without another model call. Sol confirms
-related, uncertain, or structurally invalid trigger decisions and verifier
-results that lack sufficient direct evidence. Terra resolves one disagreement.
-Persistent disagreement becomes a useful blocked checkpoint rather than an
-arbitrary decision or an endless debate.
+Architect, Fixer, and Verifier prompts contain only role, goal, context, and
+return format. They do not prescribe a point fix, architecture change, scope,
+confidence threshold, decision criteria, or fallback. Judge, confirmation,
+critic, veto, and tie-break roles do not exist in the active workflow.
 
 ## Review and finding invariants
 
-- Findings have stable identities based on path, component, root cause, and
-  violated invariant, not title wording alone.
-- Recurrences reuse an existing identity only after semantic adjudication.
-- Same-file findings are not automatically related.
-- Findings remain separate when their causes or invariants differ.
-- Durable statuses are `pending`, `open`, `fixing`, `resolved`, `superseded`,
-  `duplicate`, and `blocked`.
-- A finding is `resolved` only after verification against the current
-  repository state.
+- The current native review is authoritative for the current round.
+- Historical ledger records provide context only and never suppress current
+  review output.
+- Current review findings remain active until the Verifier accepts a solution
+  or a later native review reports clean.
 - Each durable role transition writes an atomic, idempotent checkpoint.
-- Resume must not duplicate findings or feed one cluster into another cluster's
-  fixer thread.
 - Legacy checkpoints are evidence, not executable state. Import compatible
-  findings into the current ledger, reset stale attempt/thread state, and start
-  current orchestration code.
+  history, reset stale attempt and thread state, and start with a native review
+  when the repository is clean.
 - Repository, branch, symbolic review base, resolved base commit, HEAD, speed,
   and execution fingerprint must be checked before resuming relevant work.
 
 Completion requires the configured clean-pass gate, with two consecutive clean
-reviews on an unchanged HEAD as the recommended default, and no open or blocked
-findings. Every commit or other HEAD change resets the counter.
+native reviews on an unchanged HEAD as the recommended default. Every commit or
+other HEAD change resets the clean-pass counter.
 
 ## Architecture behavior
 
-Architecture is optional remediation, not a mandatory ceremony.
+The Architect always receives the current native review text, repository
+context, and at most 50 recent history entries. It freely chooses and describes
+the approach. Its structured response goes unchanged to the Fixer.
 
-- Trigger decisions keep semantic relation and prior-finding lifecycle status
-  separate. Relations are shared root cause, shared contract with a different
-  edge, regression from a fix, independent, or insufficient evidence. Prior
-  status is active, resolved, obsolete, or unknown.
-- A shared path alone never justifies architecture.
-- Related resolved history and explicit recurrence may trigger an architecture
-  assessment for one active finding; they never force an architecture change.
-- `point_fix/no_architecture` is a valid and often preferable result.
-- Proposals compare the minimal fix with consolidation and trace every proposed
-  step to evidence, affected paths, and regression tests.
-- Critics check coherence, complete finding/path coverage, minimality, risk, and
-  artificial bundling.
-- Approval receives an independent veto and at most one tie-break.
-- Proposal revisions use the profile's budget; one is the recommended default.
-- Scope limits are pre-change gates, not targets to fill.
-- Rejected, excessive, or uncertain architecture normally falls back to a
-  bounded point fix rather than blocking unrelated progress.
-
-Do not reintroduce path-hotspot triggers, forced architecture, auto-apply-all,
-epochs, or interactive proposal review.
+There is no architecture approval, revision, critic, veto, trigger, forced
+point fix, forced redesign, or automatic fallback. Do not reintroduce these
+decision layers.
 
 ## Fixing, tests, and commits
 
-- Each semantic finding cluster gets a fresh fixer thread.
-- Only a later attempt or a technical correction for that same cluster may
-  resume the thread.
-- Semantic fix attempts use the profile's budget; two is the recommended
-  default.
-- A fixer returns a structured executable plus argument array for one targeted
-  regression test. Do not require fragile shell-string parsing.
+- The Fixer receives native review text, unchanged Architect advice, and direct
+  Verifier feedback.
+- Git determines the files actually changed; the Fixer response does not own
+  patch scope.
+- A Fixer may return a structured executable plus argument array for one
+  targeted regression test, or state that no targeted test is available.
 - Repository wrappers and arbitrary executables are valid targeted-test
   commands when they resolve from the repository or environment.
 - The orchestrator executes the targeted test independently and records its
   real exit code and log.
-- A verifier reads the current repository and receives actual test evidence.
-- Verification separates resolution of the original finding from patch safety.
-  A direct high-confidence resolution needs matching passing test evidence,
-  current path/line evidence, a safe patch verdict, and no reported regressions;
-  otherwise use confirmation/adjudication or the remaining fixer attempt.
-- Send every supported patch regression back to the same fixer thread together.
-- If two attempts fail, block that cluster and continue independent clusters.
+- The Verifier reads the current repository, receives actual test evidence, and
+  decides directly whether to accept. Rejection feedback returns to the Fixer.
+- `MaxFixAttempts` limits Fixer calls in one review round. Reaching it preserves
+  diagnostic evidence, safely restores the rejected patch, and starts another
+  native review. It never blocks a finding.
+- `MaxReviewCycles` limits native reviews per script invocation. Every new
+  invocation resets that counter while retaining the checkpoint. Reaching the
+  limit returns `limit_reached`; running the same command continues with a
+  fresh budget.
 - Run configured host gates after verification and before every commit.
 - Recheck the patch after gates, stage the exact tree, create the commit from
   that tree, and advance HEAD with an old-value check.
@@ -261,7 +233,7 @@ agent's shell.
 Do not show internal agent-command starts, successful searches, exploratory
 failures, policy declines, long command output, or model reasoning in
 `compact`. These events remain in redacted JSONL/stderr logs for diagnosis.
-Actual role failures, blocked states, targeted-test failures, host-gate
+Actual role failures, review-budget pauses, targeted-test failures, host-gate
 failures, and commit outcomes stay visible.
 
 `balanced` may show concise internal command activity and failures. `detailed`
@@ -276,8 +248,9 @@ input, cached input, and output tokens.
 ## Reliability and process lifecycle
 
 - Use one central CLI adapter for Exec and Resume.
-- Pass speed, model, reasoning, output schema, and developer instructions on
-  every call, including resumed threads.
+- Pass speed, model, and reasoning on every call, including resumed threads.
+  Pass schemas and developer instructions only to the three structured roles;
+  native review receives neither.
 - Capture thread ID as soon as it appears.
 - Retry only classified technical failures and resume the same thread whenever
   possible.
@@ -299,8 +272,8 @@ input, cached input, and output tokens.
 - Prefer changing an existing responsibility owner over adding a new layer.
 - Keep CLI process management, console rendering, state/ledger operations,
   role logic, and orchestration separated.
-- Prompts and JSON schemas remain versioned resources, not large inline
-  strings.
+- The three structured-role prompts and JSON schemas remain versioned
+  resources, not large inline strings.
 - Avoid parsing general PowerShell or shell syntax. Use structured values at
   boundaries.
 - Avoid generic migration frameworks for historical state. Migrate only

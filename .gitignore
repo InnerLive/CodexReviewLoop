@@ -7,8 +7,10 @@ profiles/
 **/ledger-v2.json
 **/run-v1.json
 *.jsonl
+*.stdout.txt
 *.stderr.txt
 *.result.json
+*.result.txt
 
 # Repository-local profiles in reviewed projects
 .codex-review-loop.psd1

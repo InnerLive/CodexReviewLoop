@@ -30,13 +30,12 @@ a `RepositoryPath` cannot be used for another repository.
 | `ReviewBase` | Detected Git revision | Revision reviewed against |
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
-| `MaxReviewCycles` | `12` | Live-reloaded review-cycle budget |
-| `MaxFixAttempts` | `2` | Live-reloaded attempts per finding cluster |
-| `MaxArchitectureRevisions` | `1` | Live-reloaded proposal revision budget |
+| `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
+| `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
 | `AutoCommit` | `$true` | Live-reloaded commit behavior |
 | `CommitMessagePrefix` | `Review-Loop` | Live-reloaded prefix for future verified commits |
 | `HostGates` | Detected checks | Required checks before every commit |
-| `Roles` | Pinned model settings | Model and reasoning level per role |
+| `Roles` | Pinned model settings | Model and reasoning level per role; live-reloaded at role boundaries |
 
 Relative `LogRoot` paths are resolved against the Codex Review Loop
 installation, not the current shell directory or reviewed repository.
@@ -47,10 +46,14 @@ starting points are:
 - `CleanPassesRequired`: 2-3
 - `MaxReviewCycles`: 6-30
 - `MaxFixAttempts`: 2-5
-- `MaxArchitectureRevisions`: 0-2
 
 The loop accepts integer values outside these ranges. The profile owner chooses
 the tradeoff appropriate for the repository and run.
+
+`MaxReviewCycles` is a user-controlled token and time budget for one script
+invocation. Every new invocation resets this counter to zero while retaining
+the existing checkpoint. Reaching the limit returns `limit_reached` without
+blocking findings; running the same command continues with a fresh budget.
 
 With `AutoCommit = $true`, the loop commits the exact verified tree after all
 host gates pass. With `AutoCommit = $false`, it stages that verified tree and
@@ -60,26 +63,25 @@ manually, or enable `AutoCommit` and resume the same run.
 ## Changes during an active run
 
 The loop reloads these settings from the active profile at safe role, review,
-fix, architecture, and commit boundaries:
+fix, and commit boundaries:
 
 - `CleanPassesRequired`
-- `MaxReviewCycles` applies before the next review cycle. Increasing it lets the
-  current checkpoint continue without stopping. Lowering it below the number of
-  cycles already used stops at the normal maximum-cycle checkpoint.
-- `MaxFixAttempts`
-- `MaxArchitectureRevisions`
+- `MaxReviewCycles` applies before the next native review call.
+- `MaxFixAttempts` applies before the next Fixer call. Reaching it restores the
+  rejected round and starts another native review; it never blocks a finding.
 - `AutoCommit`
 - `CommitMessagePrefix` applies to the next commit that has not yet entered
   commit preparation. A pending commit keeps its sealed message.
+- `HostGates` applies to future accepted patches.
+- `Roles` applies to future role calls.
 
 These settings are excluded from the execution fingerprint because changing
 them does not invalidate review, test, or verification evidence.
 
 Other settings remain fixed for an active invocation. In particular, changing
-`Name`, `RepositoryPath`, `ReviewBase`, `LogRoot`, `HostGates`, or `Roles`
-changes run identity or execution evidence. The loop preserves its checkpoint
-and requires the same command to be run again so that the change is applied
-with the normal resume checks.
+`Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes run identity. The
+loop preserves its checkpoint and requires the same command to be run again so
+that the change is applied with the normal resume checks.
 
 ## Host gates
 
@@ -123,7 +125,14 @@ integration point.
 
 ## Role and speed settings
 
-Each entry under `Roles` contains:
+New profiles contain exactly four role entries:
+
+- `Reviewer`
+- `Architect`
+- `Fixer`
+- `Verifier`
+
+Each entry contains:
 
 - `Model`: a model ID supported by the installed Codex CLI
 - `Thinking`: `low`, `medium`, `high`, `xhigh`, or `max`
@@ -131,6 +140,11 @@ Each entry under `Roles` contains:
 `-Speed standard|fast` controls the service tier globally. It does not silently
 change models or reasoning levels, and a resumed run must keep its original
 speed.
+
+Existing profiles remain usable during the transition: `PointFixer` supplies
+the `Fixer` configuration when `Fixer` is absent, and `FindingVerifier`
+supplies `Verifier` when `Verifier` is absent. Removed judge, confirmation,
+critic, veto, and tie-break entries are ignored.
 
 Tool, prompt, schema, and execution-affecting profile settings are
 fingerprinted. If they change between invocations, completed model work is

@@ -41,6 +41,22 @@ function Get-ReviewLoopClusterId {
     return "C-" + (Get-ReviewLoopSha256 $canonical).Substring(0, 16)
 }
 
+function Get-ReviewLoopSimpleFindingId {
+    param([Parameter(Mandatory = $true)][object]$Finding)
+
+    $locations = @((Get-ReviewLoopObjectProperty `
+        -Object $Finding -Name "locations" -Default @()) | ForEach-Object {
+        "$([string]$_.path):$([int]$_.line)"
+    } | Sort-Object)
+    $canonical = @(
+        (ConvertTo-ReviewLoopCanonicalText ([string]$Finding.title)),
+        (ConvertTo-ReviewLoopCanonicalText ([string](Get-ReviewLoopObjectProperty `
+            -Object $Finding -Name "description" -Default ""))),
+        ($locations -join "`n")
+    ) -join "`n"
+    return "F-" + (Get-ReviewLoopSha256 $canonical).Substring(0, 20)
+}
+
 function New-ReviewLoopLedger {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$RepoPath)
@@ -155,57 +171,65 @@ function ConvertTo-ReviewLoopFindingRecord {
         [Parameter(Mandatory = $true)][string]$Head
     )
 
-    $matchedId = [string](Get-ReviewLoopObjectProperty `
-        -Object $Finding -Name "matchedFindingId" -Default "")
-    $id = if ([string]::IsNullOrWhiteSpace($matchedId)) {
-        Get-ReviewLoopFindingId `
-            -Path ([string]$Finding.path) `
-            -Component ([string]$Finding.component) `
-            -RootCause ([string]$Finding.rootCause) `
-            -Invariant ([string]$Finding.invariant)
-    } else {
-        $matchedId
-    }
-    $clusterId = Get-ReviewLoopClusterId `
-        -Component ([string]$Finding.component) `
-        -RootCause ([string]$Finding.rootCause) `
-        -Invariant ([string]$Finding.invariant)
-
-    $fixPaths = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrWhiteSpace([string]$Finding.path)) {
-        [void]$fixPaths.Add(([string]$Finding.path).Replace("\", "/"))
-    }
-    if ($Finding.PSObject.Properties.Name -contains "fixPaths") {
-        foreach ($path in @($Finding.fixPaths)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$path) -and -not $fixPaths.Contains(([string]$path).Replace("\", "/"))) {
-                [void]$fixPaths.Add(([string]$path).Replace("\", "/"))
-            }
+    $locations = @((Get-ReviewLoopObjectProperty `
+        -Object $Finding -Name "locations" -Default @()) | ForEach-Object {
+        [pscustomobject][ordered]@{
+            path = ([string]$_.path).Replace("\", "/")
+            line = [int]$_.line
         }
+    })
+    if ($locations.Count -eq 0 -and
+        $Finding.PSObject.Properties.Name -contains "path") {
+        $locations = @([pscustomobject][ordered]@{
+            path = ([string]$Finding.path).Replace("\", "/")
+            line = [int](Get-ReviewLoopObjectProperty -Object $Finding -Name "line" -Default 0)
+        })
     }
+    $primary = if ($locations.Count -gt 0) {
+        $locations[0]
+    }
+    else {
+        [pscustomobject]@{ path = ""; line = 0 }
+    }
+    $description = [string](Get-ReviewLoopObjectProperty `
+        -Object $Finding -Name "description" -Default (
+            Get-ReviewLoopObjectProperty -Object $Finding -Name "evidence" -Default ""))
+    $id = Get-ReviewLoopSimpleFindingId -Finding ([pscustomobject]@{
+        title = [string]$Finding.title
+        description = $description
+        locations = $locations
+    })
+    $clusterId = "C-" + (Get-ReviewLoopSha256 $id).Substring(0, 16)
+    $fixPaths = @($locations | ForEach-Object {
+        [string]$_.path
+    } | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    } | Sort-Object -Unique)
 
     return [pscustomobject][ordered]@{
         Id = $id
         ClusterId = $clusterId
         Status = "open"
-        Priority = [string]$Finding.priority
+        Priority = ""
         Title = [string]$Finding.title
-        Path = ([string]$Finding.path).Replace("\", "/")
-        Line = [int]$Finding.line
-        Component = [string]$Finding.component
-        RootCause = [string]$Finding.rootCause
-        Invariant = [string]$Finding.invariant
-        Evidence = [string]$Finding.evidence
-        Reproduction = [string]$Finding.reproduction
-        SuggestedFix = [string]$Finding.suggestedFix
-        SuggestedTest = [string]$Finding.suggestedTest
-        FixPaths = $fixPaths.ToArray()
-        Relations = @((Get-ReviewLoopObjectProperty `
-            -Object $Finding -Name "relations" -Default @()))
+        Description = $description
+        Locations = $locations
+        Path = [string]$primary.path
+        Line = [int]$primary.line
+        Component = ""
+        RootCause = ""
+        Invariant = ""
+        Evidence = $description
+        Reproduction = ""
+        SuggestedFix = ""
+        SuggestedTest = ""
+        FixPaths = $fixPaths
+        Relations = @()
         IdentityHistory = @([pscustomobject]@{
-            Path = ([string]$Finding.path).Replace("\", "/")
-            Component = [string]$Finding.component
-            RootCause = [string]$Finding.rootCause
-            Invariant = [string]$Finding.invariant
+            Path = [string]$primary.path
+            Component = ""
+            RootCause = ""
+            Invariant = ""
             SeenAt = [DateTimeOffset]::UtcNow.ToString("O")
         })
         FirstSeenReview = $ReviewId
@@ -236,6 +260,11 @@ function Merge-ReviewLoopFindings {
 
     $records = [System.Collections.Generic.List[object]]::new()
     foreach ($existing in @($Ledger.Findings)) {
+        if ([string]$existing.Status -in @("pending", "open", "fixing", "blocked")) {
+            $existing.Status = "superseded"
+            $existing.FixerThreadId = ""
+            $existing.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+        }
         [void]$records.Add($existing)
     }
 
@@ -249,7 +278,7 @@ function Merge-ReviewLoopFindings {
             continue
         }
 
-        if ([string]$existing.Status -in @("resolved", "superseded", "duplicate")) {
+        if ([string]$existing.Status -in @("resolved", "superseded", "duplicate", "blocked")) {
             if ([string]$existing.Status -eq "resolved") {
                 $verifiedRecurrences = [int](Get-ReviewLoopObjectProperty `
                     -Object $existing -Name "VerifiedRecurrenceCount" -Default 0)
@@ -267,17 +296,18 @@ function Merge-ReviewLoopFindings {
         $existing.LastSeenHead = $Head
         $existing.Priority = $incoming.Priority
         $existing.Title = $incoming.Title
+        $existing | Add-Member -Force -NotePropertyName Description `
+            -NotePropertyValue $incoming.Description
+        $existing | Add-Member -Force -NotePropertyName Locations `
+            -NotePropertyValue @($incoming.Locations)
+        $existing.Path = $incoming.Path
         $existing.Line = $incoming.Line
         $existing.Evidence = $incoming.Evidence
         $existing.Reproduction = $incoming.Reproduction
         $existing.SuggestedFix = $incoming.SuggestedFix
         $existing.SuggestedTest = $incoming.SuggestedTest
         $existing.FixPaths = $incoming.FixPaths
-        $existing.Relations = @(
-            @($existing.Relations) + @($incoming.Relations) |
-                Group-Object { "$($_.CandidateFindingId)|$($_.Relation)" } |
-                ForEach-Object { $_.Group | Select-Object -Last 1 }
-        )
+        $existing.Relations = @()
         $existing.IdentityHistory = @(
             @($existing.IdentityHistory) + @($incoming.IdentityHistory) |
                 Sort-Object SeenAt
@@ -287,66 +317,6 @@ function Merge-ReviewLoopFindings {
 
     $Ledger.Findings = @($records | Sort-Object Id)
     return $Ledger
-}
-
-function Get-ReviewLoopTriggerCandidates {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][object]$Finding,
-        [Parameter(Mandatory = $true)][object]$Ledger
-    )
-
-    $component = ConvertTo-ReviewLoopCanonicalText $Finding.Component
-    $cause = ConvertTo-ReviewLoopCanonicalText $Finding.RootCause
-    $invariant = ConvertTo-ReviewLoopCanonicalText $Finding.Invariant
-    $primaryPath = ConvertTo-ReviewLoopCanonicalText $Finding.Path
-    $paths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($path in @($Finding.FixPaths)) {
-        $canonicalPath = ConvertTo-ReviewLoopCanonicalText $path
-        if (-not [string]::IsNullOrWhiteSpace($canonicalPath)) {
-            $paths.Add($canonicalPath) | Out-Null
-        }
-    }
-
-    $candidates = foreach ($candidate in @($Ledger.Findings)) {
-        if ([string]$candidate.Id -eq [string]$Finding.Id -or [string]$candidate.Status -in @("duplicate", "superseded")) {
-            continue
-        }
-
-        $sameComponent = -not [string]::IsNullOrWhiteSpace($component) -and $component -eq (ConvertTo-ReviewLoopCanonicalText $candidate.Component)
-        $sameCause = -not [string]::IsNullOrWhiteSpace($cause) -and $cause -eq (ConvertTo-ReviewLoopCanonicalText $candidate.RootCause)
-        $sameInvariant = -not [string]::IsNullOrWhiteSpace($invariant) -and $invariant -eq (ConvertTo-ReviewLoopCanonicalText $candidate.Invariant)
-        $clusterId = [string]$Finding.ClusterId
-        $sameCluster = -not [string]::IsNullOrWhiteSpace($clusterId) -and
-            $clusterId -eq [string]$candidate.ClusterId
-        $candidatePrimaryPath = ConvertTo-ReviewLoopCanonicalText $candidate.Path
-        $overlap = @($candidate.FixPaths | Where-Object {
-            $candidateFixPath = ConvertTo-ReviewLoopCanonicalText $_
-            $paths.Contains($candidateFixPath) -and
-                -not ($candidateFixPath -eq $primaryPath -and
-                    $candidateFixPath -eq $candidatePrimaryPath)
-        }).Count -gt 0
-
-        # These are candidates only. No signal decides the relationship by itself.
-        if ($sameComponent -or $sameCause -or $sameInvariant -or $sameCluster -or $overlap) {
-            $score = @($sameCause, $sameInvariant, $sameCluster, $sameComponent, $overlap |
-                Where-Object { $_ }).Count
-            [pscustomobject]@{
-                Finding = $candidate
-                SameComponent = $sameComponent
-                SameRootCause = $sameCause
-                SameInvariant = $sameInvariant
-                SameCluster = $sameCluster
-                OverlappingFixPaths = $overlap
-                Score = $score
-            }
-        }
-    }
-
-    return @($candidates | Sort-Object `
-        @{ Expression = "Score"; Descending = $true },
-        @{ Expression = { $_.Finding.UpdatedAt }; Descending = $true },
-        @{ Expression = { $_.Finding.Id }; Descending = $false })
 }
 
 function New-ReviewLoopState {
@@ -377,12 +347,13 @@ function New-ReviewLoopState {
         Status = "running"
         ExitCode = 0
         ReviewCycle = 0
+        ReviewCyclesThisInvocation = 0
         CleanPasses = 0
         CleanHead = ""
         ActiveClusterId = ""
         ActiveFindingIds = @()
+        ActiveReviewText = ""
         ActiveRoleCall = $null
-        ArchitectureRevision = 0
         ActiveStrategy = $null
         LastFixerResult = $null
         PendingCommit = $null
@@ -400,7 +371,13 @@ function Test-ReviewLoopState {
     if ([string]$State.SchemaVersion -ne "1.0") {
         throw "Unknown state version: $($State.SchemaVersion)"
     }
-    if ([string]$State.Status -notin @("running", "completed", "blocked", "failed")) {
+    if ([string]$State.Status -notin @(
+        "running",
+        "completed",
+        "limit_reached",
+        "blocked",
+        "failed"
+    )) {
         throw "Invalid run status: $($State.Status)"
     }
     return $true
@@ -415,6 +392,10 @@ function Read-ReviewLoopState {
         if ($state.PSObject.Properties.Name -notcontains $name) {
             $state | Add-Member -NotePropertyName $name -NotePropertyValue $null
         }
+    }
+    if ($state.PSObject.Properties.Name -notcontains "ReviewCyclesThisInvocation") {
+        $state | Add-Member -NotePropertyName ReviewCyclesThisInvocation `
+            -NotePropertyValue ([int]$state.ReviewCycle)
     }
     Test-ReviewLoopState -State $state | Out-Null
     return $state

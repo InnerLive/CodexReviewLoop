@@ -79,8 +79,7 @@ function Stop-ReviewLoopBlocked {
     throw (New-ReviewLoopFailureException `
         -Message $Message `
         -NextSteps $NextSteps `
-        -RecommendedStepCount $RecommendedStepCount `
-        -Status "blocked")
+        -RecommendedStepCount $RecommendedStepCount)
 }
 
 function Resolve-ReviewLoopPath {
@@ -447,12 +446,15 @@ function New-ReviewLoopProfile {
     # Recommended: 2-3 clean passes on an unchanged HEAD.
     CleanPassesRequired = 2
 
-    # Recommended ranges: 6-30 review cycles, 2-5 fix attempts per finding
-    # cluster, and 0-2 architecture proposal revisions.
-    # These values are reloaded at safe boundaries while a run is active.
+    # Recommended: 6-30 native review cycles per script invocation. Reaching
+    # the limit pauses without blocking findings. Every new script invocation
+    # resumes the checkpoint with a fresh cycle counter.
     MaxReviewCycles = 12
+
+    # Recommended: 2-5 fixer calls before discarding the rejected round and
+    # starting a new native Codex review. This value is reloaded at safe
+    # boundaries while a run is active.
     MaxFixAttempts = 2
-    MaxArchitectureRevisions = 1
 
     # When false, verified changes are staged and the loop waits for a manual
     # commit or for AutoCommit to be enabled before continuing.
@@ -475,18 +477,9 @@ $($hostGates -join "`n")
     # bypassed. Repository invariants and verification are enforced by this tool.
     Roles = @{
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        TriggerJudge = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
-        TriggerConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
-        TriggerTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
         Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        ArchitectureCritic = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
-        ArchitectureVeto = @{ Model = 'gpt-5.6-sol'; Thinking = 'medium' }
-        ArchitectureTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'high' }
-        PointFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        ArchitectureFixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        FindingVerifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
-        VerifierConfirm = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
-        VerifierTieBreak = @{ Model = 'gpt-5.6-terra'; Thinking = 'medium' }
+        Fixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
+        Verifier = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
     }
 }
 "@
@@ -569,7 +562,6 @@ function Import-ReviewLoopConfig {
         CleanPassesRequired = 2
         MaxReviewCycles = 12
         MaxFixAttempts = 2
-        MaxArchitectureRevisions = 1
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
     }
@@ -609,8 +601,7 @@ function Assert-ReviewLoopConfigValues {
     foreach ($name in @(
         "CleanPassesRequired",
         "MaxReviewCycles",
-        "MaxFixAttempts",
-        "MaxArchitectureRevisions"
+        "MaxFixAttempts"
     )) {
         try {
             $value = [int]$Config[$name]
@@ -620,13 +611,7 @@ function Assert-ReviewLoopConfigValues {
         }
         $Config[$name] = $value
     }
-    $roles = @(
-        "Reviewer",
-        "TriggerJudge", "TriggerConfirm", "TriggerTieBreak",
-        "Architect", "ArchitectureCritic", "ArchitectureVeto", "ArchitectureTieBreak",
-        "PointFixer", "ArchitectureFixer",
-        "FindingVerifier", "VerifierConfirm", "VerifierTieBreak"
-    )
+    $roles = @("Reviewer", "Architect", "Fixer", "Verifier")
     foreach ($role in $roles) {
         $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $role
         if ([string]$roleConfig.Thinking -notin @("low", "medium", "high", "xhigh", "max")) {
@@ -657,9 +642,10 @@ $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
     "MaxFixAttempts",
-    "MaxArchitectureRevisions",
     "AutoCommit",
-    "CommitMessagePrefix"
+    "CommitMessagePrefix",
+    "HostGates",
+    "Roles"
 )
 
 function ConvertTo-ReviewLoopFingerprintData {
@@ -792,11 +778,23 @@ function Get-ReviewLoopRoleConfig {
         [Parameter(Mandatory = $true)][string]$Role
     )
 
-    if (-not $Config.Roles.ContainsKey($Role)) {
-        throw "Role '$Role' is missing from the configuration."
+    $configuredRole = $Role
+    if (-not $Config.Roles.ContainsKey($configuredRole)) {
+        $legacyRole = switch ($Role) {
+            "Fixer" { "PointFixer" }
+            "Verifier" { "FindingVerifier" }
+            default { "" }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($legacyRole) -and
+            $Config.Roles.ContainsKey($legacyRole)) {
+            $configuredRole = $legacyRole
+        }
+        else {
+            throw "Role '$Role' is missing from the configuration."
+        }
     }
 
-    $roleConfig = $Config.Roles[$Role]
+    $roleConfig = $Config.Roles[$configuredRole]
     foreach ($key in @("Model", "Thinking")) {
         if (-not $roleConfig.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$roleConfig[$key])) {
             throw "Role '$Role' does not contain '$key'."
@@ -873,7 +871,10 @@ function Get-ReviewLoopWorktreeFingerprint {
 }
 
 function ConvertTo-ReviewLoopJsonCompact {
-    param([Parameter(Mandatory = $true)][object]$Value)
+    param([Parameter(Mandatory = $true)][AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        return "null"
+    }
     return ($Value | ConvertTo-Json -Depth 30 -Compress)
 }
 

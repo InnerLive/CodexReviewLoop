@@ -49,18 +49,33 @@ function Get-CodexRoleArguments {
         [Parameter(Mandatory = $true)][string]$Model,
         [Parameter(Mandatory = $true)][string]$Thinking,
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
-        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
+        [ValidateSet("Exec", "Resume", "Review")][string]$Mode = "Exec",
         [string]$ThreadId = "",
+        [string]$ReviewBase = "",
         [string]$DeveloperInstructions = "",
         [string]$SchemaPath = "",
         [string]$ResultPath = ""
     )
 
+    if ($Mode -eq "Review") {
+        if ([string]::IsNullOrWhiteSpace($ReviewBase)) {
+            throw "ReviewBase is required for a native review call."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($SchemaPath)) {
+            throw "Native Codex review does not accept an output schema."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
+            throw "Native Codex review does not accept custom developer instructions."
+        }
+    }
+
     $arguments = [System.Collections.Generic.List[string]]::new()
-    [void]$arguments.Add("exec")
-    [void]$arguments.Add("--json")
-    [void]$arguments.Add("--ignore-user-config")
-    [void]$arguments.Add("--ignore-rules")
+    if ($Mode -ne "Review") {
+        [void]$arguments.Add("exec")
+        [void]$arguments.Add("--json")
+        [void]$arguments.Add("--ignore-user-config")
+        [void]$arguments.Add("--ignore-rules")
+    }
     [void]$arguments.Add("--dangerously-bypass-approvals-and-sandbox")
     [void]$arguments.Add("-C")
     [void]$arguments.Add((Resolve-ReviewLoopPath -Path $RepoPath -MustExist))
@@ -76,16 +91,16 @@ function Get-CodexRoleArguments {
         [void]$arguments.Add("fast_mode")
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($SchemaPath)) {
+    if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($SchemaPath)) {
         Assert-CodexOutputSchemaSupported -SchemaPath $SchemaPath
         [void]$arguments.Add("--output-schema")
         [void]$arguments.Add((Resolve-ReviewLoopPath -Path $SchemaPath -MustExist))
     }
-    if (-not [string]::IsNullOrWhiteSpace($ResultPath)) {
+    if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($ResultPath)) {
         [void]$arguments.Add("-o")
         [void]$arguments.Add((Resolve-ReviewLoopPath -Path $ResultPath))
     }
-    if (-not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
+    if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
         # JSON string literals are valid TOML basic strings as well.
         $tomlString = ConvertTo-Json -InputObject $DeveloperInstructions -Compress
         [void]$arguments.Add("-c")
@@ -93,6 +108,14 @@ function Get-CodexRoleArguments {
     }
 
     switch ($Mode) {
+        "Review" {
+            # Global Codex options must precede the review subcommand. Supplying
+            # a prompt here would replace the native review instructions and
+            # conflicts with --base.
+            [void]$arguments.Add("review")
+            [void]$arguments.Add("--base")
+            [void]$arguments.Add($ReviewBase)
+        }
         "Resume" {
             if ([string]::IsNullOrWhiteSpace($ThreadId)) {
                 throw "ThreadId is required for a resume call."
@@ -544,7 +567,7 @@ function Invoke-ReviewLoopObservedProcess {
         [Parameter(Mandatory = $true)][string]$StdoutPath,
         [Parameter(Mandatory = $true)][string]$StderrPath,
         [AllowNull()][string]$InputText = $null,
-        [ValidateSet("Codex", "HostGate")][string]$EventKind = "Codex",
+        [ValidateSet("Codex", "NativeReview", "HostGate")][string]$EventKind = "Codex",
         [switch]$AppendLogs,
         [ValidateRange(0, 86400)][int]$TimeoutSeconds = 0,
         [AllowNull()][scriptblock]$OnThreadStarted = $null
@@ -680,11 +703,10 @@ function Invoke-ReviewLoopObservedProcess {
             if ($now -ge $nextHeartbeat) {
                 $elapsed = Format-ReviewLoopDuration -Duration ($now - $startedAt)
                 $idleSeconds = [Math]::Max(0, [int]($now - $activity.LastActivity).TotalSeconds)
-                $activityText = if ($EventKind -eq "Codex") {
-                    "$($activity.ActionCount) CLI actions"
-                }
-                else {
-                    "process active"
+                $activityText = switch ($EventKind) {
+                    "Codex" { "$($activity.ActionCount) CLI actions" }
+                    "NativeReview" { "review active" }
+                    default { "process active" }
                 }
                 Write-ReviewLoopStatus -Message "$DisplayName running for $elapsed · $activityText · last activity ${idleSeconds}s ago" -Kind Progress -Inline
                 $nextHeartbeat = $now.AddSeconds($heartbeatSeconds)
@@ -765,8 +787,9 @@ function Invoke-CodexCliRole {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [string]$SchemaPath = "",
-        [ValidateSet("Exec", "Resume")][string]$Mode = "Exec",
+        [ValidateSet("Exec", "Resume", "Review")][string]$Mode = "Exec",
         [string]$ThreadId = "",
+        [string]$ReviewBase = "",
         [string]$CodexPath = "",
         [ValidateRange(1, 5)][int]$MaxAttempts = 3,
         [string]$CallId = "",
@@ -774,6 +797,10 @@ function Invoke-CodexCliRole {
         [ValidateRange(1, 86400)][int]$TimeoutSeconds = 2700,
         [AllowNull()][scriptblock]$OnThreadStarted = $null
     )
+
+    if ($Mode -eq "Review" -and -not [string]::IsNullOrWhiteSpace($Prompt)) {
+        throw "Native Codex review does not accept a custom prompt when --base is used."
+    }
 
     $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
     $worktreeWasCleanAtStart = try {
@@ -789,20 +816,23 @@ function Invoke-CodexCliRole {
     if ([string]::IsNullOrWhiteSpace($CallId)) {
         $CallId = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
     }
+    $isNativeReview = $Mode -eq "Review"
     $stemBase = Join-Path $logDirectory "$CallId-$safeRole"
     $stem = $stemBase
     $invocation = 2
     while (
         (Test-Path -LiteralPath "$stem.jsonl") -or
+        (Test-Path -LiteralPath "$stem.stdout.txt") -or
         (Test-Path -LiteralPath "$stem.stderr.txt") -or
-        (Test-Path -LiteralPath "$stem.result.json")
+        (Test-Path -LiteralPath "$stem.result.json") -or
+        (Test-Path -LiteralPath "$stem.result.txt")
     ) {
         $stem = "$stemBase-run$invocation"
         $invocation++
     }
-    $jsonlPath = "$stem.jsonl"
+    $jsonlPath = if ($isNativeReview) { "$stem.stdout.txt" } else { "$stem.jsonl" }
     $stderrPath = "$stem.stderr.txt"
-    $resultPath = "$stem.result.json"
+    $resultPath = if ($isNativeReview) { "$stem.result.txt" } else { "$stem.result.json" }
 
     $attemptRecords = [System.Collections.Generic.List[object]]::new()
     $callStartedAt = [DateTimeOffset]::UtcNow
@@ -830,9 +860,10 @@ function Invoke-CodexCliRole {
             -Speed $Speed `
             -Mode $currentMode `
             -ThreadId $currentThreadId `
+            -ReviewBase $ReviewBase `
             -DeveloperInstructions $effectiveDeveloperInstructions `
             -SchemaPath $SchemaPath `
-            -ResultPath $resultPath
+            -ResultPath $(if ($isNativeReview) { "" } else { $resultPath })
 
         Write-ReviewLoopStatus -Message "$Role · $Model/$Thinking · $Speed · attempt $attempt/$MaxAttempts" -Kind Progress
         $startInfo = New-CodexProcessStartInfo -CodexExecutable $executable -Arguments $arguments
@@ -844,9 +875,9 @@ function Invoke-CodexCliRole {
                 -DisplayName $Role `
                 -StdoutPath $jsonlPath `
                 -StderrPath $stderrPath `
-                -InputText $currentPrompt `
-                -EventKind Codex `
-                -AppendLogs:($attempt -gt 1) `
+                -InputText $(if ($isNativeReview) { $null } else { $currentPrompt }) `
+                -EventKind $(if ($isNativeReview) { "NativeReview" } else { "Codex" }) `
+                -AppendLogs:($attempt -gt 1 -and -not $isNativeReview) `
                 -TimeoutSeconds $TimeoutSeconds `
                 -OnThreadStarted $OnThreadStarted
             $stdout = $observed.Stdout
@@ -865,7 +896,15 @@ function Invoke-CodexCliRole {
 
         $stdout = ConvertTo-ReviewLoopRedactedText $stdout
         $stderr = ConvertTo-ReviewLoopRedactedText $stderr
-        $sanitizedResult = Read-ReviewLoopSanitizedResult -Path $resultPath
+        $sanitizedResult = if ($isNativeReview) {
+            $nativeReviewResult = Read-ReviewLoopSanitizedResult -Path $jsonlPath
+            $nativeReviewResult.Text = ([string]$nativeReviewResult.Text).TrimEnd(
+                [char[]]@("`r", "`n"))
+            $nativeReviewResult
+        }
+        else {
+            Read-ReviewLoopSanitizedResult -Path $resultPath
+        }
         $usage = if ($null -ne $observed) {
             $observed.Usage
         }
@@ -1035,13 +1074,18 @@ Do not repeat completed investigation or edits. Correct the operational problem,
         }
         else {
             $currentMode = $Mode
-            $currentPrompt = @"
+            $currentPrompt = if ($isNativeReview) {
+                ""
+            }
+            else {
+                @"
 The previous $Role process failed before a thread ID was available: $failureReason
 Inspect the current worktree, preserve correct partial work, and complete the original task.
 
 Original task:
 $Prompt
 "@
+            }
         }
         Write-ReviewLoopStatus -Message "${Role}: $failureKind; retrying in ${delay}s$(if (-not [string]::IsNullOrWhiteSpace($lastThreadId)) { ' on the same thread' } else { '' })." -Kind Warning
         Start-Sleep -Seconds $delay

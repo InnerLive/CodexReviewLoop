@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "2.0" },
+    "summary": { "type": "string" },
+    "targetedTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "available": { "type": "boolean" },
+        "filePath": { "type": "string" },
+        "arguments": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["available", "filePath", "arguments"]
+    }
+  },
+  "required": ["schemaVersion", "summary", "targetedTest"]
+}

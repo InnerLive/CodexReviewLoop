@@ -21,7 +21,6 @@ Export-ModuleMember -Function @(
     "Write-ReviewLoopLedger",
     "Merge-ReviewLoopFindings",
     "Get-ReviewLoopFindingId",
-    "Get-ReviewLoopTriggerCandidates",
     "New-ReviewLoopState",
     "Read-ReviewLoopState",
     "Write-ReviewLoopState",
