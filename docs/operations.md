@@ -122,6 +122,12 @@ complete role take longer. Each targeted test and host gate has a 30-minute
 timeout. On timeout or cancellation, the loop terminates its owned Windows
 process tree and preserves the latest valid checkpoint.
 
+Pressing Ctrl+C writes a final interruption entry to `terminal.log` before the
+console process exits whenever Windows delivers the console cancellation
+event. The current checkpoint remains available for the next invocation.
+Forced process termination and machine crashes cannot guarantee this final log
+entry.
+
 ## Where to look when a run stops
 
 1. Read the reported problem, `Recommended` action, and safe `Alternative`.

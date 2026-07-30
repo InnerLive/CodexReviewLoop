@@ -473,10 +473,12 @@ $($hostGates -join "`n")
     # Role settings:
     # - Model: a model ID supported by the installed Codex CLI.
     # - Thinking: low, medium, high, xhigh, or max.
-    # Every role runs unattended with approvals, sandboxing, and Codex exec rules
-    # bypassed. Repository invariants and verification are enforced by this tool.
+    # ReviewClassifier is a mechanical helper used only when the native review
+    # text is ambiguous. Existing profiles without it use gpt-5.6-luna/low.
+    # Settings are reloaded at safe role boundaries while a run is active.
     Roles = @{
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
+        ReviewClassifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
         Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Fixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Verifier = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
@@ -611,7 +613,7 @@ function Assert-ReviewLoopConfigValues {
         }
         $Config[$name] = $value
     }
-    $roles = @("Reviewer", "Architect", "Fixer", "Verifier")
+    $roles = @("Reviewer", "ReviewClassifier", "Architect", "Fixer", "Verifier")
     foreach ($role in $roles) {
         $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $role
         if ([string]$roleConfig.Thinking -notin @("low", "medium", "high", "xhigh", "max")) {
@@ -780,6 +782,12 @@ function Get-ReviewLoopRoleConfig {
 
     $configuredRole = $Role
     if (-not $Config.Roles.ContainsKey($configuredRole)) {
+        if ($Role -eq "ReviewClassifier") {
+            return @{
+                Model = "gpt-5.6-luna"
+                Thinking = "low"
+            }
+        }
         $legacyRole = switch ($Role) {
             "Fixer" { "PointFixer" }
             "Verifier" { "FindingVerifier" }

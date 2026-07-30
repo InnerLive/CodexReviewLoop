@@ -125,12 +125,17 @@ integration point.
 
 ## Role and speed settings
 
-New profiles contain exactly four role entries:
+New profiles contain the four workflow roles:
 
 - `Reviewer`
 - `Architect`
 - `Fixer`
 - `Verifier`
+
+They also contain `ReviewClassifier`, a mechanical helper used only for
+ambiguous native review text. Its generated setting is `gpt-5.6-luna` with
+`low` reasoning. Existing profiles without this entry use that same default
+automatically.
 
 Each entry contains:
 

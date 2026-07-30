@@ -158,9 +158,9 @@ Describe "Codex Review Loop module" {
             New-ReviewLoopProfile -RepoPath $repository -Path $path
         } $repo $profilePath
         $profile = Import-PowerShellDataFile -LiteralPath $generated
-        $profile.Roles.Keys.Count | Should Be 4
+        $profile.Roles.Keys.Count | Should Be 5
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
-            "Architect", "Fixer", "Reviewer", "Verifier")
+            "Architect", "Fixer", "ReviewClassifier", "Reviewer", "Verifier")
     }
 }
 
@@ -217,7 +217,7 @@ Describe "Optional profiles and command help" {
         } $repo
         $profile.RepositoryPath | Should Be $canonicalRepo
         $profile.LogRoot | Should Be ".\runs"
-        $profile.Roles.Keys.Count | Should Be 4
+        $profile.Roles.Keys.Count | Should Be 5
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -272,6 +272,22 @@ Describe "Optional profiles and command help" {
         } $profile
         $resolved.Fixer.Model | Should Be "fake"
         $resolved.Verifier.Thinking | Should Be "low"
+    }
+
+    It "supplies the Luna classifier defaults to existing four-role profiles" {
+        $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
+            -Path (Join-Path $TestDrive "four-roles.psd1") `
+            -LogRoot (Join-Path $TestDrive "four-role-logs"))
+        $profile.Roles.ContainsKey("ReviewClassifier") | Should Be $false
+
+        $classifier = & (Get-Module CodexReviewLoop) {
+            param($config)
+            Assert-ReviewLoopConfigValues -Config $config
+            Get-ReviewLoopRoleConfig -Config $config -Role ReviewClassifier
+        } $profile
+
+        $classifier.Model | Should Be "gpt-5.6-luna"
+        $classifier.Thinking | Should Be "low"
     }
 
     It "reuses the profile matched by canonical repository path" {
@@ -910,6 +926,25 @@ Describe "Live terminal and streaming process observation" {
         ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
     }
 
+    It "writes one durable Ctrl+C interruption record to terminal.log" {
+        $transcript = Join-Path $caseRoot "ctrl-c-terminal.log"
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($path)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -HostOutputEnabled $false -TranscriptPath $path
+            [CodexReviewLoopCancellationLog]::Record()
+            [CodexReviewLoopCancellationLog]::Record()
+        } $transcript
+
+        $text = Get-Content -Raw -LiteralPath $transcript
+        @([regex]::Matches(
+            $text,
+            "Review Loop interrupted by Ctrl\+C; checkpoint preserved\.")).Count |
+            Should Be 1
+    }
+
     It "grows JSONL while the Codex process is still running" {
         $env:CODEX_REVIEW_LOOP_FAKE_EVENT_DELAY_MS = "2500"
         $job = Start-Job -ScriptBlock {
@@ -1421,6 +1456,130 @@ Return your decision and any feedback in the supplied structured format.
         $text | Should Not Match '(?i)\bPKonf\b'
     }
 
+}
+
+Describe "Native review classification" {
+    It "recognizes current one- and multi-finding Codex review blocks" {
+        $texts = @(
+            @"
+Review comment:
+
+- [P2] Normalize the value — C:\repo\src\A.cs:10-12
+  The current value is unstable.
+"@,
+            @"
+Full review comments:
+
+- [P1] Preserve the cache key — C:\repo\src\A.cs:20-22
+  The key changes unexpectedly.
+- [P2] Validate the fallback — C:\repo\src\B.cs:30-31
+  The fallback accepts invalid state.
+"@
+        )
+
+        foreach ($text in $texts) {
+            $classification = & (Get-Module CodexReviewLoop) {
+                param($review)
+                Get-ReviewLoopLocalReviewClassification -ReviewText $review
+            } $text
+            $classification.Classification | Should Be "finding"
+        }
+    }
+
+    It "recognizes proven legacy finding signals" {
+        $classification = & (Get-Module CodexReviewLoop) {
+            Get-ReviewLoopLocalReviewClassification -ReviewText @"
+Findings:
+The cache invalidation should be fixed before merge.
+"@
+        }
+
+        $classification.Classification | Should Be "finding"
+    }
+
+    It "recognizes established clean review language" {
+        $texts = @(
+            "No findings.",
+            "I did not identify any clear, actionable correctness issues.",
+            "Keine umsetzbaren Regressionen gefunden."
+        )
+
+        foreach ($text in $texts) {
+            $classification = & (Get-Module CodexReviewLoop) {
+                param($review)
+                Get-ReviewLoopLocalReviewClassification -ReviewText $review
+            } $text
+            $classification.Classification | Should Be "clean"
+        }
+    }
+
+    It "treats empty and explicit Reviewer failure output as invalid" {
+        foreach ($text in @("", "Reviewer failed to output a response.")) {
+            $classification = & (Get-Module CodexReviewLoop) {
+                param($review)
+                Get-ReviewLoopLocalReviewClassification -ReviewText $review
+            } $text
+            $classification.Classification | Should Be "invalid"
+        }
+    }
+
+    It "gives finding signals precedence over clean language" {
+        $classification = & (Get-Module CodexReviewLoop) {
+            Get-ReviewLoopLocalReviewClassification -ReviewText @"
+No findings were seen in the documentation.
+
+Review comment:
+
+- [P1] Preserve the transaction — C:\repo\src\Store.cs:40-42
+  The transaction is committed too early.
+"@
+        }
+
+        $classification.Classification | Should Be "finding"
+    }
+
+    It "leaves unusual prose for the ReviewClassifier" {
+        $classification = & (Get-Module CodexReviewLoop) {
+            Get-ReviewLoopLocalReviewClassification `
+                -ReviewText "The patch appears internally consistent with the surrounding implementation."
+        }
+
+        $classification.Classification | Should Be "ambiguous"
+    }
+}
+
+Describe "ReviewClassifier resources" {
+    It "keeps the complete classifier prompt minimal and stable" {
+        $actual = (Get-Content -Raw -LiteralPath (
+            Join-Path $root "prompts\review-classifier.md")).Replace("`r`n", "`n").TrimEnd()
+        $expected = @'
+Role:
+You classify the result of a completed Codex code review.
+
+Goal:
+Decide whether the review reports at least one finding.
+
+Review output:
+{{REVIEW_OUTPUT}}
+
+Result:
+Return the decision in the supplied structured format.
+'@
+        $actual | Should Be $expected.Replace("`r`n", "`n").TrimEnd()
+    }
+
+    It "defines only the version and boolean decision in its schema" {
+        $schema = Get-Content -Raw -LiteralPath (
+            Join-Path $root "schemas\review-classification-v1.schema.json") |
+            ConvertFrom-Json
+
+        @($schema.properties.PSObject.Properties.Name | Sort-Object) |
+            Should Be @("hasFindings", "schemaVersion")
+        @($schema.required | Sort-Object) |
+            Should Be @("hasFindings", "schemaVersion")
+        $schema.properties.hasFindings.type | Should Be "boolean"
+        $schema.additionalProperties | Should Be $false
+    }
 }
 
 Describe "End-to-end orchestration with fake Codex" {
@@ -1935,6 +2094,180 @@ Describe "End-to-end orchestration with fake Codex" {
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
     }
 
+    It "uses the live-configured Luna helper only for ambiguous clean output" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $ambiguousReview = "The patch appears internally consistent with its surrounding implementation."
+        $plans = @(
+            [pscustomobject]@{
+                result = $ambiguousReview
+                profileMutation = [pscustomobject]@{
+                    path = $configPath
+                    replacements = @([pscustomobject]@{
+                        old = 'Reviewer = @{ Model = "fake"; Thinking = "high" }'
+                        new = @'
+Reviewer = @{ Model = "fake"; Thinking = "high" }
+        ReviewClassifier = @{ Model = "classifier-live"; Thinking = "low" }
+'@
+                    })
+                }
+            },
+            [pscustomobject]@{
+                result = '{"schemaVersion":"1.0","hasFindings":false}'
+            }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "ambiguous-clean-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $classifierCalls = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "review-classification-v1.schema.json"
+        })
+        $classifierCalls.Count | Should Be 1
+        (@($classifierCalls[0].arguments) -contains "classifier-live") |
+            Should Be $true
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        }).Count | Should Be 0
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+    }
+
+    It "passes ambiguous finding output unchanged after Luna classifies it" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $ambiguousReview = "The cache lifetime changes when a caller repeats the operation."
+        $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the cache behavior.","steps":[],"considerations":[]}'
+        $fixerV2 = '{"schemaVersion":"2.0","summary":"Applied the advice.","targetedTest":{"available":false,"filePath":"","arguments":[]}}'
+        $verifierV3 = '{"schemaVersion":"3.0","accept":true,"summary":"Accepted.","feedback":[]}'
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            $ambiguousReview,
+            '{"schemaVersion":"1.0","hasFindings":true}',
+            $architectureV2,
+            $fixerV2,
+            $verifierV3,
+            "No findings."
+        )
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "review-classification-v1.schema.json"
+        }).Count | Should Be 1
+        $architectCall = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        })[0]
+        ([string]$architectCall.prompt).Replace("`r`n", "`n") |
+            Should Match ([regex]::Escape($ambiguousReview))
+    }
+
+    It "stops on classifier failure and retries it without rerunning the Reviewer" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $plans = @(
+            [pscustomobject]@{
+                result = "The patch appears consistent with the surrounding code."
+            },
+            [pscustomobject]@{
+                exitCode = 1
+                stderr = "Not logged in; login required"
+            },
+            [pscustomobject]@{
+                result = '{"schemaVersion":"1.0","hasFindings":false}'
+            }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "classifier-retry-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $failed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $failed.Status | Should Be "failed"
+        $failed.Reason | Should Match "ReviewClassifier"
+        $firstRecords = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($firstRecords | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
+        @($firstRecords | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        }).Count | Should Be 0
+
+        $completed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $completed.Status | Should Be "completed"
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "review-classification-v1.schema.json"
+        }).Count | Should Be 2
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        }).Count | Should Be 0
+    }
+
+    It "retries the native Reviewer after an unusable successful response" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $plans = @(
+            [pscustomobject]@{ result = "Reviewer failed to output a response." },
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $invocationPlanPath = Join-Path $caseRoot "empty-review-retry-invocations.json"
+        Set-Content -LiteralPath $invocationPlanPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $invocationPlanPath
+
+        $failed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
+
+        $failed.Status | Should Be "failed"
+        $failed.Reason | Should Match "technical failure result"
+        $stored = Read-ReviewLoopState -Path $failed.StatePath
+        $reviewRecord = @($stored.RoleCalls | Where-Object {
+            $_.Role -eq "Reviewer"
+        })[0]
+        $reviewRecord.Success | Should Be $false
+        $reviewRecord.FailureKind | Should Be "invalid_output"
+
+        $completed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $completed.Status | Should Be "completed"
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
+    }
+
     It "passes native review output and architect advice forward without side roles" {
         $nativeReview = "- [P1] first defect at src/A.cs:10`n- [P2] second defect at src/B.cs:20"
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Use one coherent change.","approach":"Change both affected paths together.","steps":["Update A.","Update B."],"considerations":["Keep the public behavior."]}'
@@ -1961,6 +2294,10 @@ Describe "End-to-end orchestration with fake Codex" {
             '"approach":"Change both affected paths together."'))
         @($records | Where-Object {
             [string]$_.schemaPath -match 'trigger|critique|veto|tie'
+        }).Count | Should Be 0
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "review-classification-v1.schema.json"
         }).Count | Should Be 0
     }
 

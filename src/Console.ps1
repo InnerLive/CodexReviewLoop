@@ -1,3 +1,90 @@
+if ($null -eq ("CodexReviewLoopCancellationLog" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+public static class CodexReviewLoopCancellationLog
+{
+    private static readonly ConsoleCancelEventHandler Handler = OnCancelKeyPress;
+    private static string transcriptPath = "";
+    private static int installed;
+    private static int recorded;
+
+    public static void Configure(string path)
+    {
+        Volatile.Write(ref transcriptPath, path ?? "");
+        Interlocked.Exchange(ref recorded, 0);
+    }
+
+    public static void Install()
+    {
+        if (Interlocked.Exchange(ref installed, 1) == 0)
+        {
+            Console.CancelKeyPress += Handler;
+        }
+    }
+
+    public static void Remove()
+    {
+        if (Interlocked.Exchange(ref installed, 0) == 1)
+        {
+            Console.CancelKeyPress -= Handler;
+        }
+    }
+
+    public static void Record()
+    {
+        if (Interlocked.Exchange(ref recorded, 1) != 0)
+        {
+            return;
+        }
+
+        string path = Volatile.Read(ref transcriptPath);
+        if (String.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        string line = String.Format(
+            "{0} [!] Review Loop interrupted by Ctrl+C; checkpoint preserved.{1}",
+            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            Environment.NewLine);
+        byte[] bytes = new UTF8Encoding(false).GetBytes(line);
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    path,
+                    FileMode.Append,
+                    FileAccess.Write,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(true);
+                }
+                return;
+            }
+            catch
+            {
+                if (attempt < 2)
+                {
+                    Thread.Sleep(20);
+                }
+            }
+        }
+    }
+
+    private static void OnCancelKeyPress(object sender, ConsoleCancelEventArgs eventArgs)
+    {
+        Record();
+    }
+}
+'@
+}
+
 $script:ReviewLoopConsole = [ordered]@{
     OutputMode       = "compact"
     HeartbeatSeconds = 30
@@ -27,6 +114,7 @@ function Initialize-ReviewLoopConsole {
     $script:ReviewLoopConsole.ColorMode = $ColorMode
     $script:ReviewLoopConsole.HostOutputEnabled = $HostOutputEnabled
     $script:ReviewLoopConsole.TranscriptPath = $TranscriptPath
+    [CodexReviewLoopCancellationLog]::Configure($TranscriptPath)
     $script:ReviewLoopConsole.InlineActive = $false
     $script:ReviewLoopConsole.InlineWidth = 0
     if ([string]::IsNullOrWhiteSpace($TranscriptPath)) {

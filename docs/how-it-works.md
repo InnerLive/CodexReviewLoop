@@ -9,7 +9,10 @@ The loop reviews and improves the complete branch diff between a pinned
 
 ```mermaid
 flowchart LR
-    review[Native Codex review] --> findings{Findings?}
+    review[Native Codex review] --> parse{Clear result?}
+    parse -- Ambiguous --> classify[Luna ReviewClassifier]
+    parse -- Clear --> findings{Findings?}
+    classify --> findings
     findings -- Yes --> architect[Architect advice]
     architect --> fix[Fixer]
     fix --> test[Optional targeted test]
@@ -29,9 +32,16 @@ The Reviewer is Codex's native review function. The loop supplies the
 repository and configured review base, but no custom reviewer prompt, developer
 instructions, or output schema.
 
-Codex's review text is passed unchanged to the Architect. The ledger stores a
-history copy, but historical states never suppress findings from the current
-native review. A clean native review advances the clean-pass counter.
+The loop first recognizes established finding and clean signals locally. If
+the text is ambiguous, the mechanical `ReviewClassifier` helper uses the
+configured Luna model to return one boolean. It has no confidence threshold,
+confirmation, tie-break, or Architect fallback. A helper failure is reported
+as a technical failure.
+
+Review text classified as containing findings is passed unchanged to the
+Architect. The ledger stores a history copy, but historical states never
+suppress findings from the current native review. A clean native review
+advances the clean-pass counter.
 
 ## 2. Free architecture advice
 

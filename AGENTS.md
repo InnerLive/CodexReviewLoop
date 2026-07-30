@@ -151,9 +151,14 @@ The current quality/cost allocation is intentional:
 | Fixer | `gpt-5.6-sol` | `high` |
 | Verifier | `gpt-5.6-sol` | `low` |
 
+Ambiguous native review text is classified by the mechanical
+`ReviewClassifier` helper using `gpt-5.6-luna/low`. It is not a workflow
+decision role.
+
 The Reviewer is the native Codex review function. It receives no custom prompt,
-developer instructions, or output schema. Its review text goes unchanged to
-the Architect.
+developer instructions, or output schema. Deterministic text recognition is
+used first. Only ambiguous text reaches the ReviewClassifier. Review text
+classified as containing findings goes unchanged to the Architect.
 
 Architect, Fixer, and Verifier prompts contain only role, goal, context, and
 return format. They do not prescribe a point fix, architecture change, scope,
@@ -163,6 +168,10 @@ critic, veto, and tie-break roles do not exist in the active workflow.
 ## Review and finding invariants
 
 - The current native review is authoritative for the current round.
+- Deterministic finding and clean signals are recognized locally. Ambiguous
+  text is classified by the configured ReviewClassifier through Codex CLI.
+- A ReviewClassifier failure is a technical failure. It never falls through to
+  the Architect.
 - Historical ledger records provide context only and never suppress current
   review output.
 - Current review findings remain active until the Verifier accepts a solution
@@ -236,6 +245,10 @@ failures, policy declines, long command output, or model reasoning in
 Actual role failures, review-budget pauses, targeted-test failures, host-gate
 failures, and commit outcomes stay visible.
 
+When Windows delivers Ctrl+C to the console process, append a best-effort
+interruption record to `terminal.log` before exit so a stale running checkpoint
+can be distinguished from an unexplained process loss.
+
 `balanced` may show concise internal command activity and failures. `detailed`
 may show successful command completion and no-result searches. Heartbeats
 update one terminal line rather than flooding the screen. `terminal.log` is
@@ -249,8 +262,8 @@ input, cached input, and output tokens.
 
 - Use one central CLI adapter for Exec and Resume.
 - Pass speed, model, and reasoning on every call, including resumed threads.
-  Pass schemas and developer instructions only to the three structured roles;
-  native review receives neither.
+  Pass schemas and developer instructions only to structured exec roles and
+  the ReviewClassifier helper; native review receives neither.
 - Capture thread ID as soon as it appears.
 - Retry only classified technical failures and resume the same thread whenever
   possible.
@@ -272,7 +285,7 @@ input, cached input, and output tokens.
 - Prefer changing an existing responsibility owner over adding a new layer.
 - Keep CLI process management, console rendering, state/ledger operations,
   role logic, and orchestration separated.
-- The three structured-role prompts and JSON schemas remain versioned
+- Structured-role and helper prompts and JSON schemas remain versioned
   resources, not large inline strings.
 - Avoid parsing general PowerShell or shell syntax. Use structured values at
   boundaries.

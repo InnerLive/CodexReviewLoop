@@ -38,6 +38,9 @@ The orchestrator executes these gates after verification.
     if ($Role -eq "Fixer") {
         return "$instructions$testOwnership`nThe fixer workspace is the worktree observed by the orchestrator."
     }
+    if ($Role -eq "ReviewClassifier") {
+        return "$instructions`nThis role classifies the supplied review text; the orchestrator compares repository state before and after the call."
+    }
     return "$instructions$testOwnership`nThis role contributes analysis; the orchestrator compares repository state before and after the call."
 }
 
@@ -412,6 +415,73 @@ function Get-ReviewLoopRepositoryContext {
     }
 }
 
+function Get-ReviewLoopLocalReviewClassification {
+    param([AllowEmptyString()][string]$ReviewText)
+
+    if ([string]::IsNullOrWhiteSpace($ReviewText)) {
+        return [pscustomobject]@{
+            Classification = "invalid"
+            Reason = "The native Reviewer returned an empty result."
+        }
+    }
+
+    $trimmed = $ReviewText.Trim()
+    if ($trimmed -in @(
+        "Reviewer failed to output a response.",
+        "Review interrupted.",
+        "Review cancelled.",
+        "Review canceled."
+    )) {
+        return [pscustomobject]@{
+            Classification = "invalid"
+            Reason = "The native Reviewer returned a technical failure result."
+        }
+    }
+
+    $findingPatterns = @(
+        "(?ims)^\s*(?:full review comments?|review comments?|review comment)\s*:\s*$.*?^\s*-\s*\[[A-Z]+\d+\]\s+",
+        "(?im)^\s*findings?\s*:\s*$",
+        "(?im)^\s*-\s*\[[A-Z]+\d+\]\s+",
+        "(?im)\bshould be fixed\b"
+    )
+    foreach ($pattern in $findingPatterns) {
+        if ($ReviewText -match $pattern) {
+            return [pscustomobject]@{
+                Classification = "finding"
+                Reason = "The native review contains a deterministic finding signal."
+            }
+        }
+    }
+
+    $cleanPatterns = @(
+        "(?im)^\s*(no findings|no issues|no problems|nothing to report)\b",
+        "(?im)^\s*keine\s+(funde|probleme|beanstandungen|regressionen)\b",
+        "(?im)\bno\s+(discrete,?\s+)?((newly\s+)?introduced\s+)?(actionable\s+)?((correctness|runtime|test-breaking)\s+)?(issues?|regressions?|defects?|bugs?|problems?)(\s+or\s+(blocking\s+)?(issues?|regressions?|defects?|bugs?|problems?))?\s+(were\s+)?(found|identified)\b",
+        "(?im)\bno actionable ((correctness|runtime|test-breaking)\s+)?(regressions|findings|issues)\b",
+        "(?im)\bi did not (identify|find)\s+(any|a)\s+(clear,?\s+)?(discrete,?\s+)?((newly\s+)?introduced\s+)?(actionable\s+)?((correctness|runtime|test-breaking)\s+or\s+)+((correctness|runtime|test-breaking)\s+)?(issues?|issue|regressions?|regression|defects?|defect|bugs?|bug|problems?|problem)\b",
+        "(?im)\bi did not (identify|find)\s+(any|a)\s+(clear,?\s+)?(discrete,?\s+)?((newly\s+)?introduced\s+)?(actionable\s+)?((correctness|runtime|test-breaking)\s+)?(issues?|issue|regressions?|regression|defects?|defect|bugs?|bug|problems?|problem)\b",
+        "(?im)\bi found no\b",
+        "(?im)\bno discrete,\s*actionable\b",
+        "(?im)\bwithout introducing a clear\s+(functional\s+)?(correctness\s+)?regression\b",
+        "(?im)\bdo(es)? not introduce a clear,?\s+actionable correctness issue\b",
+        "(?im)\bkeine diskreten,\s*umsetzbaren\b",
+        "(?im)\bkeine umsetzbaren (regressionen|funde|probleme)\b"
+    )
+    foreach ($pattern in $cleanPatterns) {
+        if ($ReviewText -match $pattern) {
+            return [pscustomobject]@{
+                Classification = "clean"
+                Reason = "The native review contains a deterministic clean signal."
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Classification = "ambiguous"
+        Reason = "The native review contains no deterministic finding or clean signal."
+    }
+}
+
 function Invoke-ReviewLoopReview {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -444,8 +514,64 @@ function Invoke-ReviewLoopReview {
     }
 
     $reviewText = [string]$call.FinalMessage
-    $isClean = $reviewText.Trim() -match (
-        "(?is)^(?:no\s+(?:actionable\s+)?findings?|the\s+review\s+found\s+no\s+(?:actionable\s+)?findings?)\s*[.!]?\s*$")
+    $State | Add-Member -Force -NotePropertyName ActiveReviewText -NotePropertyValue $reviewText
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+
+    $classification = Get-ReviewLoopLocalReviewClassification -ReviewText $reviewText
+    if ([string]$classification.Classification -eq "invalid") {
+        $reviewRecord = @($State.RoleCalls | Where-Object {
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -eq
+                ("review-{0:d2}" -f $cycle) -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+                "Reviewer"
+        } | Select-Object -Last 1)
+        if ($reviewRecord.Count -gt 0) {
+            $reviewRecord[0].Success = $false
+            $reviewRecord[0].FailureKind = "invalid_output"
+            $reviewRecord[0].FailureReason = [string]$classification.Reason
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        }
+        throw (New-ReviewLoopFailureException `
+            -Message ([string]$classification.Reason) `
+            -NextSteps @(
+                "Check the native Reviewer stdout and stderr logs in the run directory."
+                "Run the same command again to retry the native review from the saved checkpoint."
+                "If the failure repeats, verify that the local Codex CLI can complete a native review."
+            ))
+    }
+
+    $classificationSource = "deterministic"
+    if ([string]$classification.Classification -eq "ambiguous") {
+        $classifierPrompt = Get-ReviewLoopPrompt -Name "review-classifier.md" -Values @{
+            REVIEW_OUTPUT = $reviewText
+        }
+        $classifierCall = Invoke-ConfiguredCodexRole `
+            -Config $Config -Role "ReviewClassifier" -RepoPath $RepoPath -Speed $Speed `
+            -Prompt $classifierPrompt -LogRoot $RunRoot `
+            -SchemaName "review-classification-v1.schema.json" `
+            -CodexPath $CodexPath `
+            -CallId ("review-{0:d2}-classify" -f $cycle) `
+            -State $State -StatePath $StatePath
+        Assert-ReviewLoopRoleSuccess $classifierCall
+        $classification = [pscustomobject]@{
+            Classification = if ([bool]$classifierCall.StructuredResult.hasFindings) {
+                "finding"
+            }
+            else {
+                "clean"
+            }
+            Reason = "The mechanical ReviewClassifier evaluated ambiguous native review text."
+        }
+        $classificationSource = "ReviewClassifier"
+    }
+
+    $headAfterClassification = Get-ReviewLoopGitValue `
+        -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    if ($headAfterClassification -ne $head -or -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        Stop-ReviewLoopBlocked -Message "Repository HEAD or worktree changed while the review result was classified."
+    }
+
+    $isClean = [string]$classification.Classification -eq "clean"
     $summary = @($reviewText -split "\r?\n" | Where-Object {
         -not [string]::IsNullOrWhiteSpace($_)
     } | Select-Object -First 1) -join ""
@@ -460,18 +586,21 @@ function Invoke-ReviewLoopReview {
         })
     }
     if ($isClean) {
-        Write-ReviewLoopStatus -Message "Review is clean: $summary" -Kind Success
+        Write-ReviewLoopStatus `
+            -Message "Review is clean ($classificationSource): $summary" `
+            -Kind Success
     }
     else {
-        Write-ReviewLoopStatus -Message "Reviewer returned findings: $summary" -Kind Review
+        Write-ReviewLoopStatus `
+            -Message "Reviewer returned findings ($classificationSource): $summary" `
+            -Kind Review
     }
-    $State | Add-Member -Force -NotePropertyName ActiveReviewText -NotePropertyValue $reviewText
-    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     $result = [pscustomobject]@{
         summary = $summary
         findings = $findings
         text = $reviewText
         clean = $isClean
+        classificationSource = $classificationSource
     }
 
     return [pscustomobject]@{

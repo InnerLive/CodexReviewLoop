@@ -2269,6 +2269,7 @@ function Invoke-CodexReviewLoop {
         -ColorMode $ColorMode `
         -HostOutputEnabled (-not $Json) `
         -TranscriptPath ""
+    [CodexReviewLoopCancellationLog]::Install()
     $lock = $null
     try {
         $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
@@ -2358,5 +2359,6 @@ function Invoke-CodexReviewLoop {
         if ($null -ne $lock) {
             $lock.Dispose()
         }
+        [CodexReviewLoopCancellationLog]::Remove()
     }
 }

@@ -11,13 +11,15 @@ accepted work. It repeats unattended until the branch is demonstrably clean.
 ## What it does
 
 1. Runs native Codex review without a custom reviewer prompt or JSON schema.
-2. Passes the review output unchanged to an Architect.
-3. Passes the Architect's advice unchanged to a Fixer.
-4. Lets a Verifier directly accept the solution or return feedback to the Fixer.
-5. Executes configured host gates and commits the exact accepted tree.
-6. Starts a new native review instead of blocking when a Fixer round is
+2. Recognizes clear results locally and asks a small Luna helper only when the
+   review text is ambiguous.
+3. Passes review output containing findings unchanged to an Architect.
+4. Passes the Architect's advice unchanged to a Fixer.
+5. Lets a Verifier directly accept the solution or return feedback to the Fixer.
+6. Executes configured host gates and commits the exact accepted tree.
+7. Starts a new native review instead of blocking when a Fixer round is
    exhausted.
-7. Repeats until the configured number of reviews are clean on the same
+8. Repeats until the configured number of reviews are clean on the same
    unchanged `HEAD` (two is the recommended default).
 
 ## Requirements

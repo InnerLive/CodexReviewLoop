@@ -5,7 +5,7 @@
     Author = "InnerLive"
     CompanyName = "InnerLive"
     Copyright = "(c) InnerLive"
-    Description = "Unattended, CLI-only Codex review loop with semantic architecture gates and verified fixes."
+    Description = "Unattended, CLI-only Codex review loop with native review, free roles, and verified fixes."
     PowerShellVersion = "7.0"
     FunctionsToExport = @(
         "Invoke-CodexReviewLoop",
