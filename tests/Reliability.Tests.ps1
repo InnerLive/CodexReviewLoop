@@ -822,6 +822,31 @@ Describe "Unattended reliability boundaries" {
         $message | Should Not Match "Verified:"
     }
 
+    It "uses a sealed commit identity instead of re-decoding its message" {
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified change"
+        & git -C $repo add -A
+        $tree = & git -C $repo write-tree
+        & git -C $repo commit -q -m "Reliability: actual commit message"
+        $commit = & git -C $repo rev-parse HEAD
+        $pending = [pscustomobject]@{
+            PreHead = $preHead
+            ExpectedTree = $tree
+            ExpectedCommit = $commit
+            Message = "Reliability: text decoding must not decide this check"
+        }
+
+        $check = & (Get-Module CodexReviewLoop) {
+            param($repository, $sealed)
+            Get-ReviewLoopPendingCommitCheck -RepoPath $repository -Pending $sealed
+        } $repo $pending
+
+        $check.Matches | Should Be $true
+        $check.CommitMatches | Should Be $true
+        $check.MessageMatches | Should Be $false
+        $check.MessageMatchRequired | Should Be $false
+    }
+
     It "commits the structured message with authoritative gate evidence" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $config.HostGates = @(@{
@@ -1267,8 +1292,71 @@ Changes:
 
         $failure | Should Not BeNullOrEmpty
         $failure.Exception.Message | Should Match "does not match the verified pending commit"
+        $failure.Exception.Message | Should Match "tree expected .* but found"
+        $failure.Exception.Message | Should Match "commit message differs from the sealed message"
+        $failure.Exception.Message | Should Match "expected sha256 [0-9a-f]{64} length"
         (& git -C $repo rev-parse HEAD) | Should Be $externalHead
         (& git -C $repo show -s --format=%s HEAD) | Should Be "external commit"
+    }
+
+    It "reports the dirty paths when an otherwise valid pending commit is not clean" {
+        $runRoot = Join-Path $caseRoot "dirty-pending-commit-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "dirty-pending-commit-ledger.json"
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified change"
+        $module = Get-Module CodexReviewLoop
+        $verifiedFingerprint = & $module {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+        & git -C $repo add -A
+        $verifiedTree = & git -C $repo write-tree
+        $message = "Reliability: verified change"
+        & git -C $repo commit -q -m $message
+        $committedHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "unexpected.txt") -Value "late mutation"
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $preHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $preHead
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.PendingCommit = [pscustomobject]@{
+            PreHead = $preHead
+            PatchFingerprint = $verifiedFingerprint
+            ExpectedTree = $verifiedTree
+            Message = $message
+            NeedsCurrentGates = $false
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $failure = $null
+        try {
+            & $module {
+                param($profile, $loopState, $loopStatePath, $loopLedger,
+                    $loopLedgerPath, $repository, $logs)
+                Complete-ReviewLoopPendingCommit `
+                    -Config $profile -State $loopState -StatePath $loopStatePath `
+                    -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                    -RepoPath $repository -RunRoot $logs
+            } (Import-PowerShellDataFile -LiteralPath $configPath) $state $statePath `
+                $ledger $ledgerPath $repo $runRoot | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message |
+            Should Match "worktree or index is not clean: \?\? unexpected\.txt"
+        (& git -C $repo rev-parse HEAD) | Should Be $committedHead
     }
 
     It "fails technically when a targeted test mutates repository state" {
@@ -1874,4 +1962,5 @@ Changes:
             $lock.Dispose()
         }
     }
+
 }
