@@ -14,8 +14,11 @@ function Get-ReviewLoopOperationalInstructions {
     )
 
     $instructions = @"
-This role runs unattended in a Windows PowerShell repository workspace.
+Execution context:
+This role is one Codex CLI process in an unattended Windows PowerShell repository workflow.
 The repository root, local tools, and repository instructions are available to the role.
+The orchestrator is deterministic PowerShell code, not an LLM or conversational participant.
+It does not interpret prose as instructions; it reacts to implemented workflow transitions and structured result fields.
 The orchestrator records repository state, owns Git refs and commits, executes configured host gates, and manages the Codex process.
 The role returns its result through the supplied structured format.
 "@
@@ -35,13 +38,38 @@ Configured host gates:
 $hostGateText
 The orchestrator executes these gates after verification.
 "@
-    if ($Role -eq "Fixer") {
-        return "$instructions$testOwnership`nThe fixer workspace is the worktree observed by the orchestrator."
-    }
     if ($Role -eq "ReviewClassifier") {
-        return "$instructions`nThis role classifies the supplied review text; the orchestrator compares repository state before and after the call."
+        return @"
+$instructions
+The ReviewClassifier's hasFindings field is the classification consumed by the orchestrator.
+This role classifies the supplied review text; the orchestrator compares repository state before and after the call.
+"@
     }
-    return "$instructions$testOwnership`nThis role contributes analysis; the orchestrator compares repository state before and after the call."
+    $handoff = switch ($Role) {
+        "Architect" {
+            @"
+The complete Architect result is passed unchanged to the Fixer as advice and is later shown to the Verifier.
+The Fixer acts on described repository changes; the orchestrator does not execute steps from architecture prose.
+"@
+        }
+        "Fixer" {
+            @"
+The Architect result is advice to this role. This role owns worktree edits but not commits or Git refs.
+The targetedTest fields are the interface for asking the orchestrator to run one targeted test after this role returns; the summary is descriptive.
+The fixer workspace is the worktree observed by the orchestrator.
+"@
+        }
+        "Verifier" {
+            @"
+The accept field selects the implemented workflow transition. Rejection feedback is passed to the Fixer; an accepted commitMessage proposal is used after configured host gates pass.
+The orchestrator does not infer additional actions from the summary or feedback prose.
+"@
+        }
+        default {
+            "This role contributes analysis; the orchestrator compares repository state before and after the call."
+        }
+    }
+    return "$instructions$testOwnership`n$handoff"
 }
 
 function Get-ReviewLoopPrompt {
