@@ -1174,6 +1174,80 @@ function Get-ReviewLoopCanonicalCommitMessage {
         Trim()
 }
 
+function Get-ReviewLoopPendingCommitCheck {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Pending
+    )
+
+    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "HEAD"
+    )
+    $parent = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "HEAD^"
+    )
+    $tree = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "HEAD^{tree}"
+    )
+    $subject = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "show", "-s", "--format=%s", "HEAD"
+    )
+    $message = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "show", "-s", "--format=%B", "HEAD"
+    )
+    $status = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "status", "--porcelain=v1", "--untracked-files=all"
+    )
+
+    $expectedParent = [string]$Pending.PreHead
+    $expectedTree = [string]$Pending.ExpectedTree
+    $expectedCommit = [string](Get-ReviewLoopObjectProperty `
+        -Object $Pending -Name "ExpectedCommit" -Default "")
+    $commitMatches = [string]::IsNullOrWhiteSpace($expectedCommit) -or
+        $head -eq $expectedCommit
+    $parentMatches = $parent -eq $expectedParent
+    $treeMatches = $tree -eq $expectedTree
+    $actualMessage = Get-ReviewLoopCanonicalCommitMessage -Message $message
+    $expectedMessage = Get-ReviewLoopCanonicalCommitMessage `
+        -Message ([string]$Pending.Message)
+    $messageMatches = $actualMessage -eq $expectedMessage
+    $messageMatchRequired = [string]::IsNullOrWhiteSpace($expectedCommit)
+    $worktreeClean = [string]::IsNullOrWhiteSpace($status)
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    if (-not $commitMatches) {
+        [void]$mismatches.Add("commit expected $expectedCommit but HEAD is $head")
+    }
+    if (-not $parentMatches) {
+        [void]$mismatches.Add("parent expected $expectedParent but found $parent")
+    }
+    if (-not $treeMatches) {
+        [void]$mismatches.Add("tree expected $expectedTree but found $tree")
+    }
+    if ($messageMatchRequired -and -not $messageMatches) {
+        $expectedMessageHash = Get-ReviewLoopSha256 $expectedMessage
+        $actualMessageHash = Get-ReviewLoopSha256 $actualMessage
+        [void]$mismatches.Add(
+            "commit message differs from the sealed message: expected sha256 $expectedMessageHash length $($expectedMessage.Length), actual sha256 $actualMessageHash length $($actualMessage.Length)")
+    }
+    if (-not $worktreeClean) {
+        $statusExcerpt = @(Get-ReviewLoopTextExcerpt -Text $status -MaxLines 8) -join " | "
+        [void]$mismatches.Add("worktree or index is not clean: $statusExcerpt")
+    }
+
+    return [pscustomobject]@{
+        Matches = $mismatches.Count -eq 0
+        CommitMatches = $commitMatches
+        ParentMatches = $parentMatches
+        TreeMatches = $treeMatches
+        MessageMatches = $messageMatches
+        MessageMatchRequired = $messageMatchRequired
+        WorktreeClean = $worktreeClean
+        Subject = $subject
+        Status = $status
+        Mismatches = @($mismatches)
+    }
+}
+
 function New-ReviewLoopCommitMessage {
     param(
         [Parameter(Mandatory = $true)][string]$Prefix,
@@ -1357,6 +1431,7 @@ function Complete-ReviewLoopPendingCommit {
             throw "The staged tree does not match the verified pending commit."
         }
         $pending.ExpectedTree = $tree
+        $pending | Add-Member -Force -NotePropertyName ExpectedCommit -NotePropertyValue ""
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
         $autoCommit = if ($Config.ContainsKey("AutoCommit")) {
             [bool]$Config.AutoCommit
@@ -1383,24 +1458,22 @@ function Complete-ReviewLoopPendingCommit {
         if ($candidate.Count -ne 1) {
             throw "Git did not return exactly one commit object ID."
         }
+        $candidateCommit = $candidate[0].ToLowerInvariant()
+        $pending.ExpectedCommit = $candidateCommit
+        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
         Invoke-ReviewLoopGitStep -Name "Commit" -Arguments @(
-            "update-ref", "HEAD", $candidate[0].ToLowerInvariant(), $preHead
+            "update-ref", "HEAD", $candidateCommit, $preHead
         ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
         $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
     }
 
-    $parent = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD^")
-    $tree = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD^{tree}")
-    $subject = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("show", "-s", "--format=%s", "HEAD")
-    $message = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
-        "show", "-s", "--format=%B", "HEAD"
-    )
-    if ($parent -ne $preHead -or $tree -ne [string]$pending.ExpectedTree -or
-        (Get-ReviewLoopCanonicalCommitMessage -Message $message) -ne
-            (Get-ReviewLoopCanonicalCommitMessage -Message ([string]$pending.Message)) -or
-        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
-        throw "The resulting commit does not match the verified pending commit."
+    $commitCheck = Get-ReviewLoopPendingCommitCheck `
+        -RepoPath $RepoPath -Pending $pending
+    if (-not $commitCheck.Matches) {
+        $details = @($commitCheck.Mismatches) -join "; "
+        throw "The resulting commit does not match the verified pending commit. Failed checks: $details."
     }
+    $subject = [string]$commitCheck.Subject
     if ([bool](Get-ReviewLoopObjectProperty -Object $pending -Name "NeedsCurrentGates" -Default $false)) {
         Update-ReviewLoopLiveConfig -Config $Config
         Assert-ReviewLoopExecutionUnchanged -Config $Config
@@ -1484,6 +1557,7 @@ function Complete-ReviewLoopFix {
         PreHead = $head
         PatchFingerprint = [string]$ExpectedSnapshot.Fingerprint
         ExpectedTree = ""
+        ExpectedCommit = ""
         Message = $message
         NeedsCurrentGates = $false
     })

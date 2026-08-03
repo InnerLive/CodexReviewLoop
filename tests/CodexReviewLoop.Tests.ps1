@@ -1487,6 +1487,32 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $fixer | Should Match 'targetedTest\.executable'
     }
 
+    It "describes the deterministic orchestrator and each structured role handoff" {
+        $instructions = & (Get-Module CodexReviewLoop) {
+            $config = @{ HostGates = @() }
+            [pscustomobject]@{
+                Architect = Get-ReviewLoopOperationalInstructions -Role Architect -Config $config
+                Fixer = Get-ReviewLoopOperationalInstructions -Role Fixer -Config $config
+                Verifier = Get-ReviewLoopOperationalInstructions -Role Verifier -Config $config
+                ReviewClassifier = Get-ReviewLoopOperationalInstructions `
+                    -Role ReviewClassifier -Config $config
+            }
+        }
+
+        foreach ($role in @("Architect", "Fixer", "Verifier", "ReviewClassifier")) {
+            $instructions.$role | Should Match 'orchestrator is deterministic PowerShell code, not an LLM'
+            $instructions.$role | Should Match 'does not interpret prose as instructions'
+            $instructions.$role | Should Match 'structured result fields'
+        }
+        $instructions.Architect | Should Match 'passed unchanged to the Fixer as advice'
+        $instructions.Architect | Should Match 'orchestrator does not execute steps from architecture prose'
+        $instructions.Fixer | Should Match 'owns worktree edits but not commits or Git refs'
+        $instructions.Fixer | Should Match 'targetedTest fields are the interface'
+        $instructions.Verifier | Should Match 'accept field selects the implemented workflow transition'
+        $instructions.Verifier | Should Match 'Rejection feedback is passed to the Fixer'
+        $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
+    }
+
     It "has no direct HTTP model invocation in active code" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
             Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
