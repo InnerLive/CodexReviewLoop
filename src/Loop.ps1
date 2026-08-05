@@ -2279,6 +2279,45 @@ function Get-ReviewLoopLessonsLearnedEligibility {
     }
 }
 
+function Get-ReviewLoopLessonsLearnedFinalCompletion {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    if ([string]$State.LessonsLearned.Status -ne "completed") {
+        return [pscustomobject]@{
+            CompletionAllowed = $false
+            Evidence = ""
+        }
+    }
+    $completedHead = [string]$State.LessonsLearned.CompletedHead
+    if ([string]::IsNullOrWhiteSpace($completedHead) -or
+        [string]$State.CurrentHead -ne $completedHead) {
+        return [pscustomobject]@{
+            CompletionAllowed = $false
+            Evidence = ""
+        }
+    }
+
+    $createdCommit = [string]$State.LessonsLearned.TriggerHead -ne $completedHead
+    $reviewAfterCommit = [bool](Get-ReviewLoopObjectProperty `
+        -Object $State.LessonsLearned -Name "ReviewAfterCommit" -Default $false)
+    if ($createdCommit -and $reviewAfterCommit) {
+        return [pscustomobject]@{
+            CompletionAllowed = $false
+            Evidence = ""
+        }
+    }
+
+    return [pscustomobject]@{
+        CompletionAllowed = $true
+        Evidence = if ($createdCommit) {
+            "final lessons-learned change verified"
+        }
+        else {
+            "lessons-learned recommendations accepted without a commit"
+        }
+    }
+}
+
 function Get-ReviewLoopLessonsLearnedCommitText {
     param(
         [Parameter(Mandatory = $true)][object]$State,
@@ -2326,6 +2365,8 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         $State.LessonsLearned.TriggerHead = $head
         $State.LessonsLearned.TriggerCommitCount = @(
             $State.LoopCommits | Select-Object -Unique).Count
+        $State.LessonsLearned.ReviewAfterCommit =
+            [bool]$Config.ReviewAfterLessonsLearnedCommit
         $State.LessonsLearned.Status = "analyzing"
     }
     Set-ReviewLoopCheckpoint `
@@ -2392,10 +2433,17 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         -Config $Config -State $State -StatePath $StatePath `
         -Ledger $Ledger -LedgerPath $LedgerPath `
         -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
+    $finalCompletion = Get-ReviewLoopLessonsLearnedFinalCompletion -State $State
     return [pscustomobject]@{
         Eligible = $true
-        CompletionAllowed = $false
-        Reason = "recommendations entered the normal fix workflow"
+        CompletionAllowed = $finalCompletion.CompletionAllowed
+        CompletionEvidence = $finalCompletion.Evidence
+        Reason = if ($finalCompletion.CompletionAllowed) {
+            "the accepted lessons-learned solution is the final cycle"
+        }
+        else {
+            "post-commit native reviews are configured"
+        }
     }
 }
 
@@ -2406,7 +2454,8 @@ function Complete-ReviewLoopRun {
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
         [Parameter(Mandatory = $true)][string]$TranscriptPath,
-        [Parameter(Mandatory = $true)][int]$CleanPassesRequired
+        [Parameter(Mandatory = $true)][int]$CleanPassesRequired,
+        [string]$CompletionEvidence = ""
     )
 
     $State.Status = "completed"
@@ -2416,7 +2465,8 @@ function Complete-ReviewLoopRun {
     Write-ReviewLoopCompletionSummary `
         -Cycles $State.ReviewCycle `
         -CleanPasses "$($State.CleanPasses)/$CleanPassesRequired" `
-        -RunRoot $RunRoot -LedgerPath $LedgerPath -TranscriptPath $TranscriptPath
+        -RunRoot $RunRoot -LedgerPath $LedgerPath -TranscriptPath $TranscriptPath `
+        -CompletionEvidence $CompletionEvidence
     return [pscustomobject]@{
         Status = $State.Status
         ExitCode = 0
@@ -2759,6 +2809,15 @@ function Invoke-ReviewLoopCore {
         }
         while ($true) {
             Assert-ReviewLoopExecutionUnchanged -Config $config
+            $finalLessonsCompletion =
+                Get-ReviewLoopLessonsLearnedFinalCompletion -State $state
+            if ($finalLessonsCompletion.CompletionAllowed) {
+                return Complete-ReviewLoopRun `
+                    -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
+                    -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
+                    -CleanPassesRequired ([int]$config.CleanPassesRequired) `
+                    -CompletionEvidence $finalLessonsCompletion.Evidence
+            }
             if ([string]$state.Stage -in @(
                 "lessons_learned_analyzing", "lessons_learned_completed"
             )) {
@@ -2784,7 +2843,9 @@ function Invoke-ReviewLoopCore {
                     return Complete-ReviewLoopRun `
                         -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
                         -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
-                        -CleanPassesRequired ([int]$config.CleanPassesRequired)
+                        -CleanPassesRequired ([int]$config.CleanPassesRequired) `
+                        -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
+                            -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
                 }
                 continue
             }
@@ -2926,7 +2987,9 @@ function Invoke-ReviewLoopCore {
                         return Complete-ReviewLoopRun `
                             -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
                             -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
-                            -CleanPassesRequired ([int]$config.CleanPassesRequired)
+                            -CleanPassesRequired ([int]$config.CleanPassesRequired) `
+                            -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
+                                -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
                     }
                     continue
                 }

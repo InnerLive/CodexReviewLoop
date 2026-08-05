@@ -101,7 +101,9 @@ commit settings are reloaded at safe boundaries. An interrupted
 lessons-learned analysis uses the same role-call checkpoint and repository
 postconditions. A changed execution fingerprint requalifies unfinished
 analysis, while a successfully completed lessons-learned phase remains
-complete.
+complete. The captured `ReviewAfterLessonsLearnedCommit` value also survives
+resume, so an interruption after the final commit cannot change whether
+post-commit native reviews are required.
 
 Use `-NewRun` when you deliberately want a new run checkpoint. It still
 requires a clean worktree, respects the repository lock, and keeps compatible
@@ -112,7 +114,7 @@ that happens automatically.
 
 | Status | Exit code | Meaning |
 |---|---:|---|
-| `completed` | `0` | Required clean passes on unchanged `HEAD`, plus an eligible completed or safely skipped lessons-learned phase |
+| `completed` | `0` | The clean gate was reached and any eligible lessons-learned phase completed; configured post-commit reviews also passed when required |
 | Invocation error | `1` | Validation or preflight failed before a run checkpoint was created |
 | `failed` | `2` | An initialized run failed; its latest checkpoint is preserved |
 | `limit_reached` | `4` | The configured per-invocation review budget was used; run the same command to continue |
@@ -134,8 +136,10 @@ continues with a fresh budget.
 The lessons-learned phase does not consume `MaxReviewCycles`. If its Fixer
 round reaches `MaxFixAttempts`, the rejected patch is preserved and restored
 through the normal cleanup path, the phase stays open, and native review
-continues. A lessons-learned commit resets clean passes and therefore requires
-the configured native clean reviews again.
+continues. By default, an accepted lessons-learned solution is the final cycle.
+With `ReviewAfterLessonsLearnedCommit = $true`, a real lessons-learned commit
+resets clean passes and requires the configured native clean reviews again.
+An accepted no-op completes immediately in either mode.
 
 `InactivityTimeoutMinutes` defaults to 30. Codex roles, targeted tests, and host
 gates may run for any total duration while they continue producing real output.

@@ -195,9 +195,10 @@ critic, veto, and tie-break roles do not exist in the active workflow.
   after the resulting commit identity has been checked. Compatible legacy
   checkpoints reconstruct missing SHAs only from a confirmed linear
   `StartHead..CurrentHead` history.
-- Lessons-learned status, attempt, trigger `HEAD`, trigger commit count, and
-  active finding source are durable checkpoint state. An execution fingerprint
-  change requalifies unfinished analysis but never repeats a completed phase.
+- Lessons-learned status, attempt, trigger `HEAD`, trigger commit count,
+  captured post-commit review choice, and active finding source are durable
+  checkpoint state. An execution fingerprint change requalifies unfinished
+  analysis but never repeats a completed phase.
 - Each durable role transition writes an atomic, idempotent checkpoint.
 - Legacy checkpoints are evidence, not executable state. Import compatible
   history, reset stale attempt and thread state, and start with a native review
@@ -205,11 +206,14 @@ critic, veto, and tie-break roles do not exist in the active workflow.
 - Repository, branch, symbolic review base, resolved base commit, HEAD, speed,
   and execution fingerprint must be checked before resuming relevant work.
 
-Completion requires the configured clean-pass gate, with two consecutive clean
-native reviews on an unchanged HEAD as the recommended default. Every commit or
-other HEAD change resets the clean-pass counter. Before completion, a positive
-`LessonsLearnedCommitThreshold` also requires one lessons-learned phase when
-the threshold is met and root `AGENTS.md` is tracked in the current `HEAD`.
+Normal completion first requires the configured clean-pass gate, with two
+consecutive clean native reviews on an unchanged HEAD as the recommended
+default. Every ordinary fix commit or other HEAD change resets the clean-pass
+counter. Before completion, a positive `LessonsLearnedCommitThreshold` also
+requires one lessons-learned phase when the threshold is met and root
+`AGENTS.md` is tracked in the current `HEAD`. An accepted lessons-learned
+solution is then terminal unless its captured post-commit review choice
+requires the normal clean gate again after a real commit.
 
 ## Architecture behavior
 
@@ -258,10 +262,14 @@ decision layers.
 - `LessonsLearnedCommitThreshold` defaults to 6, is live-reloaded at the clean
   gate, and is disabled by zero or a negative value. The phase does not consume
   `MaxReviewCycles`.
+- `ReviewAfterLessonsLearnedCommit` defaults to false and is captured when an
+  eligible analysis starts. False makes an accepted lessons-learned solution
+  the final cycle. True requires normal clean native reviews after a real
+  lessons-learned commit.
 - An empty lessons-learned recommendation list completes the phase directly.
-  Accepted recommendations complete it even when no commit is necessary. A
-  real lessons-learned commit resets clean passes; the completed phase is not
-  run again. Exhausted Fixer attempts leave it open and return to native review.
+  Accepted recommendations complete it even when no commit is necessary, and
+  no-op solutions never require another review. The completed phase is not run
+  again. Exhausted Fixer attempts leave it open and return to native review.
 - Run configured host gates after verification and before every commit.
 - Recheck the patch after gates, stage the exact tree, create the commit from
   that tree, and advance HEAD with an old-value check.

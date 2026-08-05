@@ -33,6 +33,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
 | `LessonsLearnedCommitThreshold` | `6` | Verified loop commits required for the conditional completion analysis; `0` disables it |
+| `ReviewAfterLessonsLearnedCommit` | `$false` | Require normal clean native reviews after a real lessons-learned commit |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
 | `InactivityTimeoutMinutes` | `30` | Live-reloaded child-process inactivity limit; zero or less disables it |
 | `AutoCommit` | `$true` | Live-reloaded commit behavior |
@@ -81,6 +82,11 @@ fix, and commit boundaries:
 - `MaxReviewCycles` applies before the next native review call.
 - `LessonsLearnedCommitThreshold` applies when the clean-pass completion gate
   is reached.
+- `ReviewAfterLessonsLearnedCommit` is captured when an eligible
+  lessons-learned analysis starts. The default `$false` makes an accepted
+  lessons-learned solution the final cycle. `$true` requires normal clean
+  native reviews after a real commit; accepted no-op solutions still complete
+  directly.
 - `MaxFixAttempts` applies before the next Fixer call. Reaching it restores the
   rejected round and starts another native review; it never blocks a finding.
 - `InactivityTimeoutMinutes` applies when the next role, targeted test, or host

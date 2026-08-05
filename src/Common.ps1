@@ -461,6 +461,11 @@ function New-ReviewLoopProfile {
     # This value is reloaded when the clean-pass gate is reached.
     LessonsLearnedCommitThreshold = 6
 
+    # By default, an accepted lessons-learned solution is the final cycle.
+    # Set this to true to require the normal clean native reviews again after
+    # a real lessons-learned commit. The value is captured when analysis starts.
+    ReviewAfterLessonsLearnedCommit = `$false
+
     # Recommended: 2-5 fixer calls before discarding the rejected round and
     # starting a new native Codex review. This value is reloaded at safe
     # boundaries while a run is active.
@@ -581,6 +586,7 @@ function Import-ReviewLoopConfig {
         CleanPassesRequired = 2
         MaxReviewCycles = 12
         LessonsLearnedCommitThreshold = 6
+        ReviewAfterLessonsLearnedCommit = $false
         MaxFixAttempts = 2
         InactivityTimeoutMinutes = 30
         AutoCommit = $true
@@ -621,6 +627,9 @@ function Assert-ReviewLoopConfigValues {
     }
     if ($Config.ReviewerInstructions -isnot [string]) {
         throw "Configuration value 'ReviewerInstructions' must be a string."
+    }
+    if ($Config.ReviewAfterLessonsLearnedCommit -isnot [bool]) {
+        throw "Configuration value 'ReviewAfterLessonsLearnedCommit' must be a boolean."
     }
 
     foreach ($name in @(
@@ -672,6 +681,7 @@ $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
     "LessonsLearnedCommitThreshold",
+    "ReviewAfterLessonsLearnedCommit",
     "MaxFixAttempts",
     "InactivityTimeoutMinutes",
     "AutoCommit",

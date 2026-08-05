@@ -20,11 +20,15 @@ flowchart LR
     verify -- Reject --> fix
     verify -- Accept --> gates[Host gates]
     gates --> commit[Commit verified tree]
-    commit --> review
+    commit --> finalLesson{Final lessons-learned solution?}
+    finalLesson -- No --> review
+    finalLesson -- Yes --> postReview{Real commit and<br/>post-review enabled?}
+    postReview -- No --> done[Complete]
+    postReview -- Yes --> review
     findings -- No --> clean{Required clean passes<br/>on unchanged HEAD?}
     clean -- No --> review
     clean -- Yes --> eligible{Lessons learned eligible?}
-    eligible -- No --> done[Complete]
+    eligible -- No --> done
     eligible -- Yes --> lessons[Read-only LessonsLearned analysis]
     lessons --> recommendations{Recommendations?}
     recommendations -- No --> done
@@ -135,9 +139,12 @@ Otherwise, each recommendation becomes a normal ledger finding and the full
 analysis is passed to the Architect. Architect, Fixer, targeted test, Verifier,
 host gates, and commit behavior remain unchanged. An accepted no-op solution
 completes the phase without increasing the commit count. A real accepted
-commit is recorded as another verified loop commit, resets clean passes, and
-requires native clean reviews again. A completed lessons-learned phase is not
-repeated for the durable run.
+commit is recorded as another verified loop commit. By default, the accepted
+solution is the final cycle and the run completes immediately. Setting
+`ReviewAfterLessonsLearnedCommit = $true` before analysis starts instead resets
+clean passes and requires native clean reviews again after a real commit.
+Accepted no-op solutions always complete directly. A completed lessons-learned
+phase is not repeated for the durable run.
 
 There is no semantic blocked outcome. Rejected fixes, old blocked ledger
 entries, and stale clean checkpoints cause another native review rather than

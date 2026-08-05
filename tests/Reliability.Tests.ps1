@@ -47,6 +47,7 @@ function New-ReliabilityConfig {
     CleanPassesRequired = 2
     MaxReviewCycles = 6
     LessonsLearnedCommitThreshold = 6
+    ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
     AutoCommit = `$true
@@ -1275,6 +1276,8 @@ Changes:
         $state.ActiveFindingSource = "lessons_learned"
         $state.ActiveFindingIds = @($finding.Id)
         $state.LessonsLearned.Status = "implementing"
+        $state.LessonsLearned.TriggerHead = [string]$state.CurrentHead
+        $state.LessonsLearned.ReviewAfterCommit = $true
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         $head = & git -C $repo rev-parse HEAD
 
@@ -1293,6 +1296,49 @@ Changes:
         $reloaded.LessonsLearned.CompletedHead | Should Be $head
         @($reloaded.LoopCommits).Count | Should Be 0
         $reloaded.ActiveFindingSource | Should Be ""
+        $completion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+        $completion.CompletionAllowed | Should Be $true
+        $completion.Evidence | Should Match "without a commit"
+    }
+
+    It "resumes directly after a final lessons-learned commit by default" {
+        $runRoot = Join-Path $caseRoot "lessons-final-resume-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $triggerHead = [string]$state.CurrentHead
+        Set-Content -LiteralPath (Join-Path $repo "AGENTS.md") `
+            -Value "# Final guidance"
+        & git -C $repo add AGENTS.md
+        & git -C $repo commit -q -m "final lessons learned"
+        $completedHead = & git -C $repo rev-parse HEAD
+        $state.CurrentHead = $completedHead
+        $state.Stage = "fix_committed"
+        $state.LessonsLearned.Status = "completed"
+        $state.LessonsLearned.TriggerHead = $triggerHead
+        $state.LessonsLearned.CompletedHead = $completedHead
+        $state.LessonsLearned.ReviewAfterCommit = $false
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $completion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+
+        $completion.CompletionAllowed | Should Be $true
+        $completion.Evidence | Should Match "final lessons-learned change verified"
+
+        $reloaded.LessonsLearned.ReviewAfterCommit = $true
+        $postReviewCompletion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+        $postReviewCompletion.CompletionAllowed | Should Be $false
     }
 
     It "leaves lessons learned open when the fixer round returns to native review" {

@@ -362,6 +362,7 @@ function New-ReviewLoopState {
             TriggerHead = ""
             TriggerCommitCount = 0
             CompletedHead = ""
+            ReviewAfterCommit = $false
         }
         ActiveRoleCall = $null
         ActiveStrategy = $null
@@ -426,6 +427,7 @@ function Read-ReviewLoopState {
                 TriggerHead = ""
                 TriggerCommitCount = 0
                 CompletedHead = ""
+                ReviewAfterCommit = $false
             })
     }
     else {
@@ -434,7 +436,8 @@ function Read-ReviewLoopState {
             @{ Name = "Attempt"; Value = 0 },
             @{ Name = "TriggerHead"; Value = "" },
             @{ Name = "TriggerCommitCount"; Value = 0 },
-            @{ Name = "CompletedHead"; Value = "" }
+            @{ Name = "CompletedHead"; Value = "" },
+            @{ Name = "ReviewAfterCommit"; Value = $false }
         )) {
             if ($state.LessonsLearned.PSObject.Properties.Name -notcontains $entry.Name) {
                 $state.LessonsLearned | Add-Member `
