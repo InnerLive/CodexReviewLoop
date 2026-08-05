@@ -45,6 +45,13 @@ The ReviewClassifier's hasFindings field is the classification consumed by the o
 This role classifies the supplied review text; the orchestrator compares repository state before and after the call.
 "@
     }
+    if ($Role -eq "LessonsLearned") {
+        return @"
+$instructions$testOwnership
+The recommendations array is the analysis result consumed by the orchestrator. An empty array means that no durable repository guidance is justified.
+This role analyzes the supplied verified loop commits; the orchestrator compares repository state before and after the call.
+"@
+    }
     $handoff = switch ($Role) {
         "Architect" {
             @"

@@ -46,6 +46,7 @@ function New-ReliabilityConfig {
     LogRoot = '$literalLog'
     CleanPassesRequired = 2
     MaxReviewCycles = 6
+    LessonsLearnedCommitThreshold = 6
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
     AutoCommit = `$true

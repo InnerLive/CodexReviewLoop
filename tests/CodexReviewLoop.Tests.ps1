@@ -77,6 +77,7 @@ function New-TestConfig {
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
     CleanPassesRequired = 2
     MaxReviewCycles = 6
+    LessonsLearnedCommitThreshold = 6
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
     AutoCommit = `$true
@@ -161,9 +162,10 @@ Describe "Codex Review Loop module" {
             New-ReviewLoopProfile -RepoPath $repository -Path $path
         } $repo $profilePath
         $profile = Import-PowerShellDataFile -LiteralPath $generated
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
-            "Architect", "Fixer", "ReviewClassifier", "Reviewer", "Verifier")
+            "Architect", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer", "Verifier")
     }
 }
 
@@ -222,7 +224,8 @@ Describe "Optional profiles and command help" {
         $profile.LogRoot | Should Be ".\runs"
         $profile.ReviewerInstructions | Should Be ""
         $profile.InactivityTimeoutMinutes | Should Be 30
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -298,6 +301,22 @@ Describe "Optional profiles and command help" {
         $profile.ReviewerInstructions | Should Be ""
     }
 
+    It "defaults old profiles to a six-commit lessons-learned threshold" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "old-lessons-threshold-profile.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-lessons-threshold-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath) -replace
+            '(?m)^    LessonsLearnedCommitThreshold = 6\r?\n', ''
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+
+        $profile = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+    }
+
     It "maps legacy fixer and verifier role names in existing profiles" {
         $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
             -Path (Join-Path $TestDrive "legacy-roles.psd1") `
@@ -332,6 +351,22 @@ Describe "Optional profiles and command help" {
 
         $classifier.Model | Should Be "gpt-5.6-luna"
         $classifier.Thinking | Should Be "low"
+    }
+
+    It "supplies the lessons-learned defaults to existing profiles" {
+        $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
+            -Path (Join-Path $TestDrive "old-lessons-role.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-lessons-role-logs"))
+        $profile.Roles.ContainsKey("LessonsLearned") | Should Be $false
+
+        $role = & (Get-Module CodexReviewLoop) {
+            param($config)
+            Assert-ReviewLoopConfigValues -Config $config
+            Get-ReviewLoopRoleConfig -Config $config -Role LessonsLearned
+        } $profile
+
+        $role.Model | Should Be "gpt-5.6-sol"
+        $role.Thinking | Should Be "high"
     }
 
     It "reuses the profile matched by canonical repository path" {
@@ -747,6 +782,7 @@ Describe "Run state" {
         $content = (Get-Content -Raw -LiteralPath $profilePath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 5").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 24").
+            Replace("LessonsLearnedCommitThreshold = 6", "LessonsLearnedCommitThreshold = 9").
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 7").
             Replace("AutoCommit = `$true", "AutoCommit = `$false").
             Replace(
@@ -1432,7 +1468,7 @@ Describe "Schemas, prompts, and CLI-only invariants" {
     }
 
     It "contains every production prompt" {
-        @("architect.md", "fixer.md", "verifier.md") |
+        @("architect.md", "fixer.md", "verifier.md", "lessons-learned.md") |
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
     }
 
@@ -1457,6 +1493,12 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             Should Be $true
         '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+            Should Be $false
+        '{"schemaVersion":"1.0","summary":"Persist durable guidance.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Run the repository-owned gate after changing the parser.","evidence":["abc123 changed parser and tests"]}]}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
             Should Be $false
     }
 
@@ -1578,8 +1620,10 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
     }
 
     It "keeps role instructions factual and leaves decisions to the models" {
-        $prompts = (Get-ChildItem -LiteralPath (Join-Path $root "prompts") -Filter "*.md" |
-            ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
+        $prompts = @("architect.md", "fixer.md", "verifier.md") | ForEach-Object {
+            Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$_")
+        }
+        $prompts = $prompts -join "`n"
         $prompts | Should Not Match '(?i)\bmust\b|\bnever\b|fail closed|\bprefer\b|\bonly\b|smallest|bounded'
         $prompts | Should Match 'Use your judgment'
     }
@@ -1587,6 +1631,14 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
     It "gives the verifier the fixer result and test execution" {
         $verifier = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\verifier.md")
         $verifier | Should Match 'Fixer result and targeted-test execution'
+    }
+
+    It "keeps the lessons-learned prompt self-contained and read-only" {
+        $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\lessons-learned.md")
+        $prompt | Should Match 'Do not modify files, the worktree, the index, Git refs, or repository state'
+        $prompt | Should Match '\.agents/skills/<skill-name>/SKILL\.md'
+        $prompt | Should Match 'Do not rely on any plugin, installed skill, network access'
+        $prompt | Should Match '\{\{LOOP_COMMITS\}\}'
     }
 
     It "gives each free role the shared workflow and marks its current position" {
@@ -1609,10 +1661,14 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
                 Verifier = Get-ReviewLoopOperationalInstructions -Role Verifier -Config $config
                 ReviewClassifier = Get-ReviewLoopOperationalInstructions `
                     -Role ReviewClassifier -Config $config
+                LessonsLearned = Get-ReviewLoopOperationalInstructions `
+                    -Role LessonsLearned -Config $config
             }
         }
 
-        foreach ($role in @("Architect", "Fixer", "Verifier", "ReviewClassifier")) {
+        foreach ($role in @(
+            "Architect", "Fixer", "Verifier", "ReviewClassifier", "LessonsLearned"
+        )) {
             $instructions.$role | Should Match 'orchestrator is deterministic PowerShell code, not an LLM'
             $instructions.$role | Should Match 'does not interpret prose as instructions'
             $instructions.$role | Should Match 'structured result fields'
@@ -1624,6 +1680,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $instructions.Verifier | Should Match 'accept field selects the implemented workflow transition'
         $instructions.Verifier | Should Match 'Rejection feedback is passed to the Fixer'
         $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
+        $instructions.LessonsLearned | Should Match 'recommendations array is the analysis result consumed by the orchestrator'
     }
 
     It "has no direct HTTP model invocation in active code" {
