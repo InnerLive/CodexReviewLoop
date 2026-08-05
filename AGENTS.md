@@ -1,155 +1,135 @@
-# Agent Instructions
+# Codex Review Loop repository guidance
 
-This file is the repository-wide source of intent for future development of
-Codex Review Loop. Read it completely before changing code, prompts, schemas,
-tests, profiles, documentation, or release behavior.
+Use this file for repository-wide rules that must apply to every change. Keep
+it practical and concise. Put detailed product behavior in the linked docs and
+add new guidance here only for recurring mistakes or review feedback.
 
-## Product mission
+## Repository overview
 
-Codex Review Loop exists so a developer can start a review/fix cycle and walk
-away. It must review a branch, identify real defects, make useful fixes,
-independently verify them, run repository-owned quality gates, commit only
-verified work, and continue until trustworthy completion unless the user-owned
-review-cycle budget or a genuine technical failure stops the invocation.
-Before completion, a sufficiently productive run should also extract durable,
-evidence-backed repository lessons without requiring user attention.
+Codex Review Loop is a Windows-first PowerShell 7 CLI that reviews a branch,
+fixes findings, verifies the exact worktree, runs repository-owned gates, and
+commits only accepted work. Its primary requirement is reliable unattended
+operation: a developer should be able to start a run and walk away.
 
-The scarce resource is the user's attention. Requiring the user to inspect
-architecture proposals, classify findings, approve routine commands, repair
-state, or repeatedly restart the tool defeats the product. "Unattended" is not
-an optional mode; it is the primary requirement.
-
-A long loop is not evidence of diligence by itself. Rejected Fixer rounds must
-return to native review instead of becoming durable blocked findings. Progress
-is demonstrated by accepted commits and clean native reviews on an unchanged
-HEAD.
-
-## What the user is optimizing for
-
-Apply these priorities in order:
+Optimize in this order:
 
 1. Correctness and trustworthy completion.
 2. Reliable unattended operation on real Windows repositories.
-3. Simplicity and maintainability of the orchestrator.
-4. High model-decision quality.
-5. Efficient use of Codex credits, elapsed time, and local compute.
-6. Rich diagnostics for maintainers without noisy default terminal output.
+3. Simplicity and maintainability.
+4. Model-decision quality.
+5. Cost, elapsed time, and local compute.
+6. Useful diagnostics without noisy default output.
 
-Quality takes precedence when a cheaper model is materially worse. When two
-choices provide the same quality, prefer the cheaper one. `standard` is the
-cost-conscious default. `fast` remains an explicit global option for situations
-where elapsed time matters more, and it must apply to every role and resume call
-without changing model or reasoning effort.
+## Repository layout
 
-Do not solve reliability problems by continually adding special cases. Prefer
-removing obsolete logic, consolidating duplicate paths, strengthening a small
-number of invariants, and fixing root causes. A change that adds substantial
-orchestration complexity needs evidence that a simpler correction cannot meet
-the requirement.
+| Path | Purpose |
+|---|---|
+| `codex-review-loop.ps1` | Public CLI entry point |
+| `CodexReviewLoop.psm1` | Module composition and exports |
+| `src/Common.ps1` | Configuration, paths, and shared helpers |
+| `src/Cli.ps1` | Central Codex CLI process adapter |
+| `src/State.ps1` | Durable run state and finding ledger |
+| `src/Roles.ps1` | Role orchestration and contracts |
+| `src/Loop.ps1` | Review/fix/verify/commit state machine |
+| `src/Console.ps1` | Terminal rendering and transcript selection |
+| `prompts/` | Versioned role prompts |
+| `schemas/` | Closed JSON schemas for structured roles |
+| `tests/CodexReviewLoop.Tests.ps1` | Main behavior and integration suite |
+| `tests/Reliability.Tests.ps1` | Process, recovery, and safety suite |
+| `tests/FakeCodex.ps1` | Deterministic fake CLI for tests |
+| `docs/how-it-works.md` | Canonical workflow explanation |
+| `docs/configuration.md` | Profiles and live configuration |
+| `docs/operations.md` | Operation, resume, and failure handling |
+| `archive/` | Read-only historical implementation evidence |
 
-## Non-negotiable boundaries
+## Read before editing
 
-- All model interactions go through the locally installed and authenticated
-  Codex CLI.
-- Never add a direct OpenAI HTTP/API path, an API credential dependency, or an
-  API fallback.
-- The tool must remain repository-agnostic. Do not add product knowledge, files
-  from a reviewed repository, or any reviewed repository as a runtime dependency.
-- Historical external logs and findings may be used only as read-only regression
-  and prompt-evaluation evidence.
-- Public repository content is written in English.
-- The canonical implementation is the modular root CLI. Do not create a second
-  execution path or a legacy compatibility shim.
-- Do not require interactive architecture approval, routine command approval,
-  manual finding classification, or manual profile creation.
-- Never silently fall back from `fast` to `standard`, from one model to another,
-  or from the CLI to an API.
-- Never close a finding because a fixer edited code or a commit exists.
-  Resolution requires current verification evidence.
-- Never weaken a failing invariant merely to keep the loop moving.
+- Workflow, role, state, or completion changes: read
+  `docs/how-it-works.md`, the owning source file, related prompt/schema, and
+  matching tests.
+- Profile or public-option changes: also read `docs/configuration.md`,
+  `codex-review-loop.ps1`, and profile tests.
+- Terminal, timeout, recovery, or process-lifecycle changes: also read
+  `docs/operations.md` and `tests/Reliability.Tests.ps1`.
+- When a reliability issue resembles behavior in `archive/`, inspect the
+  archived implementation and tests, then reuse the invariant rather than the
+  old monolith.
 
-## Design philosophy: freedom plus postconditions
+## Development commands
 
-LLMs are non-deterministic. They need enough command freedom to investigate
-unfamiliar repositories, discover paths, use repository-specific tooling, and
-recover from ordinary exploratory mistakes.
+Run from the repository root with PowerShell 7.
 
-Do not build a second command-policy engine, path allowlist, shell parser, or
-per-role sandbox matrix into this tool. Every role uses the same central Codex
-CLI process adapter. Structured `exec` and `resume` calls use:
-
-- `--ignore-user-config`
-- `--ignore-rules`
-- `--dangerously-bypass-approvals-and-sandbox`
-- an explicit model
-- an explicit reasoning effort
-- an explicit service tier
-
-The Reviewer uses the direct `codex review --base ...` command with the shared
-model, reasoning, service-tier, repository, and unattended settings supported
-by that command. It may receive optional supplemental developer instructions
-from the profile or an explicit CLI override. It receives no positional prompt,
-JSONL switch, result schema, or output-file switch; its plain review output is
-the authoritative reviewer result.
-
-Control model behavior through clear role contracts and enforce outcomes with
-postconditions:
-
-- analysis roles must leave HEAD, index, tracked files, and untracked files
-  unchanged;
-- fixers may edit the worktree but may not own commits or Git refs;
-- tests and verification must not introduce unrelated mutations;
-- the orchestrator owns authoritative test execution, verification, staging,
-  and commits;
-- every accepted commit must correspond to the exact verified tree.
-
-Ordinary internal agent-command failures belong to the active model turn. The
-model receives their output and can correct them. They are not equivalent to a
-Codex process failure or an invalid role result. Conversely, do not hide a real
-process failure, `turn.failed`, invalid structured result, unsafe mutation, or
-broken process lifecycle behind an advisory classification.
-
-Model-run tests are exploratory evidence only. Configured host gates and an
-available structured targeted test are authoritative. Reviewer instructions may
-only supplement the native Reviewer through the configured
-`developer_instructions` value; do not add a positional reviewer prompt or
-reintroduce a general command allowlist.
-Long-running commands must not leave orphaned Windows child processes.
-
-## Public interface invariants
-
-The normal invocation stays simple:
+Show public help without starting a run:
 
 ```powershell
-pwsh -File .\codex-review-loop.ps1 -RepoPath C:\dev\Project
+pwsh -NoProfile -File .\codex-review-loop.ps1 -Help
 ```
 
-- `RepoPath` may be positional.
-- `ConfigPath` is optional.
-- `-ReviewerInstructions` optionally overrides the profile value. Explicit CLI
-  binding wins, including an empty string, and remains fixed for the invocation.
-- `-Help` must work without creating a profile or starting a run.
-- `-Speed` accepts `standard|fast` and defaults to `standard`.
-- `-OutputMode` accepts `compact|balanced|detailed` and defaults to `compact`.
-- `-HeartbeatSeconds` defaults to 30; zero disables heartbeats.
-- `-ColorMode` accepts `Host|Ansi|Always|Auto|Never` and defaults to `Host`.
-- The default log root is relative to the review-loop installation, never the
-  caller's current directory or the reviewed repository.
+Run the main suite:
 
-Configuration discovery is bound to the canonical repository root:
+```powershell
+$result = Invoke-Pester -Script .\tests\CodexReviewLoop.Tests.ps1 -PassThru
+if ($result.FailedCount -gt 0) { throw "Main Pester suite failed." }
+```
 
-1. `<repo>\.codex-review-loop.psd1`
-2. `<repo>\.codex\review-loop.psd1`
-3. a tool-local profile whose `RepositoryPath` exactly matches the repository
+Run the reliability suite:
 
-If none exists, create and use a commented profile automatically. Tool-local
-automatic profile names use the repository name plus the next number, such as
-`Project-001.psd1`. Comments must explain accepted values. The user must not
-have to author a file before the first run.
+```powershell
+$result = Invoke-Pester -Script .\tests\Reliability.Tests.ps1 -PassThru
+if ($result.FailedCount -gt 0) { throw "Reliability Pester suite failed." }
+```
 
-## Role policy
+Parse active PowerShell files:
 
-The current quality/cost allocation is intentional:
+```powershell
+$files = rg --files -g '*.ps1' -g '*.psm1' -g '*.psd1' -g '!archive/**' -g '!runs/**'
+foreach ($file in $files) {
+    $tokens = $null
+    $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile(
+        (Resolve-Path $file), [ref]$tokens, [ref]$errors)
+    if ($errors) { throw "PowerShell parse failed: $file" }
+}
+```
+
+Parse schemas and check the patch:
+
+```powershell
+Get-ChildItem .\schemas\*.json | ForEach-Object {
+    Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json | Out-Null
+}
+git diff --check
+```
+
+Do not run a productive review loop against a real project while developing
+this repository. Use `FakeCodex.ps1` and temporary Git repositories. A bounded
+live CLI smoke test is appropriate only when fake-process evidence cannot prove
+the behavior.
+
+## Non-negotiable constraints
+
+- All model interactions go through the locally installed and authenticated
+  Codex CLI. Never add direct OpenAI HTTP/API access, credentials, or fallback.
+- Keep the tool repository-agnostic. Reviewed repositories and their product
+  knowledge must not become runtime dependencies.
+- The modular root CLI is the only active implementation. Do not add a second
+  execution path or legacy compatibility shim.
+- Public repository content is English.
+- Do not require interactive architecture approval, routine command approval,
+  manual finding classification, or manual profile creation.
+- Never silently change speed, model, reasoning effort, service tier, or CLI
+  transport.
+- Never weaken a failing invariant to keep the loop moving.
+- Preserve unrelated user changes and never include them in a loop commit.
+
+## Architecture and role contracts
+
+Use one central CLI adapter for every structured `exec` and `resume` call. Pass
+`--ignore-user-config`, `--ignore-rules`, unattended full access, and explicit
+model, reasoning, and service-tier values on every call. The native Reviewer
+uses `codex review --base`; it receives no positional prompt, schema, JSONL
+switch, or output-file switch. Supplemental Reviewer guidance may only use its
+supported developer-instructions setting.
 
 | Role | Model | Reasoning |
 |---|---|---|
@@ -158,239 +138,99 @@ The current quality/cost allocation is intentional:
 | Architect | `gpt-5.6-sol` | `high` |
 | Fixer | `gpt-5.6-sol` | `high` |
 | Verifier | `gpt-5.6-sol` | `low` |
+| ReviewClassifier | `gpt-5.6-luna` | `low` |
 
-Ambiguous native review text is classified by the mechanical
-`ReviewClassifier` helper using `gpt-5.6-luna/low`. It is not a workflow
-decision role.
+- Analysis roles must leave HEAD, index, tracked files, and untracked files
+  unchanged.
+- Fixers own worktree edits but never commits or Git refs.
+- The orchestrator owns authoritative tests, verification, staging, and
+  commits. Every accepted commit must represent the exact verified tree.
+- Architect, Fixer, and Verifier make their existing decisions directly. Do
+  not add approval, critic, judge, veto, tie-break, or fallback roles.
+- Prompts and schemas remain versioned resources, not large inline strings.
+- Structured output is mandatory where a schema exists. A process failure,
+  `turn.failed`, invalid structured result, or unsafe mutation is technical
+  failure, not advisory output.
 
-The Reviewer is the native Codex review function. It receives no positional
-prompt or output schema. Optional profile or CLI guidance is passed only as
-supplemental developer instructions. Deterministic text recognition is used
-first. Only ambiguous text reaches the ReviewClassifier. Review text classified
-as containing findings goes unchanged to the Architect.
+## Workflow invariants
 
-LessonsLearned is a conditional, read-only completion analysis. It receives
-the verified loop commits and self-contained repository instruction and skill
-placement rules. It must not depend on plugins, network access, personal
-skills, or global configuration. Recommendations become normal findings and
-use the unchanged Architect, Fixer, Verifier, gate, and commit path.
+- The current native review is authoritative. History supplies context only
+  and never suppresses current findings.
+- Findings remain active until the Verifier accepts a solution or a later
+  native review reports clean. An edit or commit alone never resolves them.
+- Verifier rejection returns to the Fixer. Exhausting `MaxFixAttempts`
+  preserves the rejected patch, restores the clean checkpoint, and starts a
+  new native review; it does not create a blocked finding.
+- Configured host gates run after verification and before every commit. Recheck
+  the patch, stage the exact tree, and advance HEAD with an old-value check.
+- Completion normally requires the configured clean passes on unchanged HEAD.
+  Every ordinary fix commit resets them.
+- Lessons learned runs once at an eligible clean gate. Its recommendations use
+  the normal Architect/Fixer/Verifier/gate/commit path. An accepted result is
+  final unless the captured `ReviewAfterLessonsLearnedCommit` setting requires
+  clean reviews after a real lessons commit. Accepted no-ops finish directly.
+- `MaxReviewCycles` limits native reviews per invocation, not the durable run.
+  A new invocation resumes with a fresh budget.
+- Durable transitions are atomic and idempotent. Resume must validate the
+  repository, branch, review base, HEAD, speed, and execution fingerprint.
 
-Architect, Fixer, and Verifier prompts contain only role, goal, context, and
-return format. They do not prescribe a point fix, architecture change, scope,
-confidence threshold, decision criteria, or fallback. Judge, confirmation,
-critic, veto, and tie-break roles do not exist in the active workflow.
+## Process and terminal rules
 
-## Review and finding invariants
+- Stream and flush stdout/stderr; capture a thread ID as soon as it appears.
+- Bound inactivity, not total productive runtime. On cancellation or timeout,
+  terminate the complete owned Windows process tree and keep the last valid
+  checkpoint.
+- Do not leave test, fake-Codex, or descendant processes running.
+- `compact` is a supervisory dashboard. Show phases, findings, decisions,
+  authoritative tests, commits, actionable failures, and completion. Hide
+  internal command chatter, exploratory failures, and model reasoning.
+- Keep full redacted JSONL/stderr diagnostics and a timestamped, ANSI-free
+  `terminal.log`. Never expose secrets or internal reasoning.
 
-- The current native review is authoritative for the current round.
-- Deterministic finding and clean signals are recognized locally. Ambiguous
-  text is classified by the configured ReviewClassifier through Codex CLI.
-- A ReviewClassifier failure is a technical failure. It never falls through to
-  the Architect.
-- Historical ledger records provide context only and never suppress current
-  review output.
-- Current review findings remain active until the Verifier accepts a solution
-  or a later native review reports clean.
-- Verified, non-empty loop commits are stored as a deduplicated SHA list only
-  after the resulting commit identity has been checked. Compatible legacy
-  checkpoints reconstruct missing SHAs only from a confirmed linear
-  `StartHead..CurrentHead` history.
-- Lessons-learned status, attempt, trigger `HEAD`, trigger commit count,
-  captured post-commit review choice, and active finding source are durable
-  checkpoint state. An execution fingerprint change requalifies unfinished
-  analysis but never repeats a completed phase.
-- Each durable role transition writes an atomic, idempotent checkpoint.
-- Legacy checkpoints are evidence, not executable state. Import compatible
-  history, reset stale attempt and thread state, and start with a native review
-  when the repository is clean.
-- Repository, branch, symbolic review base, resolved base commit, HEAD, speed,
-  and execution fingerprint must be checked before resuming relevant work.
-
-Normal completion first requires the configured clean-pass gate, with two
-consecutive clean native reviews on an unchanged HEAD as the recommended
-default. Every ordinary fix commit or other HEAD change resets the clean-pass
-counter. Before completion, a positive `LessonsLearnedCommitThreshold` also
-requires one lessons-learned phase when the threshold is met and root
-`AGENTS.md` is tracked in the current `HEAD`. An accepted lessons-learned
-solution is then terminal unless its captured post-commit review choice
-requires the normal clean gate again after a real commit.
-
-## Architecture behavior
-
-The Architect always receives the current findings text, repository context,
-and at most 50 recent history entries. Current findings are either unchanged
-native review text or the complete structured lessons-learned analysis. It
-freely chooses and describes the approach. Its structured response goes
-unchanged to the Fixer.
-
-There is no architecture approval, revision, critic, veto, trigger, forced
-point fix, forced redesign, or automatic fallback. Do not reintroduce these
-decision layers.
-
-## Fixing, tests, and commits
-
-- The Fixer receives current findings text, unchanged Architect advice, and
-  direct Verifier feedback.
-- Git determines the files actually changed; the Fixer response does not own
-  patch scope.
-- A Fixer may return `targetedTest.executable` plus
-  `targetedTest.arguments` for one targeted regression test, or state that no
-  targeted test is available. The executable is the program the orchestrator
-  starts; project, script, test, and filter paths are arguments.
-- Repository wrappers and arbitrary executables are valid targeted-test
-  commands when they resolve from the repository or environment.
-- The orchestrator executes the targeted test independently and records its
-  real exit code and log.
-- The Verifier reads the current repository, receives actual test evidence, and
-  decides directly whether to accept. Rejection feedback returns to the Fixer.
-- `MaxFixAttempts` limits Fixer calls in one review round. Reaching it preserves
-  diagnostic evidence, safely restores the rejected patch, and starts another
-  native review. It never blocks a finding.
-- A Fixer mutation without a resumable thread is checkpointed before one fresh
-  recovery Fixer starts. If that recovery fails, preserve the latest patch,
-  restore the clean checkpoint, and return to native review.
-- `InactivityTimeoutMinutes` limits silence rather than total process duration.
-  It is live-reloaded for the next role, targeted test, or host gate. Persistent
-  inactivity returns to native review under the normal review-cycle budget.
-- Hold a process-scoped Windows system-awake request while the repository lock
-  is owned. Do not keep the display on or change shutdown, update, or registry
-  policy.
-- `MaxReviewCycles` limits native reviews per script invocation. Every new
-  invocation resets that counter while retaining the checkpoint. Reaching the
-  limit returns `limit_reached`; running the same command continues with a
-  fresh budget.
-- `LessonsLearnedCommitThreshold` defaults to 6, is live-reloaded at the clean
-  gate, and is disabled by zero or a negative value. The phase does not consume
-  `MaxReviewCycles`.
-- `ReviewAfterLessonsLearnedCommit` defaults to false and is captured when an
-  eligible analysis starts. False makes an accepted lessons-learned solution
-  the final cycle. True requires normal clean native reviews after a real
-  lessons-learned commit.
-- An empty lessons-learned recommendation list completes the phase directly.
-  Accepted recommendations complete it even when no commit is necessary, and
-  no-op solutions never require another review. The completed phase is not run
-  again. Exhausted Fixer attempts leave it open and return to native review.
-- Run configured host gates after verification and before every commit.
-- Recheck the patch after gates, stage the exact tree, create the commit from
-  that tree, and advance HEAD with an old-value check.
-- Never include unrelated concurrent changes in a loop commit.
-- A failed gate, unexpected mutation, or changed HEAD must not be committed.
-
-## Terminal and logging intent
-
-The default terminal is a supervisory dashboard, not a transcript of the
-agent's shell.
-
-`compact` must show enough for a person to answer:
-
-- What phase is running?
-- Is it making progress?
-- What findings and decisions exist?
-- Was lessons learned triggered, skipped, or sent for implementation?
-- What is being fixed or verified?
-- Did authoritative tests pass?
-- Was anything committed?
-- Is intervention or aborting necessary?
-
-Do not show internal agent-command starts, successful searches, exploratory
-failures, policy declines, long command output, or model reasoning in
-`compact`. These events remain in redacted JSONL/stderr logs for diagnosis.
-Actual role failures, review-budget pauses, targeted-test failures, host-gate
-failures, and commit outcomes stay visible.
-
-When Windows delivers Ctrl+C to the console process, append a best-effort
-interruption record to `terminal.log` before exit so a stale running checkpoint
-can be distinguished from an unexplained process loss.
-
-`balanced` may show concise internal command activity and failures. `detailed`
-may show successful command completion and no-result searches. Heartbeats
-update one terminal line rather than flooding the screen. `terminal.log` is
-timestamped, ANSI-free, and contains only messages selected for terminal
-rendering. Raw JSONL and stderr are flushed while the process is running.
-
-Never expose secrets or internal reasoning. Usage reporting separates new
-input, cached input, and output tokens.
-
-## Reliability and process lifecycle
-
-- Use one central CLI adapter for Exec and Resume.
-- Pass speed, model, and reasoning on every call, including resumed threads.
-  Pass schemas only to structured exec roles and the ReviewClassifier helper.
-  Native review may receive only the effective supplemental Reviewer developer
-  instructions and never a positional prompt or output schema.
-- Capture thread ID as soon as it appears.
-- Retry only classified technical failures and resume the same thread whenever
-  possible.
-- Do not start a fresh automatic mutating retry until the complete partial
-  mutation has been preserved in a durable recovery checkpoint.
-- Structured output is mandatory where a schema exists; invalid output is not a
-  successful role.
-- Stream and flush stdout/stderr rather than waiting for process completion.
-- Bound role, targeted-test, and host-gate inactivity while allowing productive
-  processes to run beyond any fixed wall-clock duration.
-- On cancellation or inactivity timeout, terminate the complete owned Windows
-  process tree and preserve the last valid checkpoint.
-- Test delayed output, partial JSONL, malformed auxiliary events, stderr,
-  timeouts, Ctrl+C, and descendant cleanup.
-- Never treat an unchanged external state as proof that a process is healthy;
-  use activity timestamps, process state, and bounded deadlines.
-
-## Simplicity rules for contributors
-
-- Prefer changing an existing responsibility owner over adding a new layer.
-- Keep CLI process management, console rendering, state/ledger operations,
-  role logic, and orchestration separated.
-- Structured-role and helper prompts and JSON schemas remain versioned
-  resources, not large inline strings.
-- Avoid parsing general PowerShell or shell syntax. Use structured values at
-  boundaries.
-- Avoid generic migration frameworks for historical state. Migrate only
-  explicitly supported durable data.
-- Do not add flags for behavior that should be a reliable default.
-- Do not retain dead compatibility paths after the replacement is proven.
-- When a reliability regression resembles one solved by the archived script,
-  inspect the archived implementation and its tests before inventing new
-  behavior. Reuse the proven invariant, not the old monolith.
-- Explain any meaningful increase in active source complexity and look for an
-  offsetting deletion or consolidation.
-
-## Development workflow
-
-Before editing:
-
-1. Check for an active review-loop process and active run.
-2. Do not change tool code, prompts, schemas, or an active profile while a run
-   is executing; the execution fingerprint is designed to invalidate that work.
-3. Read the relevant source, prompt, schema, tests, and any archived behavior
-   that previously solved the same class of problem.
-4. Preserve unrelated user changes.
-
-While developing:
+## Engineering conventions
 
 - Use Windows-native PowerShell and Windows paths.
-- Use `rg`/`rg --files` for discovery.
-- Use `apply_patch` for source edits.
-- Keep changes scoped to this tool repository.
-- Use fake Codex and temporary Git repositories for deterministic integration
-  tests.
-- Do not run a productive loop or modify a user's reviewed repository as part
-  of tool development.
-- A bounded live Codex CLI smoke test is appropriate only when CLI behavior
-  cannot be proven with the fake process. Use `standard`, the cheapest role
-  that can prove the behavior, and a non-product fixture.
+- Use `rg`/`rg --files` for discovery and `apply_patch` for hand-written edits.
+- Put future directory-specific guidance in the closest nested `AGENTS.md`
+  instead of expanding this root file with local rules.
+- Change the existing responsibility owner instead of adding another layer.
+- Prefer deleting or consolidating obsolete logic over adding special cases.
+- Do not build a shell parser, command allowlist, or per-role sandbox matrix.
+- Use structured values at boundaries and migrate only explicitly supported
+  durable data; do not add a generic migration framework.
+- Add profile flags only for genuine policy choices, not behavior that should
+  be a reliable default.
 
-Before handing off:
+## Code Review Rules
 
-1. Run the relevant focused tests.
-2. Run both full Pester suites for behavior that affects orchestration,
-   persistence, process management, profiles, or the CLI adapter.
+- Flag any direct API/model call outside `src/Cli.ps1`; the safe path is the
+  central authenticated Codex CLI adapter.
+- Flag reviewer positional prompts or schemas; the safe path is native
+  `codex review --base` plus optional supported developer instructions.
+- Flag resolution without current Verifier or clean-review evidence.
+- Flag commits that can include concurrent/unrelated changes or a tree that was
+  not independently gated and identity-checked.
+- Flag mutating retries without a durable recovery checkpoint and complete
+  patch preservation.
+- Flag fixed wall-clock limits for productive roles, incomplete Windows process
+  cleanup, compact-mode transcript noise, or unredacted diagnostics.
+- Reserve formatting checks for automated tooling; review semantic invariants
+  and safe recovery behavior.
+
+## Definition of done
+
+Before handing off a change:
+
+1. Run focused tests for the changed responsibility.
+2. Run both full Pester suites for orchestration, persistence, process,
+   profile, or CLI-adapter changes.
 3. Parse all active `.ps1`, `.psm1`, and `.psd1` files.
-4. Parse every JSON schema.
-5. Run the CLI-only negative scan.
-6. Run `git diff --check`.
-7. Verify `-Help` for public-option changes.
-8. Confirm no test or Codex child process remains.
-9. State exactly what was tested and what was deliberately not run.
+4. Parse all JSON schemas and run their positive/negative validation tests.
+5. Run the CLI-only negative scan and `git diff --check`.
+6. Verify `-Help` when public behavior or options change.
+7. Confirm the worktree contains only intended changes and no test/Codex child
+   process or repository lock remains.
+8. State exactly what was tested and what was deliberately not run.
 
 Do not archive, commit, push, publish, or run against a real product repository
 unless the user requested that action.

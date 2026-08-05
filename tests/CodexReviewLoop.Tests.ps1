@@ -1756,7 +1756,24 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $prompt | Should Match 'Do not modify files, the worktree, the index, Git refs, or repository state'
         $prompt | Should Match '\.agents/skills/<skill-name>/SKILL\.md'
         $prompt | Should Match 'Do not rely on any plugin, installed skill, network access'
+        $prompt | Should Match 'Keep AGENTS\.md small and practical'
+        $prompt | Should Match 'definition of done'
         $prompt | Should Match '\{\{LOOP_COMMITS\}\}'
+    }
+
+    It "keeps root AGENTS guidance practical and within the default context budget" {
+        $instructionsPath = Join-Path $root "AGENTS.md"
+        $instructions = Get-Content -Raw -LiteralPath $instructionsPath
+        (Get-Item -LiteralPath $instructionsPath).Length | Should BeLessThan 16384
+        foreach ($section in @(
+            "Repository layout",
+            "Development commands",
+            "Engineering conventions",
+            "Code Review Rules",
+            "Definition of done"
+        )) {
+            $instructions | Should Match ([regex]::Escape("## $section"))
+        }
     }
 
     It "gives each free role the shared workflow and marks its current position" {

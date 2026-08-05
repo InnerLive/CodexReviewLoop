@@ -20,7 +20,8 @@ Inspect the listed commits and their changes. Inspect the existing repository AG
 Do not rely on any plugin, installed skill, network access, or user-global Codex configuration. Apply the placement rules below directly.
 
 Placement rules:
-- Recommend AGENTS.md for concise, durable, repository-specific conventions, commands, verification steps, or review expectations.
+- Recommend AGENTS.md for concise, durable, repository-specific conventions, commands, verification steps, or review expectations that should apply to every relevant task.
+- Keep AGENTS.md small and practical. Prefer repository layout, run/build/test/lint commands, engineering and review conventions, constraints, and the definition of done. Reference task-specific architecture, planning, or review documents instead of copying their detail into AGENTS.md.
 - Place scoped guidance in the closest applicable AGENTS.md. Avoid duplicating existing instructions, transient history, generic advice, and formatting rules already enforced mechanically.
 - Recommend a repository skill for a recognizable, repeatable workflow that needs non-obvious procedure, references, scripts, or templates.
 - Repository skills belong under .agents/skills/<skill-name>/SKILL.md. Each skill covers one focused job, uses a concise description that states what it does and when it triggers, uses imperative instructions, and keeps detailed material in directly referenced resources when useful.
