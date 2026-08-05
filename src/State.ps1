@@ -354,7 +354,15 @@ function New-ReviewLoopState {
         CleanHead = ""
         ActiveClusterId = ""
         ActiveFindingIds = @()
+        ActiveFindingSource = ""
         ActiveReviewText = ""
+        LessonsLearned = [pscustomobject][ordered]@{
+            Status = "pending"
+            Attempt = 0
+            TriggerHead = ""
+            TriggerCommitCount = 0
+            CompletedHead = ""
+        }
         ActiveRoleCall = $null
         ActiveStrategy = $null
         LastFixerResult = $null
@@ -406,6 +414,33 @@ function Read-ReviewLoopState {
     if ($state.PSObject.Properties.Name -notcontains "LoopCommitsInitialized") {
         $state | Add-Member -NotePropertyName LoopCommitsInitialized `
             -NotePropertyValue $false
+    }
+    if ($state.PSObject.Properties.Name -notcontains "ActiveFindingSource") {
+        $state | Add-Member -NotePropertyName ActiveFindingSource -NotePropertyValue ""
+    }
+    if ($state.PSObject.Properties.Name -notcontains "LessonsLearned") {
+        $state | Add-Member -NotePropertyName LessonsLearned -NotePropertyValue (
+            [pscustomobject][ordered]@{
+                Status = "pending"
+                Attempt = 0
+                TriggerHead = ""
+                TriggerCommitCount = 0
+                CompletedHead = ""
+            })
+    }
+    else {
+        foreach ($entry in @(
+            @{ Name = "Status"; Value = "pending" },
+            @{ Name = "Attempt"; Value = 0 },
+            @{ Name = "TriggerHead"; Value = "" },
+            @{ Name = "TriggerCommitCount"; Value = 0 },
+            @{ Name = "CompletedHead"; Value = "" }
+        )) {
+            if ($state.LessonsLearned.PSObject.Properties.Name -notcontains $entry.Name) {
+                $state.LessonsLearned | Add-Member `
+                    -NotePropertyName $entry.Name -NotePropertyValue $entry.Value
+            }
+        }
     }
     Test-ReviewLoopState -State $state | Out-Null
     return $state

@@ -1108,6 +1108,7 @@ function Clear-ReviewLoopActiveCluster {
     $State.CleanHead = ""
     $State.ActiveClusterId = ""
     $State.ActiveFindingIds = @()
+    $State.ActiveFindingSource = ""
     $State.ActiveReviewText = ""
     $State.ActiveStrategy = $null
     $State.LastFixerResult = $null
@@ -1138,6 +1139,8 @@ function Complete-ReviewLoopResolution {
     )
 
     $createdCommit = [string]$State.CurrentHead -ne $Commit
+    $isLessonsLearned = [string](Get-ReviewLoopObjectProperty `
+        -Object $State -Name "ActiveFindingSource" -Default "") -eq "lessons_learned"
     foreach ($finding in $Findings) {
         $finding.Status = "resolved"
         $finding.Verification = $VerificationResult
@@ -1150,6 +1153,10 @@ function Complete-ReviewLoopResolution {
         Add-ReviewLoopVerifiedCommit -State $State -Commit $Commit
     }
     $State.CurrentHead = $Commit
+    if ($isLessonsLearned) {
+        $State.LessonsLearned.Status = "completed"
+        $State.LessonsLearned.CompletedHead = $Commit
+    }
     Clear-ReviewLoopActiveCluster -State $State -StatePath $StatePath -Stage "fix_committed"
     Write-ReviewLoopStatus -Message "Verified finding(s) resolved; clean-pass count reset to 0." -Kind Success
 }
@@ -1780,6 +1787,10 @@ function Restart-ReviewLoopReviewRound {
             ))
     }
 
+    if ([string](Get-ReviewLoopObjectProperty `
+        -Object $State -Name "ActiveFindingSource" -Default "") -eq "lessons_learned") {
+        $State.LessonsLearned.Status = "pending"
+    }
     foreach ($finding in $Findings) {
         $finding.Status = "open"
         $finding.FixAttempts = 0
@@ -2210,6 +2221,9 @@ function Restart-ReviewLoopAfterInactivity {
     if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
         Stop-ReviewLoopBlocked -Message "$Reason The worktree changed without an active Fixer finding."
     }
+    if ([string]$State.LessonsLearned.Status -eq "analyzing") {
+        $State.LessonsLearned.Status = "pending"
+    }
     $State.ActiveRoleCall = $null
     $State.ActiveReviewText = ""
     $State.CleanPasses = 0
@@ -2217,6 +2231,203 @@ function Restart-ReviewLoopAfterInactivity {
     Set-ReviewLoopCheckpoint `
         -State $State -StatePath $StatePath -Stage "review_round_requested"
     Write-ReviewLoopStatus -Message "$Reason Starting a new native Reviewer round." -Kind Warning
+}
+
+function Get-ReviewLoopLessonsLearnedEligibility {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    if ([string]$State.LessonsLearned.Status -eq "completed") {
+        return [pscustomobject]@{
+            Eligible = $false
+            CompletionAllowed = $true
+            Reason = "the lessons-learned phase already completed"
+        }
+    }
+    $threshold = [int]$Config.LessonsLearnedCommitThreshold
+    if ($threshold -le 0) {
+        return [pscustomobject]@{
+            Eligible = $false
+            CompletionAllowed = $true
+            Reason = "LessonsLearnedCommitThreshold is disabled"
+        }
+    }
+    $commitCount = @($State.LoopCommits | Select-Object -Unique).Count
+    if ($commitCount -lt $threshold) {
+        return [pscustomobject]@{
+            Eligible = $false
+            CompletionAllowed = $true
+            Reason = "only $commitCount of $threshold verified loop commits exist"
+        }
+    }
+    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    & git -C $RepoPath cat-file -e "$head`:AGENTS.md" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{
+            Eligible = $false
+            CompletionAllowed = $true
+            Reason = "root AGENTS.md is not tracked in the current HEAD"
+        }
+    }
+    return [pscustomobject]@{
+        Eligible = $true
+        CompletionAllowed = $false
+        Reason = "$commitCount verified loop commits reached the threshold of $threshold"
+    }
+}
+
+function Get-ReviewLoopLessonsLearnedCommitText {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $lines = foreach ($commit in @($State.LoopCommits | Select-Object -Unique)) {
+        $sha = [string]$commit
+        $subject = Get-ReviewLoopGitValue `
+            -RepoPath $RepoPath -Arguments @("show", "-s", "--format=%s", $sha)
+        "- $sha $subject"
+    }
+    return $lines -join [Environment]::NewLine
+}
+
+function Invoke-ReviewLoopLessonsLearnedGate {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Speed,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [string]$CodexPath = ""
+    )
+
+    Update-ReviewLoopLiveConfig -Config $Config
+    $eligibility = Get-ReviewLoopLessonsLearnedEligibility `
+        -Config $Config -State $State -RepoPath $RepoPath
+    if (-not $eligibility.Eligible) {
+        Write-ReviewLoopStatus `
+            -Message "Lessons learned skipped: $($eligibility.Reason)." `
+            -Kind Info
+        return $eligibility
+    }
+    if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        Stop-ReviewLoopBlocked -Message "The repository changed before lessons-learned analysis started."
+    }
+
+    $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
+    if ([string]$State.LessonsLearned.Status -ne "analyzing") {
+        $State.LessonsLearned.Attempt = [int]$State.LessonsLearned.Attempt + 1
+        $State.LessonsLearned.TriggerHead = $head
+        $State.LessonsLearned.TriggerCommitCount = @(
+            $State.LoopCommits | Select-Object -Unique).Count
+        $State.LessonsLearned.Status = "analyzing"
+    }
+    Set-ReviewLoopCheckpoint `
+        -State $State -StatePath $StatePath -Stage "lessons_learned_analyzing"
+    Write-ReviewLoopStatus `
+        -Message "Lessons learned triggered: $($eligibility.Reason)." `
+        -Kind Review
+
+    $prompt = Get-ReviewLoopPrompt -Name "lessons-learned.md" -Values @{
+        REVIEW_CYCLE_COUNT = [string]$State.ReviewCycle
+        COMMIT_COUNT = [string](@($State.LoopCommits | Select-Object -Unique).Count)
+        START_HEAD = [string]$State.StartHead
+        CURRENT_HEAD = $head
+        LOOP_COMMITS = Get-ReviewLoopLessonsLearnedCommitText `
+            -State $State -RepoPath $RepoPath
+    }
+    $headKey = if ($head.Length -gt 10) { $head.Substring(0, 10) } else { $head }
+    $call = Invoke-ConfiguredCodexRole `
+        -Config $Config -Role "LessonsLearned" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt $prompt -LogRoot $RunRoot `
+        -SchemaName "lessons-learned-v1.schema.json" `
+        -CodexPath $CodexPath `
+        -CallId ("lessons-learned-a{0:d2}-{1}" -f
+            [int]$State.LessonsLearned.Attempt, $headKey) `
+        -State $State -StatePath $StatePath
+    Assert-ReviewLoopRoleSuccess $call
+
+    $recommendations = @($call.StructuredResult.recommendations)
+    Write-ReviewLoopStatus `
+        -Message "Lessons learned: $($call.StructuredResult.summary) · $($recommendations.Count) recommendation(s)." `
+        -Kind $(if ($recommendations.Count -eq 0) { "Success" } else { "Review" })
+    if ($recommendations.Count -eq 0) {
+        $State.LessonsLearned.Status = "completed"
+        $State.LessonsLearned.CompletedHead = $head
+        Set-ReviewLoopCheckpoint `
+            -State $State -StatePath $StatePath -Stage "lessons_learned_completed"
+        return [pscustomobject]@{
+            Eligible = $true
+            CompletionAllowed = $true
+            Reason = "the analysis returned no recommendations"
+        }
+    }
+
+    $analysisText = ConvertTo-ReviewLoopJsonCompact $call.StructuredResult
+    $findings = foreach ($recommendation in $recommendations) {
+        [pscustomobject]@{
+            title = [string]$recommendation.title
+            description = ConvertTo-ReviewLoopJsonCompact $recommendation
+            locations = @()
+        }
+    }
+    $reviewId = "lessons-learned-{0:d2}" -f [int]$State.LessonsLearned.Attempt
+    $State.ActiveFindingSource = "lessons_learned"
+    $State.ActiveReviewText = $analysisText
+    $State.LessonsLearned.Status = "implementing"
+    Merge-ReviewLoopFindings `
+        -Ledger $Ledger -Findings @($findings) -ReviewId $reviewId -Head $head | Out-Null
+    Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
+    Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "reviewed"
+    Write-ReviewLoopStatus `
+        -Message "Implementing $($recommendations.Count) lessons-learned recommendation(s) through the normal fix workflow." `
+        -Kind Progress
+    Invoke-ReviewLoopOpenClusters `
+        -Config $Config -State $State -StatePath $StatePath `
+        -Ledger $Ledger -LedgerPath $LedgerPath `
+        -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
+    return [pscustomobject]@{
+        Eligible = $true
+        CompletionAllowed = $false
+        Reason = "recommendations entered the normal fix workflow"
+    }
+}
+
+function Complete-ReviewLoopRun {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$LedgerPath,
+        [Parameter(Mandatory = $true)][string]$TranscriptPath,
+        [Parameter(Mandatory = $true)][int]$CleanPassesRequired
+    )
+
+    $State.Status = "completed"
+    $State.ExitCode = 0
+    Set-ReviewLoopCheckpoint `
+        -State $State -StatePath $StatePath -Stage "completed" -Status "completed"
+    Write-ReviewLoopCompletionSummary `
+        -Cycles $State.ReviewCycle `
+        -CleanPasses "$($State.CleanPasses)/$CleanPassesRequired" `
+        -RunRoot $RunRoot -LedgerPath $LedgerPath -TranscriptPath $TranscriptPath
+    return [pscustomobject]@{
+        Status = $State.Status
+        ExitCode = 0
+        Reason = ""
+        NextSteps = @()
+        RunRoot = $RunRoot
+        StatePath = $StatePath
+        LedgerPath = $LedgerPath
+        ReviewCycles = $State.ReviewCycle
+        CleanPasses = $State.CleanPasses
+    }
 }
 
 function Invoke-ReviewLoopCore {
@@ -2355,10 +2566,14 @@ function Invoke-ReviewLoopCore {
         if ($executionChanged) {
             $state.CleanPasses = 0
             $state.CleanHead = ""
+            if ([string]$state.LessonsLearned.Status -eq "analyzing") {
+                $state.LessonsLearned.Status = "pending"
+            }
             if (Test-ReviewLoopGitClean -RepoPath $repo) {
                 $state.ActiveRoleCall = $null
                 $state.ActiveClusterId = ""
                 $state.ActiveFindingIds = @()
+                $state.ActiveFindingSource = ""
                 $state.ActiveReviewText = ""
                 $state.ActiveStrategy = $null
                 $state.LastFixerResult = $null
@@ -2411,6 +2626,10 @@ function Invoke-ReviewLoopCore {
             else {
                 "fixing"
             }
+        }
+        elseif ([string]$state.Stage -eq "stopped" -and
+            [string]$state.LessonsLearned.Status -eq "analyzing") {
+            $state.Stage = "lessons_learned_analyzing"
         }
         $state.Status = "running"
         $state.ExitCode = 0
@@ -2540,6 +2759,35 @@ function Invoke-ReviewLoopCore {
         }
         while ($true) {
             Assert-ReviewLoopExecutionUnchanged -Config $config
+            if ([string]$state.Stage -in @(
+                "lessons_learned_analyzing", "lessons_learned_completed"
+            )) {
+                try {
+                    $lessonsGate = Invoke-ReviewLoopLessonsLearnedGate `
+                        -Config $config -State $state -StatePath $statePath `
+                        -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                        -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot `
+                        -CodexPath $CodexPath
+                }
+                catch {
+                    if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
+                        Restart-ReviewLoopAfterInactivity `
+                            -State $state -StatePath $statePath `
+                            -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                            -RepoPath $repo -RunRoot $paths.RunRoot `
+                            -Reason "The lessons-learned role remained inactive after its technical recovery attempts."
+                        continue
+                    }
+                    throw
+                }
+                if ($lessonsGate.CompletionAllowed) {
+                    return Complete-ReviewLoopRun `
+                        -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
+                        -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
+                        -CleanPassesRequired ([int]$config.CleanPassesRequired)
+                }
+                continue
+            }
             if (
                 [int]$state.ReviewCyclesThisInvocation -ge [int]$config.MaxReviewCycles -and
                 [string]$state.Stage -ne "reviewing"
@@ -2610,7 +2858,7 @@ function Invoke-ReviewLoopCore {
                 $config.MaxReviewCycles
             ) -Kind Review
             try {
-                $review = Invoke-ReviewLoopReview `
+            $review = Invoke-ReviewLoopReview `
                     -Config $config -State $state -StatePath $statePath -Ledger $ledger -RepoPath $repo `
                     -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
             }
@@ -2624,6 +2872,12 @@ function Invoke-ReviewLoopCore {
                     continue
                 }
                 throw
+            }
+            $state.ActiveFindingSource = if (@($review.Result.findings).Count -gt 0) {
+                "native"
+            }
+            else {
+                ""
             }
             Merge-ReviewLoopFindings `
                 -Ledger $ledger -Findings @($review.Result.findings) `
@@ -2650,26 +2904,31 @@ function Invoke-ReviewLoopCore {
                 $cleanShortHead = if ($reviewHead.Length -gt 10) { $reviewHead.Substring(0, 10) } else { $reviewHead }
                 Write-ReviewLoopStatus -Message "Clean pass $($state.CleanPasses)/$($config.CleanPassesRequired) on unchanged HEAD $cleanShortHead" -Kind Success
                 if ([int]$state.CleanPasses -ge [int]$config.CleanPassesRequired) {
-                    $state.Status = "completed"
-                    $state.ExitCode = 0
-                    Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "completed" -Status "completed"
-                    Write-ReviewLoopCompletionSummary `
-                        -Cycles $state.ReviewCycle `
-                        -CleanPasses "$($state.CleanPasses)/$($config.CleanPassesRequired)" `
-                        -RunRoot $paths.RunRoot `
-                        -LedgerPath $paths.LedgerPath `
-                        -TranscriptPath $terminalPath
-                    return [pscustomobject]@{
-                        Status = $state.Status
-                        ExitCode = 0
-                        Reason = ""
-                        NextSteps = @()
-                        RunRoot = $paths.RunRoot
-                        StatePath = $statePath
-                        LedgerPath = $paths.LedgerPath
-                        ReviewCycles = $state.ReviewCycle
-                        CleanPasses = $state.CleanPasses
+                    try {
+                        $lessonsGate = Invoke-ReviewLoopLessonsLearnedGate `
+                            -Config $config -State $state -StatePath $statePath `
+                            -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                            -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot `
+                            -CodexPath $CodexPath
                     }
+                    catch {
+                        if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
+                            Restart-ReviewLoopAfterInactivity `
+                                -State $state -StatePath $statePath `
+                                -Ledger $ledger -LedgerPath $paths.LedgerPath `
+                                -RepoPath $repo -RunRoot $paths.RunRoot `
+                                -Reason "The lessons-learned role remained inactive after its technical recovery attempts."
+                            continue
+                        }
+                        throw
+                    }
+                    if ($lessonsGate.CompletionAllowed) {
+                        return Complete-ReviewLoopRun `
+                            -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
+                            -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
+                            -CleanPassesRequired ([int]$config.CleanPassesRequired)
+                    }
+                    continue
                 }
                 continue
             }
