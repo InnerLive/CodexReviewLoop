@@ -73,6 +73,7 @@ function New-TestConfig {
 @{
     Name = "TestRepo"
     ReviewBase = "HEAD"
+    ReviewerInstructions = ""
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
     CleanPassesRequired = 2
     MaxReviewCycles = 6
@@ -219,6 +220,7 @@ Describe "Optional profiles and command help" {
         } $repo
         $profile.RepositoryPath | Should Be $canonicalRepo
         $profile.LogRoot | Should Be ".\runs"
+        $profile.ReviewerInstructions | Should Be ""
         $profile.InactivityTimeoutMinutes | Should Be 30
         $profile.Roles.Keys.Count | Should Be 5
         @($profile.HostGates).Count | Should Be 1
@@ -278,6 +280,22 @@ Describe "Optional profiles and command help" {
         } $profilePath
 
         $profile.InactivityTimeoutMinutes | Should Be 30
+    }
+
+    It "defaults old profiles to empty ReviewerInstructions" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "old-reviewer-instructions-profile.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-reviewer-instructions-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath) -replace
+            '(?m)^    ReviewerInstructions = ""\r?\n', ''
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+
+        $profile = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+
+        $profile.ReviewerInstructions | Should Be ""
     }
 
     It "maps legacy fixer and verifier role names in existing profiles" {
@@ -408,6 +426,8 @@ Describe "Optional profiles and command help" {
 
         $exitCode | Should Be 0
         ($output -join "`n") | Should Match "ConfigPath"
+        ($output -join "`n") | Should Match "ReviewerInstructions"
+        ($output -join "`n") | Should Match "empty string"
         ($output -join "`n") | Should Match "automatically"
         ($output -join "`n") | Should Match "NewRun"
         ($output -join "`n") | Should Match "OutputMode"
@@ -527,6 +547,20 @@ Describe "Global CLI arguments" {
         @($args | Where-Object { $_ -eq "--output-schema" }).Count | Should Be 0
         @($args | Where-Object { $_ -eq "-o" }).Count | Should Be 0
         ($args -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
+    }
+
+    It "passes multiline quoted Unicode reviewer instructions as TOML-compatible JSON" {
+        $instructions = "Check `"quoted`" paths.`nPrüfe Nebenläufigkeit: 你好"
+        $encoded = ConvertTo-Json -InputObject $instructions -Compress
+        $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m `
+            -Thinking high -Mode Review -ReviewBase origin/main `
+            -DeveloperInstructions $instructions
+
+        @($args | Select-Object -Last 3) | Should Be @("review", "--base", "origin/main")
+        @($args | Where-Object { $_ -like "developer_instructions=*" }) |
+            Should Be @("developer_instructions=$encoded")
+        ($args -contains "--output-schema") | Should Be $false
+        ($args -contains "-o") | Should Be $false
     }
 
     It "requires a thread id for resume" {
@@ -732,6 +766,46 @@ Describe "Run state" {
             Get-ReviewLoopExecutionFingerprint -ConfigPath $path
         } $profilePath
         $executionChanged | Should Not Be $initial
+    }
+
+    It "fingerprints effective ReviewerInstructions and ignores a shadowed profile value" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "reviewer-instructions-fingerprint.psd1") `
+            -LogRoot (Join-Path $TestDrive "reviewer-instructions-fingerprint-logs")
+        $module = Get-Module CodexReviewLoop
+        $profileInitial = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $profilePath
+        $override = "CLI `"override`"`nPrüfung"
+        $overrideInitial = & $module {
+            param($path, $value)
+            Get-ReviewLoopExecutionFingerprint `
+                -ConfigPath $path -ReviewerInstructions $value
+        } $profilePath $override
+
+        $content = (Get-Content -Raw -LiteralPath $profilePath).Replace(
+            'ReviewerInstructions = ""',
+            'ReviewerInstructions = "profile changed"')
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $profileChanged = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+        } $profilePath
+        $sameOverride = & $module {
+            param($path, $value)
+            Get-ReviewLoopExecutionFingerprint `
+                -ConfigPath $path -ReviewerInstructions $value
+        } $profilePath $override
+        $differentOverride = & $module {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint `
+                -ConfigPath $path -ReviewerInstructions "different"
+        } $profilePath
+
+        $profileChanged | Should Not Be $profileInitial
+        $sameOverride | Should Be $overrideInitial
+        $differentOverride | Should Not Be $overrideInitial
     }
 
     It "persists and reads state" {

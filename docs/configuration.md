@@ -28,6 +28,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `Name` | Repository name | Profile and run-directory name |
 | `RepositoryPath` | Canonical Git root | Prevents profile collisions |
 | `ReviewBase` | Detected Git revision | Revision reviewed against |
+| `ReviewerInstructions` | Empty string | Optional supplemental native Reviewer developer instructions |
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
@@ -94,6 +95,13 @@ Other settings remain fixed for an active invocation. In particular, changing
 `Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes run identity. The
 loop preserves its checkpoint and requires the same command to be run again so
 that the change is applied with the normal resume checks.
+
+`ReviewerInstructions` is also fixed for the invocation and participates in
+the execution fingerprint. `-ReviewerInstructions <text>` overrides the profile
+when explicitly bound; an explicitly empty value disables the profile value.
+The same override must be passed again when resuming. A shadowed profile value
+does not affect the fingerprint. The instruction text is not written to the
+terminal or checkpoint; only its effect on the execution fingerprint is kept.
 
 ## Host gates
 

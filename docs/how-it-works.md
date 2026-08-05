@@ -29,8 +29,9 @@ flowchart LR
 ## 1. Native review
 
 The Reviewer is Codex's native review function. The loop supplies the
-repository and configured review base, but no custom reviewer prompt, developer
-instructions, or output schema.
+repository and configured review base, but no positional reviewer prompt or
+output schema. Optional `ReviewerInstructions` are supplied as supplemental
+developer instructions without replacing the native `review --base` workflow.
 
 The loop first recognizes established finding and clean signals locally. If
 the text is ambiguous, the mechanical `ReviewClassifier` helper uses the

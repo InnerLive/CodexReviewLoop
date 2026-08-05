@@ -102,15 +102,21 @@ function Assert-ReviewLoopExecutionUnchanged {
     param([Parameter(Mandatory = $true)][hashtable]$Config)
 
     if ($Config.ContainsKey("__ExecutionFingerprint") -and
-        $Config.ContainsKey("__ConfigPath") -and
-        (Get-ReviewLoopExecutionFingerprint -ConfigPath ([string]$Config.__ConfigPath)) -ne
+        $Config.ContainsKey("__ConfigPath")) {
+        $fingerprintArguments = @{ ConfigPath = [string]$Config.__ConfigPath }
+        if ($Config.ContainsKey("__ReviewerInstructionsOverrideBound") -and
+            [bool]$Config.__ReviewerInstructionsOverrideBound) {
+            $fingerprintArguments.ReviewerInstructions = [string]$Config.ReviewerInstructions
+        }
+        if ((Get-ReviewLoopExecutionFingerprint @fingerprintArguments) -ne
             [string]$Config.__ExecutionFingerprint) {
-        throw (New-ReviewLoopFailureException `
-            -Message "The review-loop code, prompts, schemas, or active profile changed while this run was executing." `
-            -NextSteps @(
-                "Finish the intended tool or profile edits and do not change them again while the loop is running."
-                "Run the same command again; completed model work will be requalified before any commit."
-            ))
+            throw (New-ReviewLoopFailureException `
+                -Message "The review-loop code, prompts, schemas, or active profile changed while this run was executing." `
+                -NextSteps @(
+                    "Finish the intended tool or profile edits and do not change them again while the loop is running."
+                    "Run the same command again; completed model work will be requalified before any commit."
+                ))
+        }
     }
 }
 
@@ -331,13 +337,13 @@ Continue the interrupted $Role work from the current repository state and return
     if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
         $arguments.CodexPath = $CodexPath
     }
-    $operationalInstructions = if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
-        ""
+    $developerInstructions = if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
+        [string]$Config.ReviewerInstructions
     }
     else {
         Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
     }
-    $arguments.DeveloperInstructions = $operationalInstructions
+    $arguments.DeveloperInstructions = $developerInstructions
     $worktreeBefore = if ($mayEditRepository) {
         ""
     }

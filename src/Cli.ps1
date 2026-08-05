@@ -64,9 +64,6 @@ function Get-CodexRoleArguments {
         if (-not [string]::IsNullOrWhiteSpace($SchemaPath)) {
             throw "Native Codex review does not accept an output schema."
         }
-        if (-not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
-            throw "Native Codex review does not accept custom developer instructions."
-        }
     }
 
     $arguments = [System.Collections.Generic.List[string]]::new()
@@ -100,7 +97,7 @@ function Get-CodexRoleArguments {
         [void]$arguments.Add("-o")
         [void]$arguments.Add((Resolve-ReviewLoopPath -Path $ResultPath))
     }
-    if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($DeveloperInstructions)) {
+    if (-not [string]::IsNullOrEmpty($DeveloperInstructions)) {
         # JSON string literals are valid TOML basic strings as well.
         $tomlString = ConvertTo-Json -InputObject $DeveloperInstructions -Compress
         [void]$arguments.Add("-c")
@@ -109,9 +106,9 @@ function Get-CodexRoleArguments {
 
     switch ($Mode) {
         "Review" {
-            # Global Codex options must precede the review subcommand. Supplying
-            # a prompt here would replace the native review instructions and
-            # conflicts with --base.
+            # Global Codex options, including supplemental developer instructions,
+            # must precede the review subcommand. A positional prompt remains
+            # forbidden because it conflicts with --base.
             [void]$arguments.Add("review")
             [void]$arguments.Add("--base")
             [void]$arguments.Add($ReviewBase)

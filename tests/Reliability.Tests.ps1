@@ -42,6 +42,7 @@ function New-ReliabilityConfig {
     Name = '$Name'
     RepositoryPath = '$literalRepo'
     ReviewBase = 'HEAD'
+    ReviewerInstructions = ''
     LogRoot = '$literalLog'
     CleanPassesRequired = 2
     MaxReviewCycles = 6
@@ -620,6 +621,73 @@ Describe "Unattended reliability boundaries" {
         $replayed.Result.text | Should Be $review.Result.text
         @((Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG)).Count | Should Be 1
         @((Read-ReviewLoopState -Path $statePath).RoleCalls).Count | Should Be 1
+    }
+
+    It "uses ReviewerInstructions from the profile for native review" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace(
+                "ReviewerInstructions = ''",
+                "ReviewerInstructions = 'Profile review guidance'")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.callKind -eq "review" })[0]
+        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }) |
+            Should Be @('developer_instructions="Profile review guidance"')
+        [string]$reviewCall.prompt | Should Be ""
+        [string]$reviewCall.schemaPath | Should Be ""
+    }
+
+    It "lets a CLI ReviewerInstructions value override the profile without checkpointing it" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace(
+                "ReviewerInstructions = ''",
+                "ReviewerInstructions = 'Profile review guidance'")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $override = "CLI `"priority`"`nPrüfe Unicode 你好"
+        $expected = "developer_instructions=$(ConvertTo-Json -InputObject $override -Compress)"
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -ReviewerInstructions $override -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.callKind -eq "review" })[0]
+        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }) |
+            Should Be @($expected)
+        (Get-Content -Raw -LiteralPath $result.StatePath) |
+            Should Not Match "Prüfe Unicode"
+        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
+            Should Not Match "Prüfe Unicode"
+    }
+
+    It "lets an explicitly empty CLI ReviewerInstructions value disable the profile" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace(
+                "ReviewerInstructions = ''",
+                "ReviewerInstructions = 'Profile review guidance'")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -ReviewerInstructions "" -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.callKind -eq "review" })[0]
+        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }).Count |
+            Should Be 0
     }
 
     It "restarts an interrupted native review without a custom prompt or schema" {
@@ -1496,7 +1564,7 @@ Changes:
         (Read-ReviewLoopLedger -Path $paths.LedgerPath).Findings[0].Status | Should Be "resolved"
     }
 
-    It "invalidates a clean pass recorded by an older tool fingerprint" {
+    It "invalidates a clean pass when a CLI ReviewerInstructions override is omitted" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $paths = & (Get-Module CodexReviewLoop) {
             param($profile, $repository)
@@ -1506,8 +1574,14 @@ Changes:
         New-Item -ItemType Directory -Path $paths.RunRoot -Force | Out-Null
         $statePath = Join-Path $paths.RunRoot "run-v1.json"
         $head = & git -C $repo rev-parse HEAD
+        $previousFingerprint = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Get-ReviewLoopExecutionFingerprint `
+                -ConfigPath $path -ReviewerInstructions "previous CLI guidance"
+        } $configPath
         $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
-            -RunRoot $paths.RunRoot -ReviewBaseCommit $head -ExecutionFingerprint "old"
+            -RunRoot $paths.RunRoot -ReviewBaseCommit $head `
+            -ExecutionFingerprint $previousFingerprint
         $state.Stage = "clean_review"
         $state.ReviewCycle = 1
         $state.CleanPasses = 1

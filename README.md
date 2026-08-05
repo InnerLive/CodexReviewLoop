@@ -10,7 +10,8 @@ accepted work. It repeats unattended until the branch is demonstrably clean.
 
 ## What it does
 
-1. Runs native Codex review without a custom reviewer prompt or JSON schema.
+1. Runs native Codex review without a positional reviewer prompt or JSON schema;
+   optional supplemental developer instructions may come from the profile or CLI.
 2. Recognizes clear results locally and asks a small Luna helper only when the
    review text is ambiguous.
 3. Passes review output containing findings unchanged to an Architect.
@@ -47,6 +48,10 @@ pwsh -File .\codex-review-loop.ps1 -RepoPath C:\dev\MyProject
 The first invocation finds an existing profile or creates a commented one and
 starts the run. By default, the loop uses the cost-conscious `standard` speed
 and compact terminal output.
+
+Use `ReviewerInstructions` in the profile for repository-specific guidance, or
+pass `-ReviewerInstructions '<text>'` for one invocation. An explicitly passed
+value wins, and `-ReviewerInstructions ''` disables the profile value.
 
 The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
 when you deliberately want a fresh run; the finding ledger is retained.

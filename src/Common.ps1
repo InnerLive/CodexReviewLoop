@@ -439,6 +439,11 @@ function New-ReviewLoopProfile {
     # Git revision against which Codex reviews the branch, for example origin/main, origin/master, or main.
     ReviewBase = $(ConvertTo-ReviewLoopPowerShellLiteral $reviewBase)
 
+    # Optional supplemental developer instructions for the native Reviewer.
+    # -ReviewerInstructions wins when explicitly passed, including an empty value.
+    # The effective value is fixed for the complete script invocation.
+    ReviewerInstructions = ''
+
     # Directory for the ledger, checkpoints, JSONL logs, and result logs.
     # Relative paths are resolved against the review loop script directory.
     LogRoot = $(ConvertTo-ReviewLoopPowerShellLiteral $logRoot)
@@ -572,6 +577,7 @@ function Import-ReviewLoopConfig {
         InactivityTimeoutMinutes = 30
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
+        ReviewerInstructions = ""
     }
     foreach ($entry in $defaults.GetEnumerator()) {
         if (-not $config.ContainsKey($entry.Key)) {
@@ -604,6 +610,9 @@ function Assert-ReviewLoopConfigValues {
     }
     if ($Config.Roles -isnot [System.Collections.IDictionary]) {
         throw "Configuration value 'Roles' must be a hashtable."
+    }
+    if ($Config.ReviewerInstructions -isnot [string]) {
+        throw "Configuration value 'ReviewerInstructions' must be a string."
     }
 
     foreach ($name in @(
@@ -702,16 +711,30 @@ function ConvertTo-ReviewLoopFingerprintData {
 }
 
 function Get-ReviewLoopExecutionProfileText {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [AllowEmptyString()][string]$ReviewerInstructions = ""
+    )
 
     $profile = Import-PowerShellDataFile -LiteralPath (
         Resolve-ReviewLoopPath -Path $ConfigPath -MustExist)
+    $effectiveReviewerInstructions = if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
+        $ReviewerInstructions
+    }
+    elseif ($profile.ContainsKey("ReviewerInstructions")) {
+        [string]$profile.ReviewerInstructions
+    }
+    else {
+        ""
+    }
     $executionSettings = @{}
     foreach ($key in $profile.Keys) {
         if ([string]$key -notin $script:ReviewLoopLiveConfigKeys) {
             $executionSettings[$key] = $profile[$key]
         }
     }
+    $executionSettings["ReviewerInstructions"] = $effectiveReviewerInstructions
     return ConvertTo-ReviewLoopFingerprintData -Value $executionSettings
 }
 
@@ -769,7 +792,11 @@ function Update-ReviewLoopLiveConfig {
 }
 
 function Get-ReviewLoopExecutionFingerprint {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [AllowEmptyString()][string]$ReviewerInstructions = ""
+    )
 
     $files = [System.Collections.Generic.List[string]]::new()
     foreach ($name in @(
@@ -795,7 +822,11 @@ function Get-ReviewLoopExecutionFingerprint {
     $profileRelative = [System.IO.Path]::GetRelativePath(
         $script:ModuleRoot,
         $profilePath).Replace("\", "/")
-    $profileText = Get-ReviewLoopExecutionProfileText -ConfigPath $profilePath
+    $profileTextArguments = @{ ConfigPath = $profilePath }
+    if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
+        $profileTextArguments.ReviewerInstructions = $ReviewerInstructions
+    }
+    $profileText = Get-ReviewLoopExecutionProfileText @profileTextArguments
     $records = @($records) + "$profileRelative`n$(Get-ReviewLoopSha256 $profileText)"
     return Get-ReviewLoopSha256 ($records -join "`n")
 }

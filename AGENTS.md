@@ -85,9 +85,10 @@ CLI process adapter. Structured `exec` and `resume` calls use:
 
 The Reviewer uses the direct `codex review --base ...` command with the shared
 model, reasoning, service-tier, repository, and unattended settings supported
-by that command. It receives no custom prompt, developer instructions, JSONL
-switch, result schema, or output-file switch; its plain review output is the
-authoritative reviewer result.
+by that command. It may receive optional supplemental developer instructions
+from the profile or an explicit CLI override. It receives no positional prompt,
+JSONL switch, result schema, or output-file switch; its plain review output is
+the authoritative reviewer result.
 
 Control model behavior through clear role contracts and enforce outcomes with
 postconditions:
@@ -107,8 +108,10 @@ process failure, `turn.failed`, invalid structured result, unsafe mutation, or
 broken process lifecycle behind an advisory classification.
 
 Model-run tests are exploratory evidence only. Configured host gates and an
-available structured targeted test are authoritative. Do not add instructions
-to the native Reviewer, and do not reintroduce a general command allowlist.
+available structured targeted test are authoritative. Reviewer instructions may
+only supplement the native Reviewer through the configured
+`developer_instructions` value; do not add a positional reviewer prompt or
+reintroduce a general command allowlist.
 Long-running commands must not leave orphaned Windows child processes.
 
 ## Public interface invariants
@@ -121,6 +124,8 @@ pwsh -File .\codex-review-loop.ps1 -RepoPath C:\dev\Project
 
 - `RepoPath` may be positional.
 - `ConfigPath` is optional.
+- `-ReviewerInstructions` optionally overrides the profile value. Explicit CLI
+  binding wins, including an empty string, and remains fixed for the invocation.
 - `-Help` must work without creating a profile or starting a run.
 - `-Speed` accepts `standard|fast` and defaults to `standard`.
 - `-OutputMode` accepts `compact|balanced|detailed` and defaults to `compact`.
@@ -155,10 +160,11 @@ Ambiguous native review text is classified by the mechanical
 `ReviewClassifier` helper using `gpt-5.6-luna/low`. It is not a workflow
 decision role.
 
-The Reviewer is the native Codex review function. It receives no custom prompt,
-developer instructions, or output schema. Deterministic text recognition is
-used first. Only ambiguous text reaches the ReviewClassifier. Review text
-classified as containing findings goes unchanged to the Architect.
+The Reviewer is the native Codex review function. It receives no positional
+prompt or output schema. Optional profile or CLI guidance is passed only as
+supplemental developer instructions. Deterministic text recognition is used
+first. Only ambiguous text reaches the ReviewClassifier. Review text classified
+as containing findings goes unchanged to the Architect.
 
 Architect, Fixer, and Verifier prompts contain only role, goal, context, and
 return format. They do not prescribe a point fix, architecture change, scope,
@@ -273,8 +279,9 @@ input, cached input, and output tokens.
 
 - Use one central CLI adapter for Exec and Resume.
 - Pass speed, model, and reasoning on every call, including resumed threads.
-  Pass schemas and developer instructions only to structured exec roles and
-  the ReviewClassifier helper; native review receives neither.
+  Pass schemas only to structured exec roles and the ReviewClassifier helper.
+  Native review may receive only the effective supplemental Reviewer developer
+  instructions and never a positional prompt or output schema.
 - Capture thread ID as soon as it appears.
 - Retry only classified technical failures and resume the same thread whenever
   possible.

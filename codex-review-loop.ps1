@@ -26,6 +26,11 @@ Optional path to a PSD1 profile. If the explicitly requested path does not
 exist, a commented profile bound to the canonical RepositoryPath is created
 there automatically.
 
+.PARAMETER ReviewerInstructions
+Optional supplemental developer instructions for the native Reviewer. An
+explicit command-line value wins over the profile, including an empty string
+that disables the profile value. The effective value is fixed for this invocation.
+
 .PARAMETER Speed
 Global service tier for every role and resume call without exception.
 Accepted values are standard and fast. The default is standard.
@@ -87,6 +92,12 @@ C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
 Adds concise CLI activity and reports progress every 15 seconds.
 
 .EXAMPLE
+C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
+    -ReviewerInstructions 'Pay particular attention to concurrency defects.'
+
+Uses supplemental native Reviewer instructions for this invocation.
+
+.EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project -Json
 
 Writes one machine-readable JSON result and no human terminal dashboard.
@@ -105,6 +116,9 @@ param(
     [string]$RepoPath = "",
 
     [string]$ConfigPath = "",
+
+    [AllowEmptyString()]
+    [string]$ReviewerInstructions = "",
 
     [ValidateSet("standard", "fast")]
     [string]$Speed = "standard",
@@ -176,6 +190,9 @@ $arguments = @{
 }
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $arguments.ConfigPath = $ConfigPath
+}
+if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
+    $arguments.ReviewerInstructions = $ReviewerInstructions
 }
 if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
     $arguments.CodexPath = $CodexPath

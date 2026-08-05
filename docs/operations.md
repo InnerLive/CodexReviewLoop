@@ -24,6 +24,7 @@ pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
 |---|---|---|
 | `-RepoPath` | Required | Repository to review and fix; may be positional |
 | `-ConfigPath` | Auto-discovered | Select or create a specific profile |
+| `-ReviewerInstructions` | Profile value or empty | Override supplemental native Reviewer developer instructions; an explicit empty string disables the profile value |
 | `-Speed` | `standard` (default), `fast` | Global Codex service tier |
 | `-CodexPath` | Auto-detected | Use a specific Codex CLI executable |
 | `-NewRun` | Off | Start a new run while retaining the finding ledger |
@@ -81,7 +82,9 @@ should never be placed in model-visible command output.
 Running the same command resumes the latest compatible checkpoint by default.
 Resume requires the same repository, branch, symbolic review base, `HEAD`, and
 speed. The base commit recorded at run start remains pinned and must still
-exist.
+exist. If the invocation used `-ReviewerInstructions`, pass the same value again
+when resuming. Changing or omitting it requalifies existing review and
+clean-pass evidence before the loop can complete.
 
 Interrupted fixer work resumes from its recorded thread when possible. If a
 Fixer changed files before a resumable thread ID was available, the loop first

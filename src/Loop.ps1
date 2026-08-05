@@ -2165,6 +2165,7 @@ function Invoke-ReviewLoopCore {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$ConfigPath = "",
+        [AllowEmptyString()][string]$ReviewerInstructions = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",
         [switch]$NewRun,
@@ -2185,6 +2186,13 @@ function Invoke-ReviewLoopCore {
     try {
         $config = Import-ReviewLoopConfig -ConfigPath $resolvedConfigPath -RepoPath $repo
         Assert-ReviewLoopConfigValues -Config $config
+        $reviewerInstructionsOverrideBound =
+            $PSBoundParameters.ContainsKey("ReviewerInstructions")
+        if ($reviewerInstructionsOverrideBound) {
+            $config.ReviewerInstructions = $ReviewerInstructions
+        }
+        $config["__ReviewerInstructionsOverrideBound"] =
+            $reviewerInstructionsOverrideBound
         Assert-ReviewLoopHostGatePreflight -Config $config -RepoPath $repo
     }
     catch {
@@ -2210,7 +2218,11 @@ function Invoke-ReviewLoopCore {
                 "Confirm git rev-parse --verify `"$($config.ReviewBase)^{commit}`" succeeds in the repository, then run the same command again."
             ))
     }
-    $executionFingerprint = Get-ReviewLoopExecutionFingerprint -ConfigPath $resolvedConfigPath
+    $fingerprintArguments = @{ ConfigPath = $resolvedConfigPath }
+    if ($reviewerInstructionsOverrideBound) {
+        $fingerprintArguments.ReviewerInstructions = [string]$config.ReviewerInstructions
+    }
+    $executionFingerprint = Get-ReviewLoopExecutionFingerprint @fingerprintArguments
     $config["__ConfigPath"] = $resolvedConfigPath
     $config["__ExecutionFingerprint"] = $executionFingerprint
     $branch = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
@@ -2728,6 +2740,7 @@ function Invoke-CodexReviewLoop {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$ConfigPath = "",
+        [AllowEmptyString()][string]$ReviewerInstructions = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",
         [switch]$NewRun,
