@@ -348,6 +348,8 @@ function New-ReviewLoopState {
         ExitCode = 0
         ReviewCycle = 0
         ReviewCyclesThisInvocation = 0
+        LoopCommits = @()
+        LoopCommitsInitialized = $true
         CleanPasses = 0
         CleanHead = ""
         ActiveClusterId = ""
@@ -397,6 +399,13 @@ function Read-ReviewLoopState {
     if ($state.PSObject.Properties.Name -notcontains "ReviewCyclesThisInvocation") {
         $state | Add-Member -NotePropertyName ReviewCyclesThisInvocation `
             -NotePropertyValue ([int]$state.ReviewCycle)
+    }
+    if ($state.PSObject.Properties.Name -notcontains "LoopCommits") {
+        $state | Add-Member -NotePropertyName LoopCommits -NotePropertyValue @()
+    }
+    if ($state.PSObject.Properties.Name -notcontains "LoopCommitsInitialized") {
+        $state | Add-Member -NotePropertyName LoopCommitsInitialized `
+            -NotePropertyValue $false
     }
     Test-ReviewLoopState -State $state | Out-Null
     return $state

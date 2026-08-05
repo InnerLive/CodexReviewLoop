@@ -213,6 +213,61 @@ function Assert-ReviewLoopResumeInvariant {
     }
 }
 
+function Initialize-ReviewLoopCommitHistory {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    if ([bool](Get-ReviewLoopObjectProperty `
+        -Object $State -Name "LoopCommitsInitialized" -Default $false)) {
+        return
+    }
+
+    $startHead = [string]$State.StartHead
+    $currentHead = [string]$State.CurrentHead
+    if ([string]::IsNullOrWhiteSpace($startHead) -or
+        [string]::IsNullOrWhiteSpace($currentHead)) {
+        throw "Legacy checkpoint cannot reconstruct loop commits because its HEAD range is incomplete."
+    }
+
+    & git -C $RepoPath merge-base --is-ancestor $startHead $currentHead 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Legacy checkpoint cannot reconstruct loop commits because saved HEAD is not descended from StartHead."
+    }
+    $history = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-list", "--reverse", "--first-parent", "$startHead..$currentHead"
+    )
+    $commits = @($history -split "\r?\n" |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique)
+    $State.LoopCommits = $commits
+    $State.LoopCommitsInitialized = $true
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+}
+
+function Add-ReviewLoopVerifiedCommit {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Commit
+    )
+
+    $normalized = $Commit.Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        throw "A verified loop commit cannot be empty."
+    }
+    $existing = @((Get-ReviewLoopObjectProperty `
+        -Object $State -Name "LoopCommits" -Default @()) |
+        ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($normalized -notin $existing) {
+        $State.LoopCommits = @($existing) + @($normalized)
+    }
+    $State.LoopCommitsInitialized = $true
+}
+
 function Resolve-ReviewLoopHostExecutable {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -1082,6 +1137,7 @@ function Complete-ReviewLoopResolution {
         [Parameter(Mandatory = $true)][string]$Commit
     )
 
+    $createdCommit = [string]$State.CurrentHead -ne $Commit
     foreach ($finding in $Findings) {
         $finding.Status = "resolved"
         $finding.Verification = $VerificationResult
@@ -1090,6 +1146,9 @@ function Complete-ReviewLoopResolution {
         $finding.UpdatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     }
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
+    if ($createdCommit) {
+        Add-ReviewLoopVerifiedCommit -State $State -Commit $Commit
+    }
     $State.CurrentHead = $Commit
     Clear-ReviewLoopActiveCluster -State $State -StatePath $StatePath -Stage "fix_committed"
     Write-ReviewLoopStatus -Message "Verified finding(s) resolved; clean-pass count reset to 0." -Kind Success
@@ -2281,6 +2340,8 @@ function Invoke-ReviewLoopCore {
             -ReviewBase ([string]$config.ReviewBase) `
             -SkipHead
     }
+    Initialize-ReviewLoopCommitHistory `
+        -State $state -StatePath $statePath -RepoPath $repo
     $executionChanged = $false
     if ($resumed) {
         $storedBaseCommit = [string](Get-ReviewLoopObjectProperty `

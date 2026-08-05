@@ -720,6 +720,8 @@ Describe "Run state" {
     It "starts at zero clean passes" {
         $state.CleanPasses | Should Be 0
         $state.ActiveRoleCall | Should BeNullOrEmpty
+        @($state.LoopCommits).Count | Should Be 0
+        $state.LoopCommitsInitialized | Should Be $true
     }
 
     It "stores the global speed" {
@@ -812,6 +814,43 @@ Describe "Run state" {
         $path = Join-Path $TestDrive "state.json"
         Write-ReviewLoopState -Path $path -State $state | Out-Null
         (Read-ReviewLoopState -Path $path).RunId | Should Be $state.RunId
+    }
+
+    It "reconstructs verified commits for a legacy checkpoint" {
+        foreach ($value in @("one", "two")) {
+            Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value $value
+            & git -C $repo add README.txt
+            & git -C $repo commit -q -m "change $value"
+        }
+        $state.CurrentHead = & git -C $repo rev-parse HEAD
+        $state.PSObject.Properties.Remove("LoopCommits")
+        $state.PSObject.Properties.Remove("LoopCommitsInitialized")
+        $path = Join-Path $TestDrive "legacy-state.json"
+        Write-ReviewLoopState -Path $path -State $state | Out-Null
+        $legacy = Read-ReviewLoopState -Path $path
+
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $statePath, $repository)
+            Initialize-ReviewLoopCommitHistory `
+                -State $loopState -StatePath $statePath -RepoPath $repository
+        } $legacy $path $repo
+
+        $reloaded = Read-ReviewLoopState -Path $path
+        $expected = @(& git -C $repo rev-list --reverse --first-parent `
+            "$($state.StartHead)..$($state.CurrentHead)")
+        @($reloaded.LoopCommits) | Should Be $expected
+        $reloaded.LoopCommitsInitialized | Should Be $true
+    }
+
+    It "deduplicates verified commit registration" {
+        $commit = & git -C $repo rev-parse HEAD
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $sha)
+            Add-ReviewLoopVerifiedCommit -State $loopState -Commit $sha
+            Add-ReviewLoopVerifiedCommit -State $loopState -Commit $sha.ToUpperInvariant()
+        } $state $commit
+
+        @($state.LoopCommits) | Should Be @($commit)
     }
 
     It "retains the active cluster" {

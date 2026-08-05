@@ -991,6 +991,8 @@ Describe "Unattended reliability boundaries" {
         $message | Should Not Match "dotnet|-Command"
         (Read-ReviewLoopState -Path $statePath).PendingCommit |
             Should BeNullOrEmpty
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits) |
+            Should Be @(& git -C $repo rev-parse HEAD)
     }
 
     It "stages verified work when AutoCommit is disabled and resumes after it is enabled" {
@@ -1074,6 +1076,7 @@ Describe "Unattended reliability boundaries" {
             Should Match "Keep the staged tree intact"
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits).Count | Should Be 1
     }
 
     It "recovers an already-created multiline commit from its sealed checkpoint" {
@@ -1143,6 +1146,8 @@ Changes:
             Should Be $message.Replace("`r`n", "`n")
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status |
             Should Be "resolved"
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits) |
+            Should Be @($committedHead)
     }
 
     It "refuses a verified change that remains unstaged before advancing HEAD" {
