@@ -556,11 +556,12 @@ function Write-ReviewLoopCompletionSummary {
         [Parameter(Mandatory = $true)][string]$CleanPasses,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][string]$TranscriptPath
+        [Parameter(Mandatory = $true)][string]$TranscriptPath,
+        [string]$CompletionEvidence = ""
     )
 
     if (Test-ReviewLoopOutputLevel -Minimum detailed) {
-        Write-ReviewLoopResultBlock -Title "Review Loop completed" -Kind Success -Values ([ordered]@{
+        $values = [ordered]@{
             Status = "completed"
             Cycles = $Cycles
             "Clean passes" = $CleanPasses
@@ -569,12 +570,23 @@ function Write-ReviewLoopCompletionSummary {
             Run = $RunRoot
             Ledger = $LedgerPath
             Transcript = $TranscriptPath
-        })
+        }
+        if (-not [string]::IsNullOrWhiteSpace($CompletionEvidence)) {
+            $values["Completion"] = $CompletionEvidence
+        }
+        Write-ReviewLoopResultBlock `
+            -Title "Review Loop completed" -Kind Success -Values $values
         return
     }
 
+    $summary = if ([string]::IsNullOrWhiteSpace($CompletionEvidence)) {
+        "Review Loop completed · $Cycles cycles · $CleanPasses clean passes"
+    }
+    else {
+        "Review Loop completed · $Cycles cycles · $CompletionEvidence"
+    }
     Write-ReviewLoopStatus `
-        -Message "Review Loop completed · $Cycles cycles · $CleanPasses clean passes" `
+        -Message $summary `
         -Kind Success
     if (Test-ReviewLoopOutputLevel -Minimum balanced) {
         Write-ReviewLoopKeyValue -Name "Run" -Value (Split-Path -Leaf $RunRoot)

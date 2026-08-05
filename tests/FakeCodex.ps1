@@ -217,6 +217,9 @@ if ($exitCode -eq 0 -and
             "review-classification-v1.schema.json" {
                 '{"schemaVersion":"1.0","hasFindings":false}'
             }
+            "lessons-learned-v1.schema.json" {
+                '{"schemaVersion":"1.0","summary":"No durable guidance is justified.","recommendations":[]}'
+            }
             "fixer-result-v3.schema.json" {
                 '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
             }

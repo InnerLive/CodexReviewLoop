@@ -77,6 +77,8 @@ function New-TestConfig {
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
     CleanPassesRequired = 2
     MaxReviewCycles = 6
+    LessonsLearnedCommitThreshold = 6
+    ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
     AutoCommit = `$true
@@ -134,6 +136,37 @@ function New-TestActiveCheckpoint {
     } $RepoPath $ConfigPath $Speed
 }
 
+function Enable-TestLessonsLearnedCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [ValidateSet("standard", "fast")][string]$Speed = "standard"
+    )
+
+    $checkpoint = New-TestActiveCheckpoint `
+        -RepoPath $RepoPath -ConfigPath $ConfigPath -Speed $Speed
+    $commits = [System.Collections.Generic.List[string]]::new()
+    for ($index = 1; $index -le 6; $index++) {
+        $path = if ($index -eq 1) { "AGENTS.md" } else { "loop-$index.txt" }
+        $content = if ($index -eq 1) {
+            "# Repository instructions`n"
+        }
+        else {
+            "verified loop change $index`n"
+        }
+        Set-Content -LiteralPath (Join-Path $RepoPath $path) -Value $content -NoNewline
+        & git -C $RepoPath add -- $path
+        & git -C $RepoPath commit -q -m "verified loop change $index"
+        [void]$commits.Add((& git -C $RepoPath rev-parse HEAD))
+    }
+    $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+    $state.CurrentHead = & git -C $RepoPath rev-parse HEAD
+    $state.LoopCommits = @($commits)
+    $state.LoopCommitsInitialized = $true
+    Write-ReviewLoopState -Path $checkpoint.StatePath -State $state | Out-Null
+    return $checkpoint
+}
+
 Describe "Codex Review Loop module" {
     It "imports the module" {
         Get-Module CodexReviewLoop | Should Not BeNullOrEmpty
@@ -161,9 +194,11 @@ Describe "Codex Review Loop module" {
             New-ReviewLoopProfile -RepoPath $repository -Path $path
         } $repo $profilePath
         $profile = Import-PowerShellDataFile -LiteralPath $generated
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+        $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
-            "Architect", "Fixer", "ReviewClassifier", "Reviewer", "Verifier")
+            "Architect", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer", "Verifier")
     }
 }
 
@@ -222,7 +257,9 @@ Describe "Optional profiles and command help" {
         $profile.LogRoot | Should Be ".\runs"
         $profile.ReviewerInstructions | Should Be ""
         $profile.InactivityTimeoutMinutes | Should Be 30
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+        $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -298,6 +335,38 @@ Describe "Optional profiles and command help" {
         $profile.ReviewerInstructions | Should Be ""
     }
 
+    It "defaults old profiles to a six-commit lessons-learned threshold" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "old-lessons-threshold-profile.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-lessons-threshold-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath) -replace
+            '(?m)^    LessonsLearnedCommitThreshold = 6\r?\n', ''
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+
+        $profile = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+
+        $profile.LessonsLearnedCommitThreshold | Should Be 6
+    }
+
+    It "defaults old profiles to final lessons-learned completion" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "old-lessons-completion-profile.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-lessons-completion-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath) -replace
+            '(?m)^    ReviewAfterLessonsLearnedCommit = \$false\r?\n', ''
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+
+        $profile = & (Get-Module CodexReviewLoop) {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+
+        $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
+    }
+
     It "maps legacy fixer and verifier role names in existing profiles" {
         $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
             -Path (Join-Path $TestDrive "legacy-roles.psd1") `
@@ -332,6 +401,22 @@ Describe "Optional profiles and command help" {
 
         $classifier.Model | Should Be "gpt-5.6-luna"
         $classifier.Thinking | Should Be "low"
+    }
+
+    It "supplies the lessons-learned defaults to existing profiles" {
+        $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
+            -Path (Join-Path $TestDrive "old-lessons-role.psd1") `
+            -LogRoot (Join-Path $TestDrive "old-lessons-role-logs"))
+        $profile.Roles.ContainsKey("LessonsLearned") | Should Be $false
+
+        $role = & (Get-Module CodexReviewLoop) {
+            param($config)
+            Assert-ReviewLoopConfigValues -Config $config
+            Get-ReviewLoopRoleConfig -Config $config -Role LessonsLearned
+        } $profile
+
+        $role.Model | Should Be "gpt-5.6-sol"
+        $role.Thinking | Should Be "high"
     }
 
     It "reuses the profile matched by canonical repository path" {
@@ -720,6 +805,12 @@ Describe "Run state" {
     It "starts at zero clean passes" {
         $state.CleanPasses | Should Be 0
         $state.ActiveRoleCall | Should BeNullOrEmpty
+        @($state.LoopCommits).Count | Should Be 0
+        $state.LoopCommitsInitialized | Should Be $true
+        $state.ActiveFindingSource | Should Be ""
+        $state.LessonsLearned.Status | Should Be "pending"
+        $state.LessonsLearned.Attempt | Should Be 0
+        $state.LessonsLearned.ReviewAfterCommit | Should Be $false
     }
 
     It "stores the global speed" {
@@ -745,6 +836,8 @@ Describe "Run state" {
         $content = (Get-Content -Raw -LiteralPath $profilePath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 5").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 24").
+            Replace("LessonsLearnedCommitThreshold = 6", "LessonsLearnedCommitThreshold = 9").
+            Replace("ReviewAfterLessonsLearnedCommit = `$false", "ReviewAfterLessonsLearnedCommit = `$true").
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 7").
             Replace("AutoCommit = `$true", "AutoCommit = `$false").
             Replace(
@@ -812,6 +905,106 @@ Describe "Run state" {
         $path = Join-Path $TestDrive "state.json"
         Write-ReviewLoopState -Path $path -State $state | Out-Null
         (Read-ReviewLoopState -Path $path).RunId | Should Be $state.RunId
+    }
+
+    It "adds lessons-learned state to an older checkpoint" {
+        $state.PSObject.Properties.Remove("ActiveFindingSource")
+        $state.PSObject.Properties.Remove("LessonsLearned")
+        $path = Join-Path $TestDrive "old-lessons-state.json"
+        Write-ReviewLoopState -Path $path -State $state | Out-Null
+
+        $reloaded = Read-ReviewLoopState -Path $path
+
+        $reloaded.ActiveFindingSource | Should Be ""
+        $reloaded.LessonsLearned.Status | Should Be "pending"
+        $reloaded.LessonsLearned.Attempt | Should Be 0
+        $reloaded.LessonsLearned.ReviewAfterCommit | Should Be $false
+    }
+
+    It "qualifies lessons learned only at the threshold with tracked root instructions" {
+        $config = @{ LessonsLearnedCommitThreshold = 0 }
+        $module = Get-Module CodexReviewLoop
+        $disabled = & $module {
+            param($profile, $loopState, $repository)
+            Get-ReviewLoopLessonsLearnedEligibility `
+                -Config $profile -State $loopState -RepoPath $repository
+        } $config $state $repo
+        $disabled.Eligible | Should Be $false
+        $disabled.Reason | Should Match "disabled"
+
+        $config.LessonsLearnedCommitThreshold = 6
+        $state.LoopCommits = 1..5 | ForEach-Object { "commit-$_" }
+        $below = & $module {
+            param($profile, $loopState, $repository)
+            Get-ReviewLoopLessonsLearnedEligibility `
+                -Config $profile -State $loopState -RepoPath $repository
+        } $config $state $repo
+        $below.Eligible | Should Be $false
+        $below.Reason | Should Match "5 of 6"
+
+        Set-Content -LiteralPath (Join-Path $repo "AGENTS.md") -Value "untracked"
+        $state.LoopCommits = 1..6 | ForEach-Object { "commit-$_" }
+        $untracked = & $module {
+            param($profile, $loopState, $repository)
+            Get-ReviewLoopLessonsLearnedEligibility `
+                -Config $profile -State $loopState -RepoPath $repository
+        } $config $state $repo
+        $untracked.Eligible | Should Be $false
+        $untracked.Reason | Should Match "not tracked"
+
+        & git -C $repo add AGENTS.md
+        & git -C $repo commit -q -m "add repository instructions"
+        $tracked = & $module {
+            param($profile, $loopState, $repository)
+            Get-ReviewLoopLessonsLearnedEligibility `
+                -Config $profile -State $loopState -RepoPath $repository
+        } $config $state $repo
+        $tracked.Eligible | Should Be $true
+
+        $state.LoopCommits += "commit-7"
+        $above = & $module {
+            param($profile, $loopState, $repository)
+            Get-ReviewLoopLessonsLearnedEligibility `
+                -Config $profile -State $loopState -RepoPath $repository
+        } $config $state $repo
+        $above.Eligible | Should Be $true
+    }
+
+    It "reconstructs verified commits for a legacy checkpoint" {
+        foreach ($value in @("one", "two")) {
+            Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value $value
+            & git -C $repo add README.txt
+            & git -C $repo commit -q -m "change $value"
+        }
+        $state.CurrentHead = & git -C $repo rev-parse HEAD
+        $state.PSObject.Properties.Remove("LoopCommits")
+        $state.PSObject.Properties.Remove("LoopCommitsInitialized")
+        $path = Join-Path $TestDrive "legacy-state.json"
+        Write-ReviewLoopState -Path $path -State $state | Out-Null
+        $legacy = Read-ReviewLoopState -Path $path
+
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $statePath, $repository)
+            Initialize-ReviewLoopCommitHistory `
+                -State $loopState -StatePath $statePath -RepoPath $repository
+        } $legacy $path $repo
+
+        $reloaded = Read-ReviewLoopState -Path $path
+        $expected = @(& git -C $repo rev-list --reverse --first-parent `
+            "$($state.StartHead)..$($state.CurrentHead)")
+        @($reloaded.LoopCommits) | Should Be $expected
+        $reloaded.LoopCommitsInitialized | Should Be $true
+    }
+
+    It "deduplicates verified commit registration" {
+        $commit = & git -C $repo rev-parse HEAD
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $sha)
+            Add-ReviewLoopVerifiedCommit -State $loopState -Commit $sha
+            Add-ReviewLoopVerifiedCommit -State $loopState -Commit $sha.ToUpperInvariant()
+        } $state $commit
+
+        @($state.LoopCommits) | Should Be @($commit)
     }
 
     It "retains the active cluster" {
@@ -1393,7 +1586,7 @@ Describe "Schemas, prompts, and CLI-only invariants" {
     }
 
     It "contains every production prompt" {
-        @("architect.md", "fixer.md", "verifier.md") |
+        @("architect.md", "fixer.md", "verifier.md", "lessons-learned.md") |
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
     }
 
@@ -1419,6 +1612,12 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
             Should Be $false
+        '{"schemaVersion":"1.0","summary":"Persist durable guidance.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Run the repository-owned gate after changing the parser.","evidence":["abc123 changed parser and tests"]}]}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
+            Should Be $true
+        '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
+            Should Be $false
     }
 
     It "keeps the complete free-role prompts stable" {
@@ -1440,7 +1639,7 @@ Recent history:
 {{HISTORY}}
 
 Workflow:
-Reviewer findings → Architect advice [current role] → Fixer changes → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice [current role] → Fixer changes → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Result:
 Return your advice in the supplied structured format.
@@ -1462,7 +1661,7 @@ Previous feedback:
 {{FEEDBACK}}
 
 Workflow:
-Reviewer findings → Architect advice → Fixer changes [current role] → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice → Fixer changes [current role] → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Targeted test:
 `targetedTest.executable` is the program started by the orchestrator, for example `dotnet`, `pwsh`, or a repository wrapper. Project, script, test, and filter values belong in `targetedTest.arguments`; for `dotnet test`, `dotnet` is the executable and `test` is the first argument.
@@ -1487,7 +1686,7 @@ Fixer result and targeted-test execution:
 {{FIXER_RESULT}}
 
 Workflow:
-Reviewer findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Commit message:
 When accepting, propose a solution-oriented subject, a brief rationale, and the key changes. Keep the subject concise, ideally within 72 characters before the configured prefix, and follow the repository's established language and style when clear. Leave test and host-gate evidence, Git trailers, and authorship out; the orchestrator adds verified evidence.
@@ -1539,8 +1738,10 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
     }
 
     It "keeps role instructions factual and leaves decisions to the models" {
-        $prompts = (Get-ChildItem -LiteralPath (Join-Path $root "prompts") -Filter "*.md" |
-            ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
+        $prompts = @("architect.md", "fixer.md", "verifier.md") | ForEach-Object {
+            Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$_")
+        }
+        $prompts = $prompts -join "`n"
         $prompts | Should Not Match '(?i)\bmust\b|\bnever\b|fail closed|\bprefer\b|\bonly\b|smallest|bounded'
         $prompts | Should Match 'Use your judgment'
     }
@@ -1550,10 +1751,35 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $verifier | Should Match 'Fixer result and targeted-test execution'
     }
 
+    It "keeps the lessons-learned prompt self-contained and read-only" {
+        $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\lessons-learned.md")
+        $prompt | Should Match 'Do not modify files, the worktree, the index, Git refs, or repository state'
+        $prompt | Should Match '\.agents/skills/<skill-name>/SKILL\.md'
+        $prompt | Should Match 'Do not rely on any plugin, installed skill, network access'
+        $prompt | Should Match 'Keep AGENTS\.md small and practical'
+        $prompt | Should Match 'definition of done'
+        $prompt | Should Match '\{\{LOOP_COMMITS\}\}'
+    }
+
+    It "keeps root AGENTS guidance practical and within the default context budget" {
+        $instructionsPath = Join-Path $root "AGENTS.md"
+        $instructions = Get-Content -Raw -LiteralPath $instructionsPath
+        (Get-Item -LiteralPath $instructionsPath).Length | Should BeLessThan 16384
+        foreach ($section in @(
+            "Repository layout",
+            "Development commands",
+            "Engineering conventions",
+            "Code Review Rules",
+            "Definition of done"
+        )) {
+            $instructions | Should Match ([regex]::Escape("## $section"))
+        }
+    }
+
     It "gives each free role the shared workflow and marks its current position" {
         foreach ($name in @("architect.md", "fixer.md", "verifier.md")) {
             $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$name")
-            $prompt | Should Match 'Reviewer findings.+Architect advice.+Fixer changes.+Verifier decision'
+            $prompt | Should Match 'Current findings.+Architect advice.+Fixer changes.+Verifier decision'
             $prompt | Should Match '\[current role\]'
             $prompt | Should Match 'orchestrator runs tests and host gates and commits accepted changes'
         }
@@ -1570,10 +1796,14 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
                 Verifier = Get-ReviewLoopOperationalInstructions -Role Verifier -Config $config
                 ReviewClassifier = Get-ReviewLoopOperationalInstructions `
                     -Role ReviewClassifier -Config $config
+                LessonsLearned = Get-ReviewLoopOperationalInstructions `
+                    -Role LessonsLearned -Config $config
             }
         }
 
-        foreach ($role in @("Architect", "Fixer", "Verifier", "ReviewClassifier")) {
+        foreach ($role in @(
+            "Architect", "Fixer", "Verifier", "ReviewClassifier", "LessonsLearned"
+        )) {
             $instructions.$role | Should Match 'orchestrator is deterministic PowerShell code, not an LLM'
             $instructions.$role | Should Match 'does not interpret prose as instructions'
             $instructions.$role | Should Match 'structured result fields'
@@ -1585,6 +1815,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $instructions.Verifier | Should Match 'accept field selects the implemented workflow transition'
         $instructions.Verifier | Should Match 'Rejection feedback is passed to the Fixer'
         $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
+        $instructions.LessonsLearned | Should Match 'recommendations array is the analysis result consumed by the orchestrator'
     }
 
     It "has no direct HTTP model invocation in active code" {
@@ -1943,7 +2174,210 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Review cycle 1"
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Clean pass 2/2"
+        $terminal | Should Match "Lessons learned skipped: only 0 of 6 verified loop commits exist"
         $terminal | Should Match "Review Loop completed"
+    }
+
+    It "implements multiple lessons-learned recommendations through the normal workflow" {
+        $configPath = New-TestConfig `
+            -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $checkpoint = Enable-TestLessonsLearnedCheckpoint `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard
+        $analysis = ConvertTo-Json -Compress -Depth 20 ([pscustomobject]@{
+            schemaVersion = "1.0"
+            summary = "Two durable lessons are supported by the verified changes."
+            recommendations = @(
+                [pscustomobject]@{
+                    title = "Record the verification invariant"
+                    surface = "agents_md"
+                    scope = "repository"
+                    lesson = "Run the repository gate after changing the loop."
+                    evidence = @("The six verified loop commits repeatedly changed orchestration state.")
+                },
+                [pscustomobject]@{
+                    title = "Add a repeatable review skill"
+                    surface = "repository_skill"
+                    scope = "review-loop maintenance"
+                    lesson = "Capture the non-obvious maintenance sequence as a repository skill."
+                    evidence = @("verified loop change 6 completed the repeated workflow.")
+                }
+            )
+        })
+        $architecture = '{"schemaVersion":"2.0","summary":"Apply both durable lessons.","approach":"Update repository guidance.","steps":[],"considerations":[]}'
+        $fixer = '{"schemaVersion":"3.0","summary":"Added repository guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
+        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"The guidance matches the evidence.","feedback":[],"commitMessage":{"subject":"Capture review-loop lessons","rationale":"Preserve verified maintenance knowledge.","changes":["Update repository instructions.","Add a repository skill."]}}'
+        $plans = @(
+            [pscustomobject]@{ result = "No findings." },
+            [pscustomobject]@{ result = $analysis },
+            [pscustomobject]@{ result = $architecture },
+            [pscustomobject]@{
+                result = $fixer
+                mutations = @(
+                    [pscustomobject]@{
+                        path = "AGENTS.md"
+                        content = "# Repository instructions`n`nRun the repository gate after changing the loop.`n"
+                    },
+                    [pscustomobject]@{
+                        path = ".agents/skills/review-loop-maintenance/SKILL.md"
+                        content = "---`nname: review-loop-maintenance`ndescription: Maintain the review loop when orchestration changes.`n---`n`nRun the repository-owned verification gate.`n"
+                    }
+                )
+            },
+            [pscustomobject]@{ result = $verifier }
+        )
+        $planPath = Join-Path $caseRoot "lessons-workflow.json"
+        Set-Content -LiteralPath $planPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.ReviewCycles | Should Be 1
+        $result.CleanPasses | Should Be 0
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $repo ".agents/skills/review-loop-maintenance/SKILL.md") |
+            Should Be $true
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $state.LessonsLearned.Status | Should Be "completed"
+        $state.LessonsLearned.Attempt | Should Be 1
+        $state.LessonsLearned.ReviewAfterCommit | Should Be $false
+        @($state.LoopCommits).Count | Should Be 7
+        $state.ActiveFindingSource | Should Be ""
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $lessonsCalls = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "lessons-learned-v1.schema.json"
+        })
+        $lessonsCalls.Count | Should Be 1
+        $lessonsCalls[0].prompt | Should Match "Native review cycles completed: 1"
+        $lessonsCalls[0].prompt | Should Match "verified loop change 6"
+        $architectCall = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        })[0]
+        $architectCall.prompt | Should Match "repository_skill"
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
+        $terminal | Should Match "Lessons learned triggered"
+        $terminal | Should Match "recommendation\(s\)"
+        $terminal | Should Match "Implementing 2 lessons-learned"
+        $terminal | Should Match "Committed"
+        $terminal | Should Match "final lessons-learned change verified"
+        $terminal | Should Not Match "Review cycle 2"
+    }
+
+    It "runs post-commit native reviews when explicitly configured" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
+            Replace(
+                "ReviewAfterLessonsLearnedCommit = `$false",
+                "ReviewAfterLessonsLearnedCommit = `$true")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $checkpoint = Enable-TestLessonsLearnedCheckpoint `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard
+        $analysis = '{"schemaVersion":"1.0","summary":"One durable lesson.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Keep the verified invariant.","evidence":["verified loop change 6"]}]}'
+        $architecture = '{"schemaVersion":"2.0","summary":"Record it.","approach":"Update guidance.","steps":[],"considerations":[]}'
+        $fixer = '{"schemaVersion":"3.0","summary":"Updated guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
+        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Record the verified invariant","rationale":"Preserve the lesson.","changes":["Update repository guidance."]}}'
+        $plans = @(
+            [pscustomobject]@{ result = "No findings." },
+            [pscustomobject]@{ result = $analysis },
+            [pscustomobject]@{ result = $architecture },
+            [pscustomobject]@{
+                result = $fixer
+                mutations = @([pscustomobject]@{
+                    path = "AGENTS.md"
+                    content = "# Repository instructions`n`nKeep the verified invariant.`n"
+                })
+            },
+            [pscustomobject]@{ result = $verifier },
+            [pscustomobject]@{ result = "No findings." }
+        )
+        $planPath = Join-Path $caseRoot "lessons-post-review-workflow.json"
+        Set-Content -LiteralPath $planPath `
+            -Value (ConvertTo-Json -InputObject $plans -Depth 20) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.ReviewCycles | Should Be 2
+        $result.CleanPasses | Should Be 1
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $state.LessonsLearned.Status | Should Be "completed"
+        $state.LessonsLearned.ReviewAfterCommit | Should Be $true
+        @($state.LoopCommits).Count | Should Be 7
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
+        $terminal | Should Match "Review cycle 2"
+        $terminal | Should Match "Lessons learned skipped: the lessons-learned phase already completed"
+    }
+
+    It "completes directly when fast lessons-learned analysis returns no recommendations" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $checkpoint = Enable-TestLessonsLearnedCheckpoint `
+            -RepoPath $repo -ConfigPath $configPath -Speed fast
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            '{"schemaVersion":"1.0","summary":"No durable guidance is justified.","recommendations":[]}'
+        )
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed fast `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.ReviewCycles | Should Be 1
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $state.LessonsLearned.Status | Should Be "completed"
+        @($state.LoopCommits).Count | Should Be 6
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "lessons-learned-v1.schema.json" -and
+            ($_.arguments -join " ") -match 'service_tier=\\?"?fast'
+        }).Count | Should Be 1
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-advice-v2.schema.json"
+        }).Count | Should Be 0
+    }
+
+    It "fails hard when lessons-learned analysis mutates the repository" {
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        $checkpoint = Enable-TestLessonsLearnedCheckpoint `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA =
+            "lessons-learned-v1.schema.json"
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            '{"schemaVersion":"1.0","summary":"No changes.","recommendations":[]}'
+        )
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "Read-only role 'LessonsLearned' changed"
+        (Read-ReviewLoopState -Path $checkpoint.StatePath).LessonsLearned.Status |
+            Should Be "analyzing"
     }
 
     It "resets the MaxReviewCycles counter when the same command resumes" {

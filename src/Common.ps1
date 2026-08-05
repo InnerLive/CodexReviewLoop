@@ -456,6 +456,16 @@ function New-ReviewLoopProfile {
     # resumes the checkpoint with a fresh cycle counter.
     MaxReviewCycles = 12
 
+    # Run one repository lessons-learned analysis before completion after this
+    # many verified loop commits. Zero disables the additional analysis.
+    # This value is reloaded when the clean-pass gate is reached.
+    LessonsLearnedCommitThreshold = 6
+
+    # By default, an accepted lessons-learned solution is the final cycle.
+    # Set this to true to require the normal clean native reviews again after
+    # a real lessons-learned commit. The value is captured when analysis starts.
+    ReviewAfterLessonsLearnedCommit = `$false
+
     # Recommended: 2-5 fixer calls before discarding the rejected round and
     # starting a new native Codex review. This value is reloaded at safe
     # boundaries while a run is active.
@@ -485,10 +495,12 @@ $($hostGates -join "`n")
     # - Thinking: low, medium, high, xhigh, or max.
     # ReviewClassifier is a mechanical helper used only when the native review
     # text is ambiguous. Existing profiles without it use gpt-5.6-luna/low.
+    # Existing profiles without LessonsLearned use gpt-5.6-sol/high.
     # Settings are reloaded at safe role boundaries while a run is active.
     Roles = @{
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         ReviewClassifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
+        LessonsLearned = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Fixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Verifier = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
@@ -573,6 +585,8 @@ function Import-ReviewLoopConfig {
     $defaults = @{
         CleanPassesRequired = 2
         MaxReviewCycles = 12
+        LessonsLearnedCommitThreshold = 6
+        ReviewAfterLessonsLearnedCommit = $false
         MaxFixAttempts = 2
         InactivityTimeoutMinutes = 30
         AutoCommit = $true
@@ -614,10 +628,14 @@ function Assert-ReviewLoopConfigValues {
     if ($Config.ReviewerInstructions -isnot [string]) {
         throw "Configuration value 'ReviewerInstructions' must be a string."
     }
+    if ($Config.ReviewAfterLessonsLearnedCommit -isnot [bool]) {
+        throw "Configuration value 'ReviewAfterLessonsLearnedCommit' must be a boolean."
+    }
 
     foreach ($name in @(
         "CleanPassesRequired",
         "MaxReviewCycles",
+        "LessonsLearnedCommitThreshold",
         "MaxFixAttempts",
         "InactivityTimeoutMinutes"
     )) {
@@ -629,7 +647,10 @@ function Assert-ReviewLoopConfigValues {
         }
         $Config[$name] = $value
     }
-    $roles = @("Reviewer", "ReviewClassifier", "Architect", "Fixer", "Verifier")
+    $roles = @(
+        "Reviewer", "ReviewClassifier", "LessonsLearned",
+        "Architect", "Fixer", "Verifier"
+    )
     foreach ($role in $roles) {
         $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $role
         if ([string]$roleConfig.Thinking -notin @("low", "medium", "high", "xhigh", "max")) {
@@ -659,6 +680,8 @@ function Assert-ReviewLoopConfigValues {
 $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
+    "LessonsLearnedCommitThreshold",
+    "ReviewAfterLessonsLearnedCommit",
     "MaxFixAttempts",
     "InactivityTimeoutMinutes",
     "AutoCommit",
@@ -839,11 +862,17 @@ function Get-ReviewLoopRoleConfig {
 
     $configuredRole = $Role
     if (-not $Config.Roles.ContainsKey($configuredRole)) {
-        if ($Role -eq "ReviewClassifier") {
-            return @{
-                Model = "gpt-5.6-luna"
-                Thinking = "low"
+        $defaultRole = switch ($Role) {
+            "ReviewClassifier" {
+                @{ Model = "gpt-5.6-luna"; Thinking = "low" }
             }
+            "LessonsLearned" {
+                @{ Model = "gpt-5.6-sol"; Thinking = "high" }
+            }
+            default { $null }
+        }
+        if ($null -ne $defaultRole) {
+            return $defaultRole
         }
         $legacyRole = switch ($Role) {
             "Fixer" { "PointFixer" }

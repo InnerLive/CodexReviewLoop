@@ -46,6 +46,8 @@ function New-ReliabilityConfig {
     LogRoot = '$literalLog'
     CleanPassesRequired = 2
     MaxReviewCycles = 6
+    LessonsLearnedCommitThreshold = 6
+    ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
     AutoCommit = `$true
@@ -991,6 +993,8 @@ Describe "Unattended reliability boundaries" {
         $message | Should Not Match "dotnet|-Command"
         (Read-ReviewLoopState -Path $statePath).PendingCommit |
             Should BeNullOrEmpty
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits) |
+            Should Be @(& git -C $repo rev-parse HEAD)
     }
 
     It "stages verified work when AutoCommit is disabled and resumes after it is enabled" {
@@ -1074,6 +1078,7 @@ Describe "Unattended reliability boundaries" {
             Should Match "Keep the staged tree intact"
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits).Count | Should Be 1
     }
 
     It "recovers an already-created multiline commit from its sealed checkpoint" {
@@ -1143,6 +1148,8 @@ Changes:
             Should Be $message.Replace("`r`n", "`n")
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status |
             Should Be "resolved"
+        @((Read-ReviewLoopState -Path $statePath).LoopCommits) |
+            Should Be @($committedHead)
     }
 
     It "refuses a verified change that remains unstaged before advancing HEAD" {
@@ -1251,6 +1258,123 @@ Changes:
         $result.Success | Should Be $true
         (& git -C $repo rev-parse HEAD) | Should Be $before
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
+    }
+
+    It "completes a no-op lessons-learned resolution without counting a commit" {
+        $runRoot = Join-Path $caseRoot "lessons-no-op-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "lessons-no-op-ledger.json"
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId lessons-learned-01 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.ActiveFindingSource = "lessons_learned"
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.LessonsLearned.Status = "implementing"
+        $state.LessonsLearned.TriggerHead = [string]$state.CurrentHead
+        $state.LessonsLearned.ReviewAfterCommit = $true
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $loopStatePath, $loopLedger, $loopLedgerPath, $loopFinding, $commit)
+            Complete-ReviewLoopResolution `
+                -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -Findings @($loopFinding) `
+                -VerificationResult ([pscustomobject]@{ accept = $true }) `
+                -Commit $commit
+        } $state $statePath $ledger $ledgerPath $finding $head
+
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $reloaded.LessonsLearned.Status | Should Be "completed"
+        $reloaded.LessonsLearned.CompletedHead | Should Be $head
+        @($reloaded.LoopCommits).Count | Should Be 0
+        $reloaded.ActiveFindingSource | Should Be ""
+        $completion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+        $completion.CompletionAllowed | Should Be $true
+        $completion.Evidence | Should Match "without a commit"
+    }
+
+    It "resumes directly after a final lessons-learned commit by default" {
+        $runRoot = Join-Path $caseRoot "lessons-final-resume-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $triggerHead = [string]$state.CurrentHead
+        Set-Content -LiteralPath (Join-Path $repo "AGENTS.md") `
+            -Value "# Final guidance"
+        & git -C $repo add AGENTS.md
+        & git -C $repo commit -q -m "final lessons learned"
+        $completedHead = & git -C $repo rev-parse HEAD
+        $state.CurrentHead = $completedHead
+        $state.Stage = "fix_committed"
+        $state.LessonsLearned.Status = "completed"
+        $state.LessonsLearned.TriggerHead = $triggerHead
+        $state.LessonsLearned.CompletedHead = $completedHead
+        $state.LessonsLearned.ReviewAfterCommit = $false
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $completion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+
+        $completion.CompletionAllowed | Should Be $true
+        $completion.Evidence | Should Match "final lessons-learned change verified"
+
+        $reloaded.LessonsLearned.ReviewAfterCommit = $true
+        $postReviewCompletion = & (Get-Module CodexReviewLoop) {
+            param($loopState)
+            Get-ReviewLoopLessonsLearnedFinalCompletion -State $loopState
+        } $reloaded
+        $postReviewCompletion.CompletionAllowed | Should Be $false
+    }
+
+    It "leaves lessons learned open when the fixer round returns to native review" {
+        $runRoot = Join-Path $caseRoot "lessons-restart-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $caseRoot "lessons-restart-ledger.json"
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId lessons-learned-01 -Head (& git -C $repo rev-parse HEAD) | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.FixAttempts = 1
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.ActiveFindingSource = "lessons_learned"
+        $state.LessonsLearned.Status = "implementing"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+
+        & (Get-Module CodexReviewLoop) {
+            param($loopState, $loopStatePath, $loopLedger, $loopLedgerPath, $loopFinding, $repository, $logs)
+            Restart-ReviewLoopReviewRound `
+                -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -Findings @($loopFinding) -RepoPath $repository `
+                -RunRoot $logs -Attempt 1 | Out-Null
+        } $state $statePath $ledger $ledgerPath $finding $repo $runRoot
+
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $reloaded.LessonsLearned.Status | Should Be "pending"
+        $reloaded.Stage | Should Be "review_round_requested"
+        $reloaded.ActiveFindingSource | Should Be ""
+        (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "open"
     }
 
     It "refuses changes created by a host gate" {
