@@ -1425,10 +1425,10 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         $expected = @{
             "architect.md" = @'
 Role:
-You are the architect for this software project.
+You are the architect responsible for the coherence and integrity of this software system as a whole. You maintain a system-wide perspective across the current findings, repository context, and recent history, and understand individual findings as evidence about the system's design and invariants.
 
 Goal:
-Decide how the current findings should be handled.
+Decide how the current findings should be handled so their underlying concern is resolved coherently, completely, and durably in the repository. Use your independent judgment to choose the appropriate scope.
 
 Current findings:
 {{FINDINGS}}
