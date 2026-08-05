@@ -7,6 +7,8 @@ Codex Review Loop uses Codex's native review function on the complete branch
 diff, lets free Architect and Fixer roles choose the solution, asks a Verifier
 to accept or reject it, runs the repository's quality gates, and commits only
 accepted work. It repeats unattended until the branch is demonstrably clean.
+After enough verified loop commits, it can also extract evidence-backed lessons
+into repository guidance before declaring the run complete.
 
 ## What it does
 
@@ -22,6 +24,10 @@ accepted work. It repeats unattended until the branch is demonstrably clean.
    exhausted.
 8. Repeats until the configured number of reviews are clean on the same
    unchanged `HEAD` (two is the recommended default).
+9. Before completion, conditionally analyzes verified loop commits for durable
+   `AGENTS.md` or repository-skill guidance.
+10. Sends any recommendations through the same Architect, Fixer, Verifier,
+    host-gate, and commit path, then requires clean native reviews again.
 
 ## Requirements
 

@@ -11,6 +11,8 @@ away. It must review a branch, identify real defects, make useful fixes,
 independently verify them, run repository-owned quality gates, commit only
 verified work, and continue until trustworthy completion unless the user-owned
 review-cycle budget or a genuine technical failure stops the invocation.
+Before completion, a sufficiently productive run should also extract durable,
+evidence-backed repository lessons without requiring user attention.
 
 The scarce resource is the user's attention. Requiring the user to inspect
 architecture proposals, classify findings, approve routine commands, repair
@@ -152,6 +154,7 @@ The current quality/cost allocation is intentional:
 | Role | Model | Reasoning |
 |---|---|---|
 | Reviewer | `gpt-5.6-sol` | `high` |
+| LessonsLearned | `gpt-5.6-sol` | `high` |
 | Architect | `gpt-5.6-sol` | `high` |
 | Fixer | `gpt-5.6-sol` | `high` |
 | Verifier | `gpt-5.6-sol` | `low` |
@@ -165,6 +168,12 @@ prompt or output schema. Optional profile or CLI guidance is passed only as
 supplemental developer instructions. Deterministic text recognition is used
 first. Only ambiguous text reaches the ReviewClassifier. Review text classified
 as containing findings goes unchanged to the Architect.
+
+LessonsLearned is a conditional, read-only completion analysis. It receives
+the verified loop commits and self-contained repository instruction and skill
+placement rules. It must not depend on plugins, network access, personal
+skills, or global configuration. Recommendations become normal findings and
+use the unchanged Architect, Fixer, Verifier, gate, and commit path.
 
 Architect, Fixer, and Verifier prompts contain only role, goal, context, and
 return format. They do not prescribe a point fix, architecture change, scope,
@@ -182,6 +191,13 @@ critic, veto, and tie-break roles do not exist in the active workflow.
   review output.
 - Current review findings remain active until the Verifier accepts a solution
   or a later native review reports clean.
+- Verified, non-empty loop commits are stored as a deduplicated SHA list only
+  after the resulting commit identity has been checked. Compatible legacy
+  checkpoints reconstruct missing SHAs only from a confirmed linear
+  `StartHead..CurrentHead` history.
+- Lessons-learned status, attempt, trigger `HEAD`, trigger commit count, and
+  active finding source are durable checkpoint state. An execution fingerprint
+  change requalifies unfinished analysis but never repeats a completed phase.
 - Each durable role transition writes an atomic, idempotent checkpoint.
 - Legacy checkpoints are evidence, not executable state. Import compatible
   history, reset stale attempt and thread state, and start with a native review
@@ -191,13 +207,17 @@ critic, veto, and tie-break roles do not exist in the active workflow.
 
 Completion requires the configured clean-pass gate, with two consecutive clean
 native reviews on an unchanged HEAD as the recommended default. Every commit or
-other HEAD change resets the clean-pass counter.
+other HEAD change resets the clean-pass counter. Before completion, a positive
+`LessonsLearnedCommitThreshold` also requires one lessons-learned phase when
+the threshold is met and root `AGENTS.md` is tracked in the current `HEAD`.
 
 ## Architecture behavior
 
-The Architect always receives the current native review text, repository
-context, and at most 50 recent history entries. It freely chooses and describes
-the approach. Its structured response goes unchanged to the Fixer.
+The Architect always receives the current findings text, repository context,
+and at most 50 recent history entries. Current findings are either unchanged
+native review text or the complete structured lessons-learned analysis. It
+freely chooses and describes the approach. Its structured response goes
+unchanged to the Fixer.
 
 There is no architecture approval, revision, critic, veto, trigger, forced
 point fix, forced redesign, or automatic fallback. Do not reintroduce these
@@ -205,8 +225,8 @@ decision layers.
 
 ## Fixing, tests, and commits
 
-- The Fixer receives native review text, unchanged Architect advice, and direct
-  Verifier feedback.
+- The Fixer receives current findings text, unchanged Architect advice, and
+  direct Verifier feedback.
 - Git determines the files actually changed; the Fixer response does not own
   patch scope.
 - A Fixer may return `targetedTest.executable` plus
@@ -235,6 +255,13 @@ decision layers.
   invocation resets that counter while retaining the checkpoint. Reaching the
   limit returns `limit_reached`; running the same command continues with a
   fresh budget.
+- `LessonsLearnedCommitThreshold` defaults to 6, is live-reloaded at the clean
+  gate, and is disabled by zero or a negative value. The phase does not consume
+  `MaxReviewCycles`.
+- An empty lessons-learned recommendation list completes the phase directly.
+  Accepted recommendations complete it even when no commit is necessary. A
+  real lessons-learned commit resets clean passes; the completed phase is not
+  run again. Exhausted Fixer attempts leave it open and return to native review.
 - Run configured host gates after verification and before every commit.
 - Recheck the patch after gates, stage the exact tree, create the commit from
   that tree, and advance HEAD with an old-value check.
@@ -251,6 +278,7 @@ agent's shell.
 - What phase is running?
 - Is it making progress?
 - What findings and decisions exist?
+- Was lessons learned triggered, skipped, or sent for implementation?
 - What is being fixed or verified?
 - Did authoritative tests pass?
 - Was anything committed?

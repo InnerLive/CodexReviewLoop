@@ -59,6 +59,9 @@ stages files, and commits.
 
 Raw model reasoning is never printed. Long-running roles and host gates update
 one in-place heartbeat line instead of flooding the terminal.
+When the clean gate is reached, compact and balanced output also state whether
+lessons learned were triggered or skipped, how many recommendations were
+returned, and whether they entered the normal implementation workflow.
 
 Normal invocations do not append a JSON copy of the result. For automation:
 
@@ -94,7 +97,11 @@ the clean checkpoint is restored, and native review starts again. A changed
 tool or execution-affecting profile fingerprint resets
 clean-pass evidence and starts a fresh native review when the repository is
 clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, host gates, and
-commit settings are reloaded at safe boundaries.
+commit settings are reloaded at safe boundaries. An interrupted
+lessons-learned analysis uses the same role-call checkpoint and repository
+postconditions. A changed execution fingerprint requalifies unfinished
+analysis, while a successfully completed lessons-learned phase remains
+complete.
 
 Use `-NewRun` when you deliberately want a new run checkpoint. It still
 requires a clean worktree, respects the repository lock, and keeps compatible
@@ -105,7 +112,7 @@ that happens automatically.
 
 | Status | Exit code | Meaning |
 |---|---:|---|
-| `completed` | `0` | Required clean passes on unchanged `HEAD` |
+| `completed` | `0` | Required clean passes on unchanged `HEAD`, plus an eligible completed or safely skipped lessons-learned phase |
 | Invocation error | `1` | Validation or preflight failed before a run checkpoint was created |
 | `failed` | `2` | An initialized run failed; its latest checkpoint is preserved |
 | `limit_reached` | `4` | The configured per-invocation review budget was used; run the same command to continue |
@@ -123,6 +130,12 @@ script invocation for token or time control. Every new invocation resets only
 that cycle counter and retains the checkpoint. Reaching the limit leaves the
 checkpoint resumable, does not mark any finding blocked, and the same command
 continues with a fresh budget.
+
+The lessons-learned phase does not consume `MaxReviewCycles`. If its Fixer
+round reaches `MaxFixAttempts`, the rejected patch is preserved and restored
+through the normal cleanup path, the phase stays open, and native review
+continues. A lessons-learned commit resets clean passes and therefore requires
+the configured native clean reviews again.
 
 `InactivityTimeoutMinutes` defaults to 30. Codex roles, targeted tests, and host
 gates may run for any total duration while they continue producing real output.
@@ -152,4 +165,4 @@ entry.
 
 Old dirty `cluster_blocked` checkpoints are not cleaned automatically because
 they cannot prove which changes belong to the Fixer. This is legacy recovery,
-not an outcome produced by the current four-role loop.
+not an outcome produced by the current workflow.

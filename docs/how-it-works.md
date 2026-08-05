@@ -23,7 +23,12 @@ flowchart LR
     commit --> review
     findings -- No --> clean{Required clean passes<br/>on unchanged HEAD?}
     clean -- No --> review
-    clean -- Yes --> done[Complete]
+    clean -- Yes --> eligible{Lessons learned eligible?}
+    eligible -- No --> done[Complete]
+    eligible -- Yes --> lessons[Read-only LessonsLearned analysis]
+    lessons --> recommendations{Recommendations?}
+    recommendations -- No --> done
+    recommendations -- Yes --> architect
 ```
 
 ## 1. Native review
@@ -46,8 +51,10 @@ advances the clean-pass counter.
 
 ## 2. Free architecture advice
 
-The Architect receives the current review text, repository context, and up to
-50 recent history entries. Its prompt describes the role and response format
+The Architect receives the current findings text, repository context, and up
+to 50 recent history entries. The findings text is unchanged native review
+output during ordinary cycles and the complete structured analysis during the
+lessons-learned phase. Its prompt describes the role and response format
 without prescribing a point fix, redesign, scope, or decision criteria.
 
 The structured Architect response is passed unchanged to the Fixer. There is no
@@ -55,8 +62,8 @@ judge, confirmation, critic, veto, or tie-break role.
 
 ## 3. Fixing without a blocked finding state
 
-The Fixer receives the current review, the Architect response, and any feedback
-from the previous Verifier call. It chooses the changes and exploratory tests.
+The Fixer receives the current findings, the Architect response, and any
+feedback from the previous Verifier call. It chooses the changes and exploratory tests.
 Git determines which files actually changed.
 
 `MaxFixAttempts` is the number of Fixer calls allowed in one review round. When
@@ -79,8 +86,8 @@ targeted test is available.
 ## 4. Direct verification
 
 The orchestrator runs an available targeted test and records the actual result.
-The Verifier receives the current repository, review text, Architect response,
-Fixer response, and test evidence.
+The Verifier receives the current repository, findings text, Architect
+response, Fixer response, and test evidence.
 
 The Verifier decides directly:
 
@@ -114,6 +121,24 @@ Completion requires the configured number of consecutive clean native reviews
 on an unchanged `HEAD`; two is the recommended default. Every commit or other
 `HEAD` change resets the clean-pass count.
 
+At that clean gate, `LessonsLearnedCommitThreshold` is reloaded. When the run
+has created at least that many verified, non-empty commits and the current
+`HEAD` tracks an exact root `AGENTS.md`, one read-only `LessonsLearned` call
+reviews the run's commit SHAs, subjects, and diffs. Zero disables the phase.
+The prompt is self-contained and does not depend on plugins, network access,
+personal skills, or global Codex configuration. It may recommend concise
+instructions in the applicable `AGENTS.md` or a focused repository skill under
+`.agents/skills/<name>/SKILL.md`.
+
+An empty recommendation list completes the phase without another role call.
+Otherwise, each recommendation becomes a normal ledger finding and the full
+analysis is passed to the Architect. Architect, Fixer, targeted test, Verifier,
+host gates, and commit behavior remain unchanged. An accepted no-op solution
+completes the phase without increasing the commit count. A real accepted
+commit is recorded as another verified loop commit, resets clean passes, and
+requires native clean reviews again. A completed lessons-learned phase is not
+repeated for the durable run.
+
 There is no semantic blocked outcome. Rejected fixes, old blocked ledger
 entries, and stale clean checkpoints cause another native review rather than
 stopping the run.
@@ -122,6 +147,8 @@ stopping the run.
 Every new script invocation resets that counter while retaining the checkpoint.
 Reaching it returns a resumable `limit_reached` result without changing finding
 status. Running the same command again therefore continues with a fresh budget.
+The supplemental lessons-learned call is not a native review cycle and does not
+consume this budget.
 
 The run may still fail when continuing would risk the repository or make the
 result technically untrustworthy, for example a changed `HEAD`, an unexpected
