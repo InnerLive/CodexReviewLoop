@@ -298,6 +298,111 @@ Describe "Optional profiles and command help" {
         $profile.ReviewerInstructions | Should Be ""
     }
 
+    It "preflights symbolic host-gate executables without changing the profile" {
+        $repo = New-TestRepo (Join-Path $TestDrive "host-gate-preflight-repo")
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "host-gate-preflight.psd1") `
+            -LogRoot (Join-Path $TestDrive "host-gate-preflight-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath).Replace(
+            "    HostGates = @()",
+            @"
+    HostGates = @(
+        @{ Name = "Solution tests"; FilePath = "dotnet"; Arguments = @("test", ".\Test.sln") }
+        @{ Name = "Git diff check"; FilePath = "git"; Arguments = @("diff", "--check") }
+    )
+"@.TrimEnd())
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $transcript = Join-Path $TestDrive "host-gate-preflight-terminal.log"
+        $config = Import-PowerShellDataFile -LiteralPath $profilePath
+        $config["__ConfigPath"] = $profilePath
+
+        & (Get-Module CodexReviewLoop) {
+            param($repository, $activeConfig, $terminalPath)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath $terminalPath
+            Assert-ReviewLoopHostGatePreflight `
+                -Config $activeConfig -RepoPath $repository
+            Update-ReviewLoopLiveConfig -Config $activeConfig
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath ""
+        } $repo $config $transcript
+
+        @($config.HostGates | ForEach-Object { [string]$_.FilePath }) |
+            Should Be @("dotnet", "git")
+        (Get-Content -Raw -LiteralPath $transcript) |
+            Should Not Match "Reloaded live profile settings"
+    }
+
+    It "fails host-gate preflight when an executable cannot be resolved" {
+        $repo = New-TestRepo (Join-Path $TestDrive "missing-host-gate-repo")
+        $config = @{
+            HostGates = @(@{
+                Name = "Missing gate"
+                FilePath = "review-loop-command-that-does-not-exist"
+                Arguments = @()
+            })
+        }
+
+        (Test-Throws {
+            & (Get-Module CodexReviewLoop) {
+                param($repository, $activeConfig)
+                Assert-ReviewLoopHostGatePreflight `
+                    -Config $activeConfig -RepoPath $repository
+            } $repo $config
+        }) | Should Be $true
+    }
+
+    It "renders genuine live profile changes without fingerprint JSON" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "readable-live-reload.psd1") `
+            -LogRoot (Join-Path $TestDrive "readable-live-reload-logs") `
+            -WithHostGate
+        $config = Import-PowerShellDataFile -LiteralPath $profilePath
+        $config["__ConfigPath"] = $profilePath
+        $content = (Get-Content -Raw -LiteralPath $profilePath).
+            Replace("    MaxReviewCycles = 6", "    MaxReviewCycles = 7").
+            Replace("    AutoCommit = `$true", "    AutoCommit = `$false").
+            Replace(
+                '    CommitMessagePrefix = "Test Review Loop"',
+                '    CommitMessagePrefix = "private-prefix-value"').
+            Replace(
+                '    HostGates = @(@{ Name = "fake gate"; FilePath = "pwsh"; Arguments = @("-NoProfile", "-Command", "exit 0") })',
+                '    HostGates = @(@{ Name = "Solution tests"; FilePath = "dotnet"; Arguments = @("test", ".\PKonf.sln") })').
+            Replace(
+                '        Fixer = @{ Model = "fake"; Thinking = "high" }',
+                '        Fixer = @{ Model = "fake"; Thinking = "xhigh" }')
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $transcript = Join-Path $TestDrive "readable-live-reload-terminal.log"
+
+        & (Get-Module CodexReviewLoop) {
+            param($activeConfig, $terminalPath)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath $terminalPath
+            Update-ReviewLoopLiveConfig -Config $activeConfig
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath ""
+        } $config $transcript
+
+        $text = Get-Content -Raw -LiteralPath $transcript
+        $text | Should Match "Reloaded live profile settings"
+        $text | Should Match "MaxReviewCycles: 6 -> 7"
+        $text | Should Match "AutoCommit: enabled -> disabled"
+        $text | Should Match "CommitMessagePrefix updated"
+        $text | Should Not Match "private-prefix-value"
+        $text | Should Match "HostGates:"
+        $text | Should Match "Before:"
+        $text | Should Match "fake gate: pwsh -NoProfile -Command 'exit 0'"
+        $text | Should Match "After:"
+        $text | Should Match ([regex]::Escape("Solution tests: dotnet test .\PKonf.sln"))
+        $text | Should Match "Fixer: fake/high -> fake/xhigh"
+        $text | Should Not Match '\[\{'
+        $text | Should Not Match '"Arguments"\s*:'
+    }
+
     It "maps legacy fixer and verifier role names in existing profiles" {
         $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
             -Path (Join-Path $TestDrive "legacy-roles.psd1") `
@@ -2080,8 +2185,8 @@ Describe "End-to-end orchestration with fake Codex" {
         (& git -C $repo show -s --format=%s HEAD) | Should Match "^Reloaded:"
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Reloaded live profile settings"
-        $terminal | Should Match "MaxReviewCycles 2 -> 3"
-        $terminal | Should Match "InactivityTimeoutMinutes 30 -> 47"
+        $terminal | Should Match "MaxReviewCycles: 2 -> 3"
+        $terminal | Should Match "InactivityTimeoutMinutes: 30 -> 47"
         $terminal | Should Match "Review cycle 3"
         $terminal | Should Not Match "active profile changed"
     }

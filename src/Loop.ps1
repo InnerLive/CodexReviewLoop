@@ -243,8 +243,8 @@ function Assert-ReviewLoopHostGatePreflight {
 
     foreach ($gate in @($Config.HostGates)) {
         try {
-            $gate.FilePath = Resolve-ReviewLoopHostExecutable `
-                -RepoPath $RepoPath -FilePath ([string]$gate.FilePath)
+            Resolve-ReviewLoopHostExecutable `
+                -RepoPath $RepoPath -FilePath ([string]$gate.FilePath) | Out-Null
         }
         catch {
             throw (New-ReviewLoopFailureException `
