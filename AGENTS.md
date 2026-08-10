@@ -128,6 +128,8 @@ pwsh -File .\codex-review-loop.ps1 -RepoPath C:\dev\Project
   binding wins, including an empty string, and remains fixed for the invocation.
 - `-Help` must work without creating a profile or starting a run.
 - `-Speed` accepts `standard|fast` and defaults to `standard`.
+  A resumed checkpoint inherits its recorded speed when the option is omitted;
+  an explicit value changes subsequent calls in the same checkpoint.
 - `-OutputMode` accepts `compact|balanced|detailed` and defaults to `compact`.
 - `-HeartbeatSeconds` defaults to 30; zero disables heartbeats.
 - `-ColorMode` accepts `Host|Ansi|Always|Auto|Never` and defaults to `Host`.
@@ -186,8 +188,9 @@ critic, veto, and tie-break roles do not exist in the active workflow.
 - Legacy checkpoints are evidence, not executable state. Import compatible
   history, reset stale attempt and thread state, and start with a native review
   when the repository is clean.
-- Repository, branch, symbolic review base, resolved base commit, HEAD, speed,
-  and execution fingerprint must be checked before resuming relevant work.
+- Repository, branch, symbolic review base, resolved base commit, HEAD, and
+  execution fingerprint must be checked before resuming relevant work. Speed
+  is inherited from the checkpoint unless the user explicitly changes it.
 
 Completion requires the configured clean-pass gate, with two consecutive clean
 native reviews on an unchanged HEAD as the recommended default. Every commit or

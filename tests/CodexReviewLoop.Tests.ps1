@@ -1795,60 +1795,15 @@ Describe "End-to-end orchestration with fake Codex" {
         Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
     }
 
-    It "explains how to resolve a resumed speed mismatch" {
-        New-TestActiveCheckpoint `
+    It "changes speed on the same checkpoint when explicitly requested" {
+        $checkpoint = New-TestActiveCheckpoint `
             -RepoPath $repo `
             -ConfigPath $configPath `
-            -Speed fast | Out-Null
-
-        $result = Invoke-CodexReviewLoop `
-            -RepoPath $repo `
-            -ConfigPath $configPath `
-            -Speed standard `
-            -CodexPath $fakeCodex `
-            -HeartbeatSeconds 0 `
-            -ColorMode Never
-
-        $result.Status | Should Be "failed"
-        $result.Reason | Should Match "cannot change speed"
-        ($result.NextSteps -join "`n") | Should Match "-Speed fast"
-        ($result.NextSteps -join "`n") | Should Match "-Speed standard -NewRun"
-        Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
-    }
-
-    It "keeps an immediate compact failure short and non-duplicative" {
-        New-TestActiveCheckpoint `
-            -RepoPath $repo `
-            -ConfigPath $configPath `
-            -Speed fast | Out-Null
-        $entryPoint = Join-Path $root "codex-review-loop.ps1"
-        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
-            -File $entryPoint `
-            -RepoPath $repo `
-            -ConfigPath $configPath `
-            -Speed standard `
-            -CodexPath $fakeCodex `
-            -HeartbeatSeconds 0 `
-            -ColorMode Never 2>&1
-        $exitCode = $LASTEXITCODE
-        $text = $output -join "`n"
-        $lines = @($output | Where-Object {
-            -not [string]::IsNullOrWhiteSpace([string]$_)
-        })
-
-        $exitCode | Should Be 2
-        $lines.Count | Should Not BeGreaterThan 8
-        [regex]::Matches($text, "cannot change speed").Count | Should Be 1
-        $text | Should Match "Recommended"
-        $text | Should Match "Alternative"
-        $text | Should Not Match "Repository:|Checkpoint:|Ledger:|`"Status`"\s*:"
-    }
-
-    It "emits only one JSON result for an immediate runtime failure" {
-        New-TestActiveCheckpoint `
-            -RepoPath $repo `
-            -ConfigPath $configPath `
-            -Speed fast | Out-Null
+            -Speed fast
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            "No findings."
+        )
         $entryPoint = Join-Path $root "codex-review-loop.ps1"
         $output = & pwsh -NoLogo -NoProfile -NonInteractive `
             -File $entryPoint `
@@ -1862,12 +1817,57 @@ Describe "End-to-end orchestration with fake Codex" {
         $exitCode = $LASTEXITCODE
         $text = $output -join "`n"
         $result = $text | ConvertFrom-Json
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json }
+        $terminal = Get-Content -Raw -LiteralPath (Join-Path $checkpoint.RunRoot "terminal.log")
 
-        $exitCode | Should Be 2
-        $result.Status | Should Be "failed"
-        $result.Reason | Should Match "cannot change speed"
-        ($result.NextSteps -join "`n") | Should Match "-Speed fast"
-        $text | Should Not Match "\[X\]|\[!\]|Codex Review Loop"
+        $exitCode | Should Be 0
+        $result.Status | Should Be "completed"
+        $result.StatePath | Should Be $checkpoint.StatePath
+        $state.Speed | Should Be "standard"
+        @($state.RoleCalls | Where-Object { [string]$_.Speed -ne "standard" }).Count |
+            Should Be 0
+        @($records | Where-Object {
+            ($_.arguments -join " ") -notmatch 'service_tier=\\?"default'
+        }).Count | Should Be 0
+        $terminal | Should Match "Checkpoint speed changed: fast -> standard"
+    }
+
+    It "inherits a resumed checkpoint speed when the CLI option is omitted" {
+        $checkpoint = New-TestActiveCheckpoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -Speed fast
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            "No findings."
+        )
+        $entryPoint = Join-Path $root "codex-review-loop.ps1"
+        $output = & pwsh -NoLogo -NoProfile -NonInteractive `
+            -File $entryPoint `
+            -RepoPath $repo `
+            -ConfigPath $configPath `
+            -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 `
+            -ColorMode Never `
+            -Json 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = $output -join "`n"
+        $result = $text | ConvertFrom-Json
+        $state = Read-ReviewLoopState -Path $checkpoint.StatePath
+        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json }
+
+        $exitCode | Should Be 0
+        $result.Status | Should Be "completed"
+        $result.StatePath | Should Be $checkpoint.StatePath
+        $state.Speed | Should Be "fast"
+        @($state.RoleCalls | Where-Object { [string]$_.Speed -ne "fast" }).Count |
+            Should Be 0
+        @($records | Where-Object {
+            ($_.arguments -join " ") -notmatch 'service_tier=\\?"fast'
+        }).Count | Should Be 0
     }
 
     It "gives a concrete compact recovery command for a dirty legacy blocked checkpoint" {

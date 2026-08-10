@@ -55,6 +55,8 @@ value wins, and `-ReviewerInstructions ''` disables the profile value.
 
 The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
 when you deliberately want a fresh run; the finding ledger is retained.
+Resume inherits the checkpoint's service tier unless `-Speed standard|fast` is
+passed explicitly to change subsequent calls in that same run.
 
 During unattended runs Windows is kept awake without keeping the display on or
 changing update policy. Long-running roles and tests are limited by inactivity,

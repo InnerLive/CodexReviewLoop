@@ -162,9 +162,10 @@ Each entry contains:
 - `Model`: a model ID supported by the installed Codex CLI
 - `Thinking`: `low`, `medium`, `high`, `xhigh`, or `max`
 
-`-Speed standard|fast` controls the service tier globally. It does not silently
-change models or reasoning levels, and a resumed run must keep its original
-speed.
+`-Speed standard|fast` controls the service tier without changing models or
+reasoning levels. When resuming, omitting the parameter inherits the speed from
+the checkpoint. Passing it explicitly changes the speed for subsequent role
+and thread-resume calls while retaining the same checkpoint and ledger.
 
 Existing profiles remain usable during the transition: `PointFixer` supplies
 the `Fixer` configuration when `Fixer` is absent, and `FindingVerifier`

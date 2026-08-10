@@ -32,8 +32,10 @@ explicit command-line value wins over the profile, including an empty string
 that disables the profile value. The effective value is fixed for this invocation.
 
 .PARAMETER Speed
-Global service tier for every role and resume call without exception.
-Accepted values are standard and fast. The default is standard.
+Service tier for Codex role calls. Accepted values are standard and fast.
+New runs default to standard. A resumed checkpoint keeps its recorded speed
+when this parameter is omitted; an explicit value changes the speed for
+subsequent role and thread-resume calls in that checkpoint.
 
 .PARAMETER CodexPath
 Optional path to a specific Codex CLI executable. When omitted, the installed
@@ -181,12 +183,14 @@ Import-Module $modulePath -Force
 
 $arguments = @{
     RepoPath = $RepoPath
-    Speed = $Speed
     NewRun = $NewRun
     OutputMode = $OutputMode
     HeartbeatSeconds = $HeartbeatSeconds
     ColorMode = $ColorMode
     Json = $Json
+}
+if ($PSBoundParameters.ContainsKey("Speed")) {
+    $arguments.Speed = $Speed
 }
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $arguments.ConfigPath = $ConfigPath
