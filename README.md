@@ -71,6 +71,25 @@ machine-readable result document and no terminal dashboard with `-Json`.
 - [Profiles and configuration](docs/configuration.md)
 - [Running, monitoring, and recovery](docs/operations.md)
 
+## Optional global working agreements
+
+The repository includes a small set of reusable Codex working agreements in
+[`docs/smallest-complete-work.md`](docs/smallest-complete-work.md). Install or
+refresh them at the beginning of your global `AGENTS.md` with either script:
+
+```powershell
+pwsh -File .\install-global-agents.ps1
+```
+
+```bash
+bash ./install-global-agents.sh
+```
+
+The installers use `$CODEX_HOME/AGENTS.md` when `CODEX_HOME` is set and
+`~/.codex/AGENTS.md` otherwise. They preserve other content, update their
+managed block without duplicating it, and warn when a non-empty global
+`AGENTS.override.md` prevents Codex from loading `AGENTS.md`.
+
 For the complete command reference:
 
 ```powershell
