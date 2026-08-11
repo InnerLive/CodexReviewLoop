@@ -93,6 +93,12 @@ new speed for subsequent calls in the same checkpoint. If the invocation used
 when resuming. Changing or omitting it requalifies existing review and
 clean-pass evidence before the loop can complete.
 
+Architect, Fixer, Verifier, ReviewClassifier, and LessonsLearned each keep a
+separate durable Codex thread across invocations of the same run. Older
+checkpoints without the role-session map reconstruct it from the latest
+successful recorded call for each role. The native Reviewer always starts a
+fresh review and is excluded from this migration.
+
 Interrupted fixer work resumes from its recorded thread when possible. If a
 Fixer changed files before a resumable thread ID was available, the loop first
 preserves that complete Git diff and gives one fresh Fixer the same semantic

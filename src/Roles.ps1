@@ -274,6 +274,13 @@ function Invoke-ConfiguredCodexRole {
 
     $effectiveMode = $Mode
     $effectiveThreadId = $ThreadId
+    if ($null -ne $State -and $Mode -eq "Exec" -and
+        [string]::IsNullOrWhiteSpace($effectiveThreadId)) {
+        $effectiveThreadId = Get-ReviewLoopRoleSessionThreadId -State $State -Role $Role
+        if (-not [string]::IsNullOrWhiteSpace($effectiveThreadId)) {
+            $effectiveMode = "Resume"
+        }
+    }
     $effectivePrompt = $Prompt
     if ($null -ne $pending) {
         $effectiveThreadId = [string](Get-ReviewLoopObjectProperty `
@@ -388,6 +395,10 @@ Continue the interrupted $Role work from the current repository state and return
             -NotePropertyValue ([string]$roleEndSnapshot.Head)
         $call | Add-Member -Force -NotePropertyName WorktreeFingerprint `
             -NotePropertyValue ([string]$roleEndSnapshot.Fingerprint)
+        if ([bool]$call.Success) {
+            Set-ReviewLoopRoleSessionThreadId `
+                -State $State -Role $Role -ThreadId ([string]$call.ThreadId)
+        }
         Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
         $State.ActiveRoleCall = $null
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null

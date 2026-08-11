@@ -8,6 +8,80 @@ $script:FindingStatuses = @(
     "blocked"
 )
 
+function Get-ReviewLoopSessionRoleNames {
+    return @(
+        "ReviewClassifier",
+        "LessonsLearned",
+        "Architect",
+        "Fixer",
+        "Verifier"
+    )
+}
+
+function New-ReviewLoopRoleSessions {
+    $sessions = [ordered]@{}
+    foreach ($role in @(Get-ReviewLoopSessionRoleNames)) {
+        $sessions[$role] = ""
+    }
+    return [pscustomobject]$sessions
+}
+
+function Initialize-ReviewLoopRoleSessions {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    if ($State.PSObject.Properties.Name -notcontains "RoleSessions") {
+        $State | Add-Member -NotePropertyName RoleSessions `
+            -NotePropertyValue (New-ReviewLoopRoleSessions)
+    }
+    foreach ($role in @(Get-ReviewLoopSessionRoleNames)) {
+        if ($State.RoleSessions.PSObject.Properties.Name -notcontains $role) {
+            $State.RoleSessions | Add-Member -NotePropertyName $role -NotePropertyValue ""
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$State.RoleSessions.$role)) {
+            continue
+        }
+        $latest = @((Get-ReviewLoopObjectProperty -Object $State -Name "RoleCalls" -Default @()) |
+            Where-Object {
+                [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false) -and
+                [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq $role -and
+                -not [string]::IsNullOrWhiteSpace([string](Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "ThreadId" -Default ""))
+            } |
+            Select-Object -Last 1)
+        if ($latest.Count -gt 0) {
+            $State.RoleSessions.$role = [string]$latest[0].ThreadId
+        }
+    }
+}
+
+function Get-ReviewLoopRoleSessionThreadId {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    if ($Role -notin @(Get-ReviewLoopSessionRoleNames)) {
+        return ""
+    }
+    Initialize-ReviewLoopRoleSessions -State $State
+    return [string]$State.RoleSessions.$Role
+}
+
+function Set-ReviewLoopRoleSessionThreadId {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ThreadId
+    )
+
+    if ($Role -notin @(Get-ReviewLoopSessionRoleNames) -or
+        [string]::IsNullOrWhiteSpace($ThreadId)) {
+        return
+    }
+    Initialize-ReviewLoopRoleSessions -State $State
+    $State.RoleSessions.$Role = $ThreadId
+}
+
 function Get-ReviewLoopFindingId {
     [CmdletBinding()]
     param(
@@ -364,6 +438,7 @@ function New-ReviewLoopState {
             CompletedHead = ""
             ReviewAfterCommit = $false
         }
+        RoleSessions = New-ReviewLoopRoleSessions
         ActiveRoleCall = $null
         ActiveStrategy = $null
         LastFixerResult = $null
@@ -445,6 +520,7 @@ function Read-ReviewLoopState {
             }
         }
     }
+    Initialize-ReviewLoopRoleSessions -State $state
     Test-ReviewLoopState -State $state | Out-Null
     return $state
 }

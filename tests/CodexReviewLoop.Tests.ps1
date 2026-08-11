@@ -916,6 +916,10 @@ Describe "Run state" {
         $state.LessonsLearned.Status | Should Be "pending"
         $state.LessonsLearned.Attempt | Should Be 0
         $state.LessonsLearned.ReviewAfterCommit | Should Be $false
+        $state.RoleSessions.Architect | Should Be ""
+        $state.RoleSessions.Fixer | Should Be ""
+        $state.RoleSessions.Verifier | Should Be ""
+        @($state.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
     It "stores the global speed" {
@@ -1024,6 +1028,26 @@ Describe "Run state" {
         $reloaded.LessonsLearned.Status | Should Be "pending"
         $reloaded.LessonsLearned.Attempt | Should Be 0
         $reloaded.LessonsLearned.ReviewAfterCommit | Should Be $false
+    }
+
+    It "reconstructs durable role sessions from an older checkpoint" {
+        $state.PSObject.Properties.Remove("RoleSessions")
+        $state.RoleCalls = @(
+            [pscustomobject]@{ Role = "Architect"; Success = $true; ThreadId = "architect-old" },
+            [pscustomobject]@{ Role = "Reviewer"; Success = $true; ThreadId = "reviewer-thread" },
+            [pscustomobject]@{ Role = "Architect"; Success = $true; ThreadId = "architect-current" },
+            [pscustomobject]@{ Role = "Verifier"; Success = $false; ThreadId = "verifier-failed" },
+            [pscustomobject]@{ Role = "Fixer"; Success = $true; ThreadId = "fixer-current" }
+        )
+        $path = Join-Path $TestDrive "old-role-sessions-state.json"
+        Write-ReviewLoopState -Path $path -State $state | Out-Null
+
+        $reloaded = Read-ReviewLoopState -Path $path
+
+        $reloaded.RoleSessions.Architect | Should Be "architect-current"
+        $reloaded.RoleSessions.Fixer | Should Be "fixer-current"
+        $reloaded.RoleSessions.Verifier | Should Be ""
+        @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
     It "qualifies lessons learned only at the threshold with tracked root instructions" {
@@ -1192,6 +1216,66 @@ Describe "Fake Codex integration" {
     It "captures the thread id" {
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex
         $call.ThreadId | Should Be "fake-thread-123"
+    }
+
+    It "reuses separate durable sessions while native reviews stay fresh" {
+        $repoPath = New-TestRepo $repo.FullName
+        $configPath = New-TestConfig `
+            -Path (Join-Path $TestDrive "role-sessions.psd1") `
+            -LogRoot $logRoot
+        $statePath = Join-Path $logRoot "role-sessions-state.json"
+        $planPath = Join-Path $TestDrive "role-sessions-invocations.json"
+        Set-Content -LiteralPath $planPath -Value (@(
+            @{ threadId = "architect-thread" },
+            @{ threadId = "verifier-thread" },
+            @{ threadId = "architect-thread" },
+            @{ threadId = "verifier-thread" },
+            @{},
+            @{}
+        ) | ConvertTo-Json -Depth 10) -Encoding UTF8
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        & (Get-Module CodexReviewLoop) {
+            param($profilePath, $repository, $runRoot, $checkpointPath, $fakePath)
+            $config = Import-PowerShellDataFile -LiteralPath $profilePath
+            $config["__ExecutionFingerprint"] = "role-session-fingerprint"
+            $head = & git -C $repository rev-parse HEAD
+            $state = New-ReviewLoopState `
+                -RepoPath $repository -ReviewBase HEAD -ReviewBaseCommit $head `
+                -ExecutionFingerprint "role-session-fingerprint" -Speed standard `
+                -RunRoot $runRoot
+            Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
+
+            foreach ($call in @(
+                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-1" },
+                @{ Role = "Verifier"; Schema = "verifier-result-v4.schema.json"; Id = "verifier-1" },
+                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-2" },
+                @{ Role = "Verifier"; Schema = "verifier-result-v4.schema.json"; Id = "verifier-2" }
+            )) {
+                Invoke-ConfiguredCodexRole `
+                    -Config $config -Role $call.Role -RepoPath $repository -Speed standard `
+                    -Prompt "current task" -LogRoot $runRoot -SchemaName $call.Schema `
+                    -CodexPath $fakePath -CallId $call.Id -State $state -StatePath $checkpointPath |
+                    Out-Null
+            }
+            foreach ($id in @("review-1", "review-2")) {
+                Invoke-ConfiguredCodexRole `
+                    -Config $config -Role "Reviewer" -RepoPath $repository -Speed standard `
+                    -Prompt "" -LogRoot $runRoot -Mode Review -ReviewBase HEAD `
+                    -CodexPath $fakePath -CallId $id -State $state -StatePath $checkpointPath |
+                    Out-Null
+            }
+        } $configPath $repoPath $logRoot $statePath $fakeCodex
+
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records.callKind) | Should Be @("exec", "exec", "resume", "resume", "review", "review")
+        $records[2].resumeThreadId | Should Be "architect-thread"
+        $records[3].resumeThreadId | Should Be "verifier-thread"
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $reloaded.RoleSessions.Architect | Should Be "architect-thread"
+        $reloaded.RoleSessions.Verifier | Should Be "verifier-thread"
+        @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
     It "captures usage" {
@@ -1705,24 +1789,27 @@ Describe "Schemas, prompts, and CLI-only invariants" {
         '{"schemaVersion":"3.0","summary":"Done.","targetedTest":{"available":true,"executable":"dotnet","arguments":["test","tests/Project.Tests.csproj"]}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
             Should Be $true
-        '{"schemaVersion":"3.0","summary":"Ambiguous.","targetedTest":{"available":true,"filePath":"tests/Project.Tests.csproj","arguments":[]}}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") |
-            Should Be $false
+        (Test-Throws {
+            '{"schemaVersion":"3.0","summary":"Ambiguous.","targetedTest":{"available":true,"filePath":"tests/Project.Tests.csproj","arguments":[]}}' |
+                Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json")
+        }) | Should Be $true
         '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct.","changes":["Update the implementation."]}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
             Should Be $true
         '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
             Should Be $true
-        '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
-            Should Be $false
+        (Test-Throws {
+            '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
+                Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json")
+        }) | Should Be $true
         '{"schemaVersion":"1.0","summary":"Persist durable guidance.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Run the repository-owned gate after changing the parser.","evidence":["abc123 changed parser and tests"]}]}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
             Should Be $true
-        '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
-            Should Be $false
+        (Test-Throws {
+            '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
+                Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json")
+        }) | Should Be $true
     }
 
     It "keeps the complete free-role prompts stable" {
@@ -2874,7 +2961,7 @@ Describe "End-to-end orchestration with fake Codex" {
         $records[0].prompt | Should Match "previous Fixer process ended"
     }
 
-    It "uses the configured fixer-attempt budget and resumes only the cluster thread" {
+    It "uses the configured fixer-attempt budget and resumes the durable Fixer thread" {
         $configPath = New-TestConfig -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
@@ -2962,7 +3049,11 @@ Describe "End-to-end orchestration with fake Codex" {
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json" -and
             $_.callKind -eq "exec"
-        }).Count | Should Be 2
+        }).Count | Should Be 1
+        @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json" -and
+            $_.callKind -eq "resume"
+        }).Count | Should Be 1
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 4
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
             Should Match "restarting with the native Reviewer"

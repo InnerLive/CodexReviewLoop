@@ -41,6 +41,7 @@ The Reviewer is Codex's native review function. The loop supplies the
 repository and configured review base, but no positional reviewer prompt or
 output schema. Optional `ReviewerInstructions` are supplied as supplemental
 developer instructions without replacing the native `review --base` workflow.
+Every native review starts fresh; Reviewer threads are deliberately not reused.
 
 The loop first recognizes established finding and clean signals locally. If
 the text is ambiguous, the mechanical `ReviewClassifier` helper uses the
@@ -60,6 +61,8 @@ to 50 recent history entries. The findings text is unchanged native review
 output during ordinary cycles and the complete structured analysis during the
 lessons-learned phase. Its prompt describes the role and response format
 without prescribing a point fix, redesign, scope, or decision criteria.
+The Architect keeps one dedicated Codex thread for the durable run, so later
+cycles retain its architectural reasoning in addition to the explicit history.
 
 The structured Architect response is passed unchanged to the Fixer. There is no
 judge, confirmation, critic, veto, or tie-break role.
@@ -69,6 +72,8 @@ judge, confirmation, critic, veto, or tie-break role.
 The Fixer receives the current findings, the Architect response, and any
 feedback from the previous Verifier call. It chooses the changes and exploratory tests.
 Git determines which files actually changed.
+Its dedicated Codex thread is reused across attempts and finding clusters in
+the same durable run.
 
 `MaxFixAttempts` is the number of Fixer calls allowed in one review round. When
 the value is reached without acceptance, the loop preserves the rejected patch
@@ -92,6 +97,7 @@ targeted test is available.
 The orchestrator runs an available targeted test and records the actual result.
 The Verifier receives the current repository, findings text, Architect
 response, Fixer response, and test evidence.
+It keeps a separate dedicated Codex thread for the durable run.
 
 The Verifier decides directly:
 
@@ -102,6 +108,9 @@ For an accepted patch, it also proposes the semantic commit subject, rationale,
 and key changes. It does not own test claims or Git metadata.
 
 There are no confidence thresholds, majority decisions, or adjudication roles.
+
+All other structured roles likewise retain their own independent thread for
+the durable run. Threads are never shared between roles.
 
 ## 5. Gates and commit
 

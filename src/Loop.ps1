@@ -1885,6 +1885,9 @@ function Invoke-ReviewLoopFixWorkflow {
     $attempt = [int](@($Findings | ForEach-Object { [int]$_.FixAttempts } |
         Measure-Object -Maximum).Maximum)
     $threadId = [string]$Findings[0].FixerThreadId
+    if ([string]::IsNullOrWhiteSpace($threadId)) {
+        $threadId = Get-ReviewLoopRoleSessionThreadId -State $State -Role "Fixer"
+    }
     $partialRecovery = Get-ReviewLoopObjectProperty -Object $State -Name "PartialFixRecovery"
     if ($Recover -and [string]::IsNullOrWhiteSpace($threadId) -and $attempt -gt 0 -and
         $null -eq (Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall") -and
