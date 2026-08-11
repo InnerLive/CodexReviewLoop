@@ -8,22 +8,32 @@ Import-Module $modulePath -Force
 function New-ReliabilityRepo {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    & git -C $Path init -q
-    & git -C $Path config user.email "review-loop-tests@example.invalid"
-    & git -C $Path config user.name "Review Loop Tests"
-    & git -C $Path config core.excludesFile (Join-Path $Path ".git\info\exclude")
-    & git -C $Path config core.autocrlf false
-    Set-Content -LiteralPath (Join-Path $Path "README.txt") -Value "initial"
-    Set-Content -LiteralPath (Join-Path $Path "review-loop-test.proj") -Value @"
+    $template = Join-Path $TestDrive "repo-template-reliability"
+    if (-not (Test-Path -LiteralPath (Join-Path $template ".git") -PathType Container)) {
+        New-Item -ItemType Directory -Path $template -Force | Out-Null
+        & git -C $template init -q
+        & git -C $template config user.email "review-loop-tests@example.invalid"
+        & git -C $template config user.name "Review Loop Tests"
+        & git -C $template config core.autocrlf false
+        Set-Content -LiteralPath (Join-Path $template "README.txt") -Value "initial"
+        Set-Content -LiteralPath (Join-Path $template "review-loop-test.proj") -Value @"
 <Project>
   <Target Name="VSTest">
     <Message Text="targeted test passed" Importance="High" />
   </Target>
 </Project>
 "@
-    & git -C $Path add README.txt review-loop-test.proj
-    & git -C $Path commit -q -m "initial"
+        & git -C $template add README.txt review-loop-test.proj
+        & git -C $template commit -q -m "initial"
+    }
+    & git clone -q --no-hardlinks `
+        -c user.email=review-loop-tests@example.invalid `
+        -c user.name="Review Loop Tests" `
+        -c core.autocrlf=false `
+        -- $template $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "Reliability repository clone failed: '$Path'."
+    }
     return $Path
 }
 
@@ -81,47 +91,66 @@ function Write-ReliabilityJsonArray {
     Set-Content -LiteralPath $Path -Value (ConvertTo-Json -InputObject @($Values) -Depth 30) -Encoding UTF8
 }
 
-Describe "Unattended reliability boundaries" {
+function New-ReliabilityTestCase {
+    & (Get-Module CodexReviewLoop) {
+        $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+    }
+    $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $caseRoot | Out-Null
+    $repo = New-ReliabilityRepo -Path (Join-Path $caseRoot "repo")
+    $logRoot = Join-Path $caseRoot "logs"
+    $configPath = New-ReliabilityConfig -Path (Join-Path $caseRoot "profile.psd1") `
+        -RepoPath $repo -LogRoot $logRoot
+    $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
+    $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_STDERR = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_THREAD = "reliability-thread"
+    $env:CODEX_REVIEW_LOOP_FAKE_COMMAND_EXIT_CODE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_COMMAND_OUTPUT = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_NULL_USAGE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_HANG_MS = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = ""
+
+    return [pscustomobject]@{
+        Root = $caseRoot
+        Repo = $repo
+        LogRoot = $logRoot
+        ConfigPath = $configPath
+    }
+}
+
+function Clear-ReliabilityTestCase {
+    & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+    @(
+        "CODEX_REVIEW_LOOP_FAKE_LOG",
+        "CODEX_REVIEW_LOOP_FAKE_RESULT",
+        "CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE",
+        "CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE",
+        "CODEX_REVIEW_LOOP_FAKE_EXIT_CODE",
+        "CODEX_REVIEW_LOOP_FAKE_STDERR",
+        "CODEX_REVIEW_LOOP_FAKE_THREAD",
+        "CODEX_REVIEW_LOOP_FAKE_COMMAND_EXIT_CODE",
+        "CODEX_REVIEW_LOOP_FAKE_COMMAND_OUTPUT",
+        "CODEX_REVIEW_LOOP_FAKE_NULL_USAGE",
+        "CODEX_REVIEW_LOOP_FAKE_HANG_MS",
+        "CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA"
+    ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
+}
+
+Describe "Unattended process reliability boundaries" -Tags @("Process") {
     BeforeEach {
-        & (Get-Module CodexReviewLoop) {
-            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
-        }
-        $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Path $caseRoot | Out-Null
-        $repo = New-ReliabilityRepo -Path (Join-Path $caseRoot "repo")
-        $logRoot = Join-Path $caseRoot "logs"
-        $configPath = New-ReliabilityConfig -Path (Join-Path $caseRoot "profile.psd1") `
-            -RepoPath $repo -LogRoot $logRoot
-        $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
-        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_STDERR = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_THREAD = "reliability-thread"
-        $env:CODEX_REVIEW_LOOP_FAKE_COMMAND_EXIT_CODE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_COMMAND_OUTPUT = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_NULL_USAGE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_HANG_MS = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = ""
+        $case = New-ReliabilityTestCase
+        $caseRoot = $case.Root
+        $repo = $case.Repo
+        $logRoot = $case.LogRoot
+        $configPath = $case.ConfigPath
     }
 
     AfterEach {
-        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
-        @(
-            "CODEX_REVIEW_LOOP_FAKE_LOG",
-            "CODEX_REVIEW_LOOP_FAKE_RESULT",
-            "CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE",
-            "CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE",
-            "CODEX_REVIEW_LOOP_FAKE_EXIT_CODE",
-            "CODEX_REVIEW_LOOP_FAKE_STDERR",
-            "CODEX_REVIEW_LOOP_FAKE_THREAD",
-            "CODEX_REVIEW_LOOP_FAKE_COMMAND_EXIT_CODE",
-            "CODEX_REVIEW_LOOP_FAKE_COMMAND_OUTPUT",
-            "CODEX_REVIEW_LOOP_FAKE_NULL_USAGE",
-            "CODEX_REVIEW_LOOP_FAKE_HANG_MS",
-            "CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA"
-        ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
+        Clear-ReliabilityTestCase
     }
 
     It "ignores personal config for exec and resume" {
@@ -551,6 +580,22 @@ Describe "Unattended reliability boundaries" {
         $observed.ExitCode | Should Be 0
         $observed.Stdout.Length | Should BeLessThan 65537
         (Get-Item -LiteralPath $stdoutPath).Length | Should BeGreaterThan 500000
+    }
+
+}
+
+Describe "Unattended Git and recovery reliability boundaries" `
+    -Tags @("GitSafety", "GitSafetyA") {
+    BeforeEach {
+        $case = New-ReliabilityTestCase
+        $caseRoot = $case.Root
+        $repo = $case.Repo
+        $logRoot = $case.LogRoot
+        $configPath = $case.ConfigPath
+    }
+
+    AfterEach {
+        Clear-ReliabilityTestCase
     }
 
     It "executes an arbitrary structured targeted test" {
@@ -1262,6 +1307,22 @@ Changes:
         $result.Success | Should Be $true
         (& git -C $repo rev-parse HEAD) | Should Be $before
         (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status | Should Be "resolved"
+    }
+
+}
+
+Describe "Unattended Git and recovery reliability boundaries 2" `
+    -Tags @("GitSafety", "GitSafetyB") {
+    BeforeEach {
+        $case = New-ReliabilityTestCase
+        $caseRoot = $case.Root
+        $repo = $case.Repo
+        $logRoot = $case.LogRoot
+        $configPath = $case.ConfigPath
+    }
+
+    AfterEach {
+        Clear-ReliabilityTestCase
     }
 
     It "completes a no-op lessons-learned resolution without counting a commit" {
