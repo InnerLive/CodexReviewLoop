@@ -83,6 +83,9 @@ function Write-ReliabilityJsonArray {
 
 Describe "Unattended reliability boundaries" {
     BeforeEach {
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
         $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         $repo = New-ReliabilityRepo -Path (Join-Path $caseRoot "repo")
@@ -104,6 +107,7 @@ Describe "Unattended reliability boundaries" {
     }
 
     AfterEach {
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         @(
             "CODEX_REVIEW_LOOP_FAKE_LOG",
             "CODEX_REVIEW_LOOP_FAKE_RESULT",

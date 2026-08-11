@@ -170,6 +170,16 @@ function New-CodexProcessStartInfo {
     return $info
 }
 
+function Invoke-ReviewLoopRetryDelay {
+    param([ValidateRange(0, 60)][int]$Seconds)
+
+    if ($null -ne $script:ReviewLoopRetryDelayOverride) {
+        & $script:ReviewLoopRetryDelayOverride $Seconds
+        return
+    }
+    Start-Sleep -Seconds $Seconds
+}
+
 function Test-CodexStructuredResult {
     param(
         [Parameter(Mandatory = $true)][string]$ResultPath,
@@ -1102,6 +1112,6 @@ $Prompt
             }
         }
         Write-ReviewLoopStatus -Message "${Role}: $failureKind; retrying in ${delay}s$(if (-not [string]::IsNullOrWhiteSpace($lastThreadId)) { ' on the same thread' } else { '' })." -Kind Warning
-        Start-Sleep -Seconds $delay
+        Invoke-ReviewLoopRetryDelay -Seconds $delay
     }
 }

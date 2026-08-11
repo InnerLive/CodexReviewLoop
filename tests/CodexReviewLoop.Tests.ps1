@@ -756,6 +756,28 @@ Describe "Global CLI arguments" {
     It "requires a thread id for resume" {
         (Test-Throws { Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Mode Resume }) | Should Be $true
     }
+
+    It "keeps retry delays private and preserves the exponential schedule" {
+        ((Get-Command Invoke-CodexCliRole).Parameters.Keys -contains "RetryDelay") |
+            Should Be $false
+        $delays = [System.Collections.Generic.List[int]]::new()
+        & (Get-Module CodexReviewLoop) {
+            param($observed)
+            $script:ReviewLoopRetryDelayOverride = {
+                param([int]$seconds)
+                [void]$observed.Add($seconds)
+            }
+            try {
+                Invoke-ReviewLoopRetryDelay -Seconds 2
+                Invoke-ReviewLoopRetryDelay -Seconds 4
+                Invoke-ReviewLoopRetryDelay -Seconds 8
+            }
+            finally {
+                $script:ReviewLoopRetryDelayOverride = $null
+            }
+        } $delays
+        @($delays) | Should Be @(2, 4, 8)
+    }
 }
 
 Describe "Finding identity and ledger" {
@@ -1173,6 +1195,9 @@ Describe "Run state" {
 
 Describe "Fake Codex integration" {
     BeforeEach {
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
         $repo = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))) -Force
         $logRoot = Join-Path $TestDrive "logs"
         $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $TestDrive ("calls-{0}.jsonl" -f ([Guid]::NewGuid().ToString("N")))
@@ -1192,6 +1217,7 @@ Describe "Fake Codex integration" {
     }
 
     AfterEach {
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_LOG -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_RESULT -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_EXIT_CODE -ErrorAction SilentlyContinue
@@ -2167,6 +2193,9 @@ Return the decision in the supplied structured format.
 
 Describe "End-to-end orchestration with fake Codex" {
     BeforeEach {
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
         $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
@@ -2184,6 +2213,7 @@ Describe "End-to-end orchestration with fake Codex" {
     }
 
     AfterEach {
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         @(
             "CODEX_REVIEW_LOOP_FAKE_LOG",
             "CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE",
