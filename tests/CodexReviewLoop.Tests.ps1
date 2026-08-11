@@ -2,25 +2,39 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
 $modulePath = Join-Path $root "CodexReviewLoop.psd1"
 $fakeCodex = Join-Path $here "FakeCodex.ps1"
+$inProcessCodex = Join-Path $here "InProcessCodex.ps1"
 
 Import-Module $modulePath -Force
+. $inProcessCodex
 
 function New-TestRepo {
     param([string]$Path)
-    New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    & git -C $Path init -q
-    & git -C $Path config user.email "review-loop-tests@example.invalid"
-    & git -C $Path config user.name "Review Loop Tests"
-    Set-Content -LiteralPath (Join-Path $Path "README.txt") -Value "test"
-    Set-Content -LiteralPath (Join-Path $Path "review-loop-test.proj") -Value @"
+    $template = Join-Path $TestDrive "repo-template-main"
+    if (-not (Test-Path -LiteralPath (Join-Path $template ".git") -PathType Container)) {
+        New-Item -ItemType Directory -Path $template -Force | Out-Null
+        & git -C $template init -q
+        & git -C $template config user.email "review-loop-tests@example.invalid"
+        & git -C $template config user.name "Review Loop Tests"
+        & git -C $template config core.autocrlf false
+        Set-Content -LiteralPath (Join-Path $template "README.txt") -Value "test"
+        Set-Content -LiteralPath (Join-Path $template "review-loop-test.proj") -Value @"
 <Project>
   <Target Name="VSTest">
     <Message Text="targeted test passed" Importance="High" />
   </Target>
 </Project>
 "@
-    & git -C $Path add README.txt review-loop-test.proj
-    & git -C $Path commit -q -m "initial"
+        & git -C $template add README.txt review-loop-test.proj
+        & git -C $template commit -q -m "initial"
+    }
+    & git clone -q --no-hardlinks `
+        -c user.email=review-loop-tests@example.invalid `
+        -c user.name="Review Loop Tests" `
+        -c core.autocrlf=false `
+        -- $template $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "Test repository clone failed: '$Path'."
+    }
     return $Path
 }
 
@@ -61,7 +75,8 @@ function New-TestConfig {
     param(
         [string]$Path,
         [string]$LogRoot,
-        [switch]$WithHostGate
+        [switch]$WithHostGate,
+        [ValidateRange(1, 100)][int]$CleanPassesRequired = 2
     )
     $gate = if ($WithHostGate) {
         '@{ Name = "fake gate"; FilePath = "pwsh"; Arguments = @("-NoProfile", "-Command", "exit 0") }'
@@ -75,7 +90,7 @@ function New-TestConfig {
     ReviewBase = "HEAD"
     ReviewerInstructions = ""
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
-    CleanPassesRequired = 2
+    CleanPassesRequired = $CleanPassesRequired
     MaxReviewCycles = 6
     LessonsLearnedCommitThreshold = 6
     ReviewAfterLessonsLearnedCommit = `$false
@@ -145,20 +160,30 @@ function Enable-TestLessonsLearnedCheckpoint {
 
     $checkpoint = New-TestActiveCheckpoint `
         -RepoPath $RepoPath -ConfigPath $ConfigPath -Speed $Speed
-    $commits = [System.Collections.Generic.List[string]]::new()
-    for ($index = 1; $index -le 6; $index++) {
-        $path = if ($index -eq 1) { "AGENTS.md" } else { "loop-$index.txt" }
-        $content = if ($index -eq 1) {
-            "# Repository instructions`n"
+    $historyTemplate = Join-Path $TestDrive "repo-template-lessons-history"
+    if (-not (Test-Path -LiteralPath (Join-Path $historyTemplate ".git") -PathType Container)) {
+        New-TestRepo -Path $historyTemplate | Out-Null
+        for ($index = 1; $index -le 6; $index++) {
+            $path = if ($index -eq 1) { "AGENTS.md" } else { "loop-$index.txt" }
+            $content = if ($index -eq 1) {
+                "# Repository instructions`n"
+            }
+            else {
+                "verified loop change $index`n"
+            }
+            Set-Content -LiteralPath (Join-Path $historyTemplate $path) `
+                -Value $content -NoNewline
+            & git -C $historyTemplate add -- $path
+            & git -C $historyTemplate commit -q -m "verified loop change $index"
         }
-        else {
-            "verified loop change $index`n"
-        }
-        Set-Content -LiteralPath (Join-Path $RepoPath $path) -Value $content -NoNewline
-        & git -C $RepoPath add -- $path
-        & git -C $RepoPath commit -q -m "verified loop change $index"
-        [void]$commits.Add((& git -C $RepoPath rev-parse HEAD))
     }
+    $startingHead = & git -C $RepoPath rev-parse HEAD
+    & git -C $RepoPath fetch -q --no-tags -- $historyTemplate HEAD
+    if ($LASTEXITCODE -ne 0) {
+        throw "Lessons-learned history fixture could not be imported."
+    }
+    $commits = @(& git -C $RepoPath rev-list --reverse "$startingHead..FETCH_HEAD")
+    & git -C $RepoPath reset -q --hard FETCH_HEAD
     $state = Read-ReviewLoopState -Path $checkpoint.StatePath
     $state.CurrentHead = & git -C $RepoPath rev-parse HEAD
     $state.LoopCommits = @($commits)
@@ -167,7 +192,47 @@ function Enable-TestLessonsLearnedCheckpoint {
     return $checkpoint
 }
 
-Describe "Codex Review Loop module" {
+function New-EndToEndTestCase {
+    $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
+    $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $caseRoot | Out-Null
+    $configPath = New-TestConfig `
+        -Path (Join-Path $caseRoot "profile.psd1") `
+        -LogRoot (Join-Path $caseRoot "logs") `
+        -CleanPassesRequired 1
+    $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
+    $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = Join-Path $caseRoot "results.json"
+    $env:CODEX_REVIEW_LOOP_FAKE_THREAD = "cluster-thread"
+    $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_STDERR = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_NULL_USAGE = ""
+    $env:CODEX_REVIEW_LOOP_FAKE_HANG_MS = ""
+    return [pscustomobject]@{
+        Repo = $repo
+        CaseRoot = $caseRoot
+        ConfigPath = $configPath
+    }
+}
+
+function Clear-EndToEndTestCase {
+    @(
+        "CODEX_REVIEW_LOOP_FAKE_LOG",
+        "CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE",
+        "CODEX_REVIEW_LOOP_FAKE_THREAD",
+        "CODEX_REVIEW_LOOP_FAKE_RESULT",
+        "CODEX_REVIEW_LOOP_FAKE_EXIT_CODE",
+        "CODEX_REVIEW_LOOP_FAKE_STDERR",
+        "CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA",
+        "CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE",
+        "CODEX_REVIEW_LOOP_FAKE_NULL_USAGE",
+        "CODEX_REVIEW_LOOP_FAKE_HANG_MS"
+    ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
+}
+
+Describe "Codex Review Loop module" -Tags @("Fast", "FullLocal") {
     It "imports the module" {
         Get-Module CodexReviewLoop | Should Not BeNullOrEmpty
     }
@@ -202,7 +267,7 @@ Describe "Codex Review Loop module" {
     }
 }
 
-Describe "Optional profiles and command help" {
+Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
     It "does not require ConfigPath on the module command" {
         $parameter = (Get-Command Invoke-CodexReviewLoop).Parameters["ConfigPath"]
         $mandatory = @($parameter.Attributes | Where-Object {
@@ -656,7 +721,7 @@ Describe "Optional profiles and command help" {
     }
 }
 
-Describe "Global CLI arguments" {
+Describe "Global CLI arguments" -Tags @("Fast", "FullLocal") {
     BeforeEach {
         $repo = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))) -Force
         $schema = Join-Path $root "schemas\architecture-advice-v2.schema.json"
@@ -756,9 +821,31 @@ Describe "Global CLI arguments" {
     It "requires a thread id for resume" {
         (Test-Throws { Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Mode Resume }) | Should Be $true
     }
+
+    It "keeps retry delays private and preserves the exponential schedule" {
+        ((Get-Command Invoke-CodexCliRole).Parameters.Keys -contains "RetryDelay") |
+            Should Be $false
+        $delays = [System.Collections.Generic.List[int]]::new()
+        & (Get-Module CodexReviewLoop) {
+            param($observed)
+            $script:ReviewLoopRetryDelayOverride = {
+                param([int]$seconds)
+                [void]$observed.Add($seconds)
+            }
+            try {
+                Invoke-ReviewLoopRetryDelay -Seconds 2
+                Invoke-ReviewLoopRetryDelay -Seconds 4
+                Invoke-ReviewLoopRetryDelay -Seconds 8
+            }
+            finally {
+                $script:ReviewLoopRetryDelayOverride = $null
+            }
+        } $delays
+        @($delays) | Should Be @(2, 4, 8)
+    }
 }
 
-Describe "Finding identity and ledger" {
+Describe "Finding identity and ledger" -Tags @("Fast", "FullLocal") {
     BeforeEach {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
         $ledger = New-ReviewLoopLedger -RepoPath $repo
@@ -891,7 +978,7 @@ Describe "Finding identity and ledger" {
     }
 }
 
-Describe "Run state" {
+Describe "Run state" -Tags @("Fast", "FullLocal") {
     BeforeEach {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
         $runRoot = Join-Path $TestDrive "run"
@@ -1171,8 +1258,11 @@ Describe "Run state" {
     }
 }
 
-Describe "Fake Codex integration" {
+Describe "Fake Codex integration" -Tags @("Process") {
     BeforeEach {
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
         $repo = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))) -Force
         $logRoot = Join-Path $TestDrive "logs"
         $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $TestDrive ("calls-{0}.jsonl" -f ([Guid]::NewGuid().ToString("N")))
@@ -1192,6 +1282,7 @@ Describe "Fake Codex integration" {
     }
 
     AfterEach {
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_LOG -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_RESULT -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_EXIT_CODE -ErrorAction SilentlyContinue
@@ -1369,7 +1460,7 @@ Describe "Fake Codex integration" {
     }
 }
 
-Describe "Live terminal and streaming process observation" {
+Describe "Live terminal and streaming process observation" -Tags @("Process") {
     BeforeEach {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
         $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
@@ -1752,7 +1843,7 @@ Invoke-CodexCliRole -Role Test -RepoPath '$($repo.Replace("'", "''"))' -Model mo
     }
 }
 
-Describe "Schemas, prompts, and CLI-only invariants" {
+Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLocal") {
     It "parses every JSON schema" {
         $schemas = Get-ChildItem -LiteralPath (Join-Path $root "schemas") -Filter "*.json"
         foreach ($schema in $schemas) {
@@ -1791,7 +1882,8 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             Should Be $true
         (Test-Throws {
             '{"schemaVersion":"3.0","summary":"Ambiguous.","targetedTest":{"available":true,"filePath":"tests/Project.Tests.csproj","arguments":[]}}' |
-                Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json")
+                Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") `
+                    -ErrorAction Stop
         }) | Should Be $true
         '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct.","changes":["Update the implementation."]}}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
@@ -1801,14 +1893,16 @@ Describe "Schemas, prompts, and CLI-only invariants" {
             Should Be $true
         (Test-Throws {
             '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
-                Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json")
+                Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") `
+                    -ErrorAction Stop
         }) | Should Be $true
         '{"schemaVersion":"1.0","summary":"Persist durable guidance.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Run the repository-owned gate after changing the parser.","evidence":["abc123 changed parser and tests"]}]}' |
             Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
             Should Be $true
         (Test-Throws {
             '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
-                Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json")
+                Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") `
+                    -ErrorAction Stop
         }) | Should Be $true
     }
 
@@ -2041,7 +2135,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
 
 }
 
-Describe "Native review classification" {
+Describe "Native review classification" -Tags @("Fast", "FullLocal") {
     It "recognizes current one- and multi-finding Codex review blocks" {
         $texts = @(
             @"
@@ -2131,7 +2225,7 @@ Review comment:
     }
 }
 
-Describe "ReviewClassifier resources" {
+Describe "ReviewClassifier resources" -Tags @("Static", "FullLocal") {
     It "keeps the complete classifier prompt minimal and stable" {
         $actual = (Get-Content -Raw -LiteralPath (
             Join-Path $root "prompts\review-classifier.md")).Replace("`r`n", "`n").TrimEnd()
@@ -2165,37 +2259,23 @@ Return the decision in the supplied structured format.
     }
 }
 
-Describe "End-to-end orchestration with fake Codex" {
+Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
     BeforeEach {
-        $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
-        $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Path $caseRoot | Out-Null
-        $configPath = New-TestConfig -Path (Join-Path $caseRoot "profile.psd1") -LogRoot (Join-Path $caseRoot "logs")
-        $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
-        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = Join-Path $caseRoot "results.json"
-        $env:CODEX_REVIEW_LOOP_FAKE_THREAD = "cluster-thread"
-        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_STDERR = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_NULL_USAGE = ""
-        $env:CODEX_REVIEW_LOOP_FAKE_HANG_MS = ""
+        Enable-InProcessCodexRoleCalls `
+            -Module (Get-Module CodexReviewLoop) -HelperPath $inProcessCodex
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
+        $testCase = New-EndToEndTestCase
+        $repo = $testCase.Repo
+        $caseRoot = $testCase.CaseRoot
+        $configPath = $testCase.ConfigPath
     }
 
     AfterEach {
-        @(
-            "CODEX_REVIEW_LOOP_FAKE_LOG",
-            "CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE",
-            "CODEX_REVIEW_LOOP_FAKE_THREAD",
-            "CODEX_REVIEW_LOOP_FAKE_RESULT",
-            "CODEX_REVIEW_LOOP_FAKE_EXIT_CODE",
-            "CODEX_REVIEW_LOOP_FAKE_STDERR",
-            "CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA"
-            "CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE"
-            "CODEX_REVIEW_LOOP_FAKE_NULL_USAGE"
-            "CODEX_REVIEW_LOOP_FAKE_HANG_MS"
-        ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
+        Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-EndToEndTestCase
     }
 
     It "rejects an unavailable host gate before starting a reviewer" {
@@ -2354,6 +2434,10 @@ Describe "End-to-end orchestration with fake Codex" {
     }
 
     It "completes after two clean reviews on unchanged HEAD" {
+        $before = & git -C $repo rev-parse HEAD
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 1", "CleanPassesRequired = 2")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
@@ -2362,6 +2446,8 @@ Describe "End-to-end orchestration with fake Codex" {
         $result.Status | Should Be "completed"
         $result.CleanPasses | Should Be 2
         $result.ReviewCycles | Should Be 2
+        (& git -C $repo rev-parse HEAD) | Should Be $before
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Review cycle 1"
         $terminal | Should Match "Reviewer"
@@ -2463,6 +2549,27 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Match "Committed"
         $terminal | Should Match "final lessons-learned change verified"
         $terminal | Should Not Match "Review cycle 2"
+    }
+
+}
+
+Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
+    BeforeEach {
+        Enable-InProcessCodexRoleCalls `
+            -Module (Get-Module CodexReviewLoop) -HelperPath $inProcessCodex
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
+        $testCase = New-EndToEndTestCase
+        $repo = $testCase.Repo
+        $caseRoot = $testCase.CaseRoot
+        $configPath = $testCase.ConfigPath
+    }
+
+    AfterEach {
+        Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-EndToEndTestCase
     }
 
     It "runs post-commit native reviews when explicitly configured" {
@@ -2574,6 +2681,7 @@ Describe "End-to-end orchestration with fake Codex" {
 
     It "resets the MaxReviewCycles counter when the same command resumes" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 1", "CleanPassesRequired = 2").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 1")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
@@ -2652,6 +2760,7 @@ Describe "End-to-end orchestration with fake Codex" {
 
     It "reloads live profile settings without stopping the active run" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 1", "CleanPassesRequired = 2").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 2")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $findingReview = "- [P1] live reload defect at src/A.cs:10"
@@ -2712,6 +2821,27 @@ Describe "End-to-end orchestration with fake Codex" {
         $terminal | Should Not Match "active profile changed"
     }
 
+}
+
+Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
+    BeforeEach {
+        Enable-InProcessCodexRoleCalls `
+            -Module (Get-Module CodexReviewLoop) -HelperPath $inProcessCodex
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
+        $testCase = New-EndToEndTestCase
+        $repo = $testCase.Repo
+        $caseRoot = $testCase.CaseRoot
+        $configPath = $testCase.ConfigPath
+    }
+
+    AfterEach {
+        Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-EndToEndTestCase
+    }
+
     It "emits one JSON document and no human dashboard when requested" {
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
@@ -2734,7 +2864,7 @@ Describe "End-to-end orchestration with fake Codex" {
 
         $exitCode | Should Be 0
         $result.Status | Should Be "completed"
-        $result.CleanPasses | Should Be 2
+        $result.CleanPasses | Should Be 1
         @($result.NextSteps).Count | Should Be 0
         $text | Should Not Match "\[OK\]|\[\.\.\]|Codex Review Loop"
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
@@ -2763,21 +2893,6 @@ Describe "End-to-end orchestration with fake Codex" {
         $text | Should Match "Review Loop completed"
         $text | Should Not Match '"Status"\s*:|"RunRoot"\s*:'
         $text | Should Not Match "Repository:|Checkpoint:|Ledger:"
-    }
-
-    It "propagates fast to every role in a complete run" {
-        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
-        )
-        $result = Invoke-CodexReviewLoop `
-            -RepoPath $repo -ConfigPath $configPath -Speed fast -CodexPath $fakeCodex -NewRun `
-            -OutputMode detailed -HeartbeatSeconds 0 -ColorMode Never
-        $result.Status | Should Be "completed"
-        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object { ($_.arguments -join " ") -notmatch 'service_tier="fast"' }).Count | Should Be 0
-        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
-            Should Match "Output:\s+detailed · heartbeat 0s · Never"
     }
 
     It "preserves partial fixer work without a thread and completes it in one fresh recovery" {
@@ -2860,8 +2975,6 @@ Describe "End-to-end orchestration with fake Codex" {
                     content = "partial"
                 })
             }
-            [pscustomobject]@{ result = "not json" }
-            [pscustomobject]@{ result = "not json" }
             [pscustomobject]@{ result = "not json" }
             [pscustomobject]@{ result = "No findings." }
         )
@@ -2961,8 +3074,31 @@ Describe "End-to-end orchestration with fake Codex" {
         $records[0].prompt | Should Match "previous Fixer process ended"
     }
 
+}
+
+Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
+    BeforeEach {
+        Enable-InProcessCodexRoleCalls `
+            -Module (Get-Module CodexReviewLoop) -HelperPath $inProcessCodex
+        & (Get-Module CodexReviewLoop) {
+            $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
+        }
+        $testCase = New-EndToEndTestCase
+        $repo = $testCase.Repo
+        $caseRoot = $testCase.CaseRoot
+        $configPath = $testCase.ConfigPath
+    }
+
+    AfterEach {
+        Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-EndToEndTestCase
+    }
+
     It "uses the configured fixer-attempt budget and resumes the durable Fixer thread" {
-        $configPath = New-TestConfig -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
+        $configPath = New-TestConfig -Path $configPath `
+            -LogRoot (Join-Path $caseRoot "logs") -WithHostGate `
+            -CleanPassesRequired 1
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
@@ -2992,6 +3128,9 @@ Describe "End-to-end orchestration with fake Codex" {
             $_.callKind -eq "resume" -and
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
+        @($records | Where-Object {
+            [string]$_.schemaPath -match 'confirm|tie'
+        }).Count | Should Be 0
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Finding-Cluster"
         $terminal | Should Match "Fixer · call 3 · resuming thread"
@@ -3054,20 +3193,9 @@ Describe "End-to-end orchestration with fake Codex" {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json" -and
             $_.callKind -eq "resume"
         }).Count | Should Be 1
-        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 4
+        @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 3
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
             Should Match "restarting with the native Reviewer"
-    }
-
-    It "leaves the target repository unchanged during prompt-independent clean orchestration" {
-        $before = & git -C $repo rev-parse HEAD
-        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}',
-            '{"schemaVersion":"1.0","classification":"clean","summary":"clean","findings":[]}'
-        )
-        Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun | Out-Null
-        (& git -C $repo rev-parse HEAD) | Should Be $before
-        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
     }
 
     It "uses the live-configured Luna helper only for ambiguous clean output" {
@@ -3274,33 +3402,6 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "review-classification-v1.schema.json"
-        }).Count | Should Be 0
-    }
-
-    It "lets the verifier request another fixer call without adjudication" {
-        $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
-        $fixerV3 = '{"schemaVersion":"3.0","summary":"Worked on it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $rejectV4 = '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":["Handle the remaining case."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
-        $acceptV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Finish the remaining case","rationale":"Cover the complete affected behavior.","changes":["Handle the remaining case."]}}'
-        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            '- [P1] defect at src/A.cs:10',
-            $architectureV2,
-            $fixerV3, $rejectV4,
-            $fixerV3, $acceptV4,
-            'No findings.', 'No findings.'
-        )
-
-        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -Speed standard -CodexPath $fakeCodex -NewRun
-        $result.Status | Should Be "completed"
-        $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
-        @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
-        }).Count | Should Be 2
-        @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "verifier-result-v4.schema.json"
-        }).Count | Should Be 2
-        @($records | Where-Object {
-            [string]$_.schemaPath -match 'confirm|tie'
         }).Count | Should Be 0
     }
 

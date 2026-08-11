@@ -2387,7 +2387,7 @@ function Invoke-ReviewLoopLessonsLearnedGate {
             -State $State -RepoPath $RepoPath
     }
     $headKey = if ($head.Length -gt 10) { $head.Substring(0, 10) } else { $head }
-    $call = Invoke-ConfiguredCodexRole `
+    $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "LessonsLearned" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot `
         -SchemaName "lessons-learned-v1.schema.json" `

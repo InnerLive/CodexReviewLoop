@@ -59,6 +59,18 @@ Optimize in this order:
 
 Run from the repository root with PowerShell 7.
 
+Run the fast state and orchestration-independent iteration suite:
+
+```powershell
+pwsh -NoProfile -File .\tests\Invoke-TestSuites.ps1 -Mode Fast
+```
+
+Run the complete partitioned suite, including process and recovery boundaries:
+
+```powershell
+pwsh -NoProfile -File .\tests\Invoke-TestSuites.ps1 -Mode Full
+```
+
 Show public help without starting a run:
 
 ```powershell
