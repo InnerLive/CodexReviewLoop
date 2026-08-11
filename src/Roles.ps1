@@ -153,6 +153,33 @@ function ConvertFrom-ReviewLoopRoleCallRecord {
     }
 }
 
+function Invoke-ReviewLoopRoleCall {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Speed,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
+        [Parameter(Mandatory = $true)][string]$LogRoot,
+        [string]$SchemaName = "",
+        [ValidateSet("Exec", "Resume", "Review")][string]$Mode = "Exec",
+        [string]$ThreadId = "",
+        [string]$ReviewBase = "",
+        [string]$CodexPath = "",
+        [string]$CallId = "",
+        [object]$State = $null,
+        [string]$StatePath = ""
+    )
+
+    $override = Get-Variable -Name ReviewLoopRoleCallOverride `
+        -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $override) {
+        return & $override @PSBoundParameters
+    }
+    return Invoke-ConfiguredCodexRole @PSBoundParameters
+}
+
 function Invoke-ConfiguredCodexRole {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -562,7 +589,7 @@ function Invoke-ReviewLoopReview {
     if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
         throw "The worktree changed before the reviewer started."
     }
-    $call = Invoke-ConfiguredCodexRole `
+    $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Reviewer" -RepoPath $RepoPath -Speed $Speed `
         -Prompt "" -LogRoot $RunRoot `
         -Mode Review -ReviewBase ([string]$State.ReviewBase) `
@@ -607,7 +634,7 @@ function Invoke-ReviewLoopReview {
         $classifierPrompt = Get-ReviewLoopPrompt -Name "review-classifier.md" -Values @{
             REVIEW_OUTPUT = $reviewText
         }
-        $classifierCall = Invoke-ConfiguredCodexRole `
+        $classifierCall = Invoke-ReviewLoopRoleCall `
             -Config $Config -Role "ReviewClassifier" -RepoPath $RepoPath -Speed $Speed `
             -Prompt $classifierPrompt -LogRoot $RunRoot `
             -SchemaName "review-classification-v1.schema.json" `
@@ -693,7 +720,7 @@ function Invoke-ReviewLoopArchitect {
         HISTORY = ConvertTo-ReviewLoopJsonCompact @(
             Get-ReviewLoopRecentHistory -Ledger $Ledger -Limit 50)
     }
-    $call = Invoke-ConfiguredCodexRole `
+    $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot -SchemaName "architecture-advice-v2.schema.json" `
         -CodexPath $CodexPath `
@@ -736,7 +763,7 @@ function Invoke-ReviewLoopFixer {
     else {
         "$($State.ActiveClusterId)-c$($State.ReviewCycle)-fix-a$Attempt-c$Correction"
     }
-    return Invoke-ConfiguredCodexRole `
+    return Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Fixer" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot -SchemaName "fixer-result-v3.schema.json" `
         -Mode $mode -ThreadId $ThreadId -CodexPath $CodexPath `
@@ -769,7 +796,7 @@ function Invoke-ReviewLoopVerifier {
             -Object $State.LastFixerResult -Name "Correction" -Default 0))"
     }
     $verificationKey = (Get-ReviewLoopSha256 $fixerCallId).Substring(0, 12)
-    $call = Invoke-ConfiguredCodexRole `
+    $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Verifier" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v4.schema.json" `
         -CodexPath $CodexPath `

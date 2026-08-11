@@ -173,8 +173,10 @@ function New-CodexProcessStartInfo {
 function Invoke-ReviewLoopRetryDelay {
     param([ValidateRange(0, 60)][int]$Seconds)
 
-    if ($null -ne $script:ReviewLoopRetryDelayOverride) {
-        & $script:ReviewLoopRetryDelayOverride $Seconds
+    $override = Get-Variable -Name ReviewLoopRetryDelayOverride `
+        -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $override) {
+        & $override $Seconds
         return
     }
     Start-Sleep -Seconds $Seconds
