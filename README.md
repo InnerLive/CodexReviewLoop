@@ -62,6 +62,8 @@ value wins, and `-ReviewerInstructions ''` disables the profile value.
 
 The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
 when you deliberately want a fresh run; the finding ledger is retained.
+Resume inherits the checkpoint's service tier unless `-Speed standard|fast` is
+passed explicitly to change subsequent calls in that same run.
 
 During unattended runs Windows is kept awake without keeping the display on or
 changing update policy. Long-running roles and tests are limited by inactivity,
@@ -75,6 +77,25 @@ machine-readable result document and no terminal dashboard with `-Json`.
 - [How the loop works](docs/how-it-works.md)
 - [Profiles and configuration](docs/configuration.md)
 - [Running, monitoring, and recovery](docs/operations.md)
+
+## Optional global working agreements
+
+The repository includes a small set of reusable Codex working agreements in
+[`docs/smallest-complete-work.md`](docs/smallest-complete-work.md). Install or
+refresh them at the beginning of your global `AGENTS.md` with either script:
+
+```powershell
+pwsh -File .\install-global-agents.ps1
+```
+
+```bash
+bash ./install-global-agents.sh
+```
+
+The installers use `$CODEX_HOME/AGENTS.md` when `CODEX_HOME` is set and
+`~/.codex/AGENTS.md` otherwise. They preserve other content, update their
+managed block without duplicating it, and warn when a non-empty global
+`AGENTS.override.md` prevents Codex from loading `AGENTS.md`.
 
 For the complete command reference:
 

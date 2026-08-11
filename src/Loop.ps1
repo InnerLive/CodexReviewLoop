@@ -298,8 +298,8 @@ function Assert-ReviewLoopHostGatePreflight {
 
     foreach ($gate in @($Config.HostGates)) {
         try {
-            $gate.FilePath = Resolve-ReviewLoopHostExecutable `
-                -RepoPath $RepoPath -FilePath ([string]$gate.FilePath)
+            Resolve-ReviewLoopHostExecutable `
+                -RepoPath $RepoPath -FilePath ([string]$gate.FilePath) | Out-Null
         }
         catch {
             throw (New-ReviewLoopFailureException `
@@ -2495,6 +2495,8 @@ function Invoke-ReviewLoopCore {
         [switch]$Json
     )
 
+    $speedExplicitlyBound = $PSBoundParameters.ContainsKey("Speed")
+    $previousSpeed = ""
     Initialize-ReviewLoopConsole `
         -OutputMode $OutputMode `
         -HeartbeatSeconds $HeartbeatSeconds `
@@ -2585,21 +2587,21 @@ function Invoke-ReviewLoopCore {
             -RunRoot $paths.RunRoot
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
-    elseif ([string]$state.Speed -ne $Speed) {
-        throw (New-ReviewLoopFailureException `
-            -Message "The existing checkpoint was started with speed '$($state.Speed)', but this command selected '$Speed'. A run cannot change speed while it is being resumed." `
-            -NextSteps @(
-                "Resume the existing checkpoint by running the same command with -Speed $($state.Speed)."
-                "To use -Speed $Speed instead, make the worktree clean and start with -Speed $Speed -NewRun."
-            ))
-    }
-
-    if ($resumed) {
+    else {
         Assert-ReviewLoopResumeInvariant `
             -State $state `
             -RepoPath $repo `
             -ReviewBase ([string]$config.ReviewBase) `
             -SkipHead
+        $checkpointSpeed = [string]$state.Speed
+        if (-not $speedExplicitlyBound) {
+            $Speed = $checkpointSpeed
+        }
+        elseif ($checkpointSpeed -ne $Speed) {
+            $previousSpeed = $checkpointSpeed
+            $state.Speed = $Speed
+            Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        }
     }
     Initialize-ReviewLoopCommitHistory `
         -State $state -StatePath $statePath -RepoPath $repo
@@ -2764,6 +2766,11 @@ function Invoke-ReviewLoopCore {
         Write-ReviewLoopStatus `
             -Message "$($config.Name) · $($state.Branch) · $runMode · $Speed · HEAD $shortHead" `
             -Kind Progress
+    }
+    if (-not [string]::IsNullOrWhiteSpace($previousSpeed)) {
+        Write-ReviewLoopStatus `
+            -Message "Checkpoint speed changed: $previousSpeed -> $Speed. Subsequent role and thread-resume calls use $Speed." `
+            -Kind Warning
     }
     if ($resumedFromFailure -and (Test-ReviewLoopOutputLevel -Minimum balanced)) {
         Write-ReviewLoopStatus -Message "Resuming the previous failed checkpoint at stage '$($state.Stage)'." -Kind Warning

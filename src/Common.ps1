@@ -761,6 +761,144 @@ function Get-ReviewLoopExecutionProfileText {
     return ConvertTo-ReviewLoopFingerprintData -Value $executionSettings
 }
 
+function ConvertTo-ReviewLoopCommandDisplayToken {
+    param([AllowEmptyString()][string]$Value)
+
+    if ($Value.Length -eq 0) {
+        return "''"
+    }
+    if ($Value -match '[\s''"]') {
+        return "'{0}'" -f $Value.Replace("'", "''")
+    }
+    return $Value
+}
+
+function ConvertTo-ReviewLoopHostGateDisplayText {
+    param([Parameter(Mandatory = $true)][object]$Gate)
+
+    $name = [string]$Gate.Name
+    $filePath = [string]$Gate.FilePath
+    $arguments = @($Gate.Arguments)
+    $tokens = @($filePath) + @($arguments | ForEach-Object { [string]$_ })
+    $command = @($tokens | ForEach-Object {
+        ConvertTo-ReviewLoopCommandDisplayToken -Value $_
+    }) -join " "
+    return "${name}: $command"
+}
+
+function Write-ReviewLoopHostGateConfigChange {
+    param(
+        [AllowNull()][object]$Before,
+        [AllowNull()][object]$After
+    )
+
+    Write-ReviewLoopStatus -Message "HostGates:" -Kind Muted -Indent 1
+    foreach ($side in @(
+        [pscustomobject]@{ Name = "Before"; Value = $Before },
+        [pscustomobject]@{ Name = "After"; Value = $After }
+    )) {
+        Write-ReviewLoopStatus -Message "$($side.Name):" -Kind Muted -Indent 2
+        $gates = @($side.Value)
+        if ($gates.Count -eq 0) {
+            Write-ReviewLoopStatus -Message "(none)" -Kind Muted -Indent 3
+            continue
+        }
+        foreach ($gate in $gates) {
+            Write-ReviewLoopStatus `
+                -Message (ConvertTo-ReviewLoopHostGateDisplayText -Gate $gate) `
+                -Kind Muted `
+                -Indent 3
+        }
+    }
+}
+
+function Write-ReviewLoopRoleConfigChange {
+    param(
+        [AllowNull()][object]$Before,
+        [AllowNull()][object]$After
+    )
+
+    $beforeRoles = if ($Before -is [System.Collections.IDictionary]) { $Before } else { @{} }
+    $afterRoles = if ($After -is [System.Collections.IDictionary]) { $After } else { @{} }
+    $roleNames = @(@($beforeRoles.Keys) + @($afterRoles.Keys) | ForEach-Object {
+        [string]$_
+    } | Sort-Object -Unique)
+    $changedRoles = [System.Collections.Generic.List[string]]::new()
+    foreach ($roleName in $roleNames) {
+        $beforeRole = if ($beforeRoles.Contains($roleName)) { $beforeRoles[$roleName] } else { $null }
+        $afterRole = if ($afterRoles.Contains($roleName)) { $afterRoles[$roleName] } else { $null }
+        if ((ConvertTo-ReviewLoopFingerprintData -Value $beforeRole) -eq
+            (ConvertTo-ReviewLoopFingerprintData -Value $afterRole)) {
+            continue
+        }
+        $beforeText = if ($null -eq $beforeRole) {
+            "not configured"
+        }
+        else {
+            "$($beforeRole.Model)/$($beforeRole.Thinking)"
+        }
+        $afterText = if ($null -eq $afterRole) {
+            "not configured"
+        }
+        else {
+            "$($afterRole.Model)/$($afterRole.Thinking)"
+        }
+        [void]$changedRoles.Add("${roleName}: $beforeText -> $afterText")
+    }
+
+    Write-ReviewLoopStatus -Message "Roles:" -Kind Muted -Indent 1
+    if ($changedRoles.Count -eq 0) {
+        Write-ReviewLoopStatus -Message "updated" -Kind Muted -Indent 2
+        return
+    }
+    foreach ($change in $changedRoles) {
+        Write-ReviewLoopStatus -Message $change -Kind Muted -Indent 2
+    }
+}
+
+function Write-ReviewLoopLiveConfigChanges {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Changes
+    )
+
+    if ($Changes.Count -eq 0) {
+        return
+    }
+    Write-ReviewLoopStatus -Message "Reloaded live profile settings" -Kind Info
+    foreach ($change in $Changes) {
+        $name = [string]$change.Name
+        switch ($name) {
+            "CommitMessagePrefix" {
+                Write-ReviewLoopStatus -Message "CommitMessagePrefix updated" -Kind Muted -Indent 1
+            }
+            "HostGates" {
+                Write-ReviewLoopHostGateConfigChange -Before $change.Before -After $change.After
+            }
+            "Roles" {
+                Write-ReviewLoopRoleConfigChange -Before $change.Before -After $change.After
+            }
+            default {
+                $beforeText = if ($name -eq "AutoCommit") {
+                    if ([bool]$change.Before) { "enabled" } else { "disabled" }
+                }
+                elseif ($null -eq $change.Before) { "not configured" }
+                else { [string]$change.Before }
+                $afterText = if ($name -eq "AutoCommit") {
+                    if ([bool]$change.After) { "enabled" } else { "disabled" }
+                }
+                elseif ($null -eq $change.After) { "not configured" }
+                else { [string]$change.After }
+                Write-ReviewLoopStatus `
+                    -Message "${name}: $beforeText -> $afterText" `
+                    -Kind Muted `
+                    -Indent 1
+            }
+        }
+    }
+}
+
 function Update-ReviewLoopLiveConfig {
     param([Parameter(Mandatory = $true)][hashtable]$Config)
 
@@ -792,26 +930,23 @@ function Update-ReviewLoopLiveConfig {
             ))
     }
 
-    $changes = [System.Collections.Generic.List[string]]::new()
+    $changes = [System.Collections.Generic.List[object]]::new()
     foreach ($key in $script:ReviewLoopLiveConfigKeys) {
-        $before = ConvertTo-ReviewLoopFingerprintData -Value $Config[$key]
-        $after = ConvertTo-ReviewLoopFingerprintData -Value $latest[$key]
-        if ($before -eq $after) {
+        $beforeValue = $Config[$key]
+        $afterValue = $latest[$key]
+        $beforeFingerprint = ConvertTo-ReviewLoopFingerprintData -Value $beforeValue
+        $afterFingerprint = ConvertTo-ReviewLoopFingerprintData -Value $afterValue
+        if ($beforeFingerprint -eq $afterFingerprint) {
             continue
         }
-        $Config[$key] = $latest[$key]
-        if ($key -eq "CommitMessagePrefix") {
-            [void]$changes.Add("CommitMessagePrefix updated")
-        }
-        else {
-            [void]$changes.Add("$key $before -> $after")
-        }
+        $Config[$key] = $afterValue
+        [void]$changes.Add([pscustomobject]@{
+            Name = $key
+            Before = $beforeValue
+            After = $afterValue
+        })
     }
-    if ($changes.Count -gt 0) {
-        Write-ReviewLoopStatus `
-            -Message "Reloaded live profile settings · $($changes -join ' · ')" `
-            -Kind Info
-    }
+    Write-ReviewLoopLiveConfigChanges -Changes $changes.ToArray()
 }
 
 function Get-ReviewLoopExecutionFingerprint {

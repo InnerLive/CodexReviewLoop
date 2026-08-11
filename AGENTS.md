@@ -172,7 +172,8 @@ supported developer-instructions setting.
 - `MaxReviewCycles` limits native reviews per invocation, not the durable run.
   A new invocation resumes with a fresh budget.
 - Durable transitions are atomic and idempotent. Resume must validate the
-  repository, branch, review base, HEAD, speed, and execution fingerprint.
+  repository, branch, review base, HEAD, and execution fingerprint. It inherits
+  checkpoint speed unless the user explicitly changes it.
 
 ## Process and terminal rules
 

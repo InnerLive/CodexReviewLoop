@@ -34,9 +34,11 @@ pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
 | `-Json` | Off | Emit one JSON result document and no human dashboard |
 | `-Help`, `-h` | Off | Show help without creating a profile or run |
 
-`standard` is cost-conscious. `fast` applies to every role and resumed call
-without changing the configured model or reasoning effort. There is no silent
-fallback between speeds.
+`standard` is cost-conscious. `fast` changes the service tier without changing
+the configured model or reasoning effort. A resumed checkpoint inherits its
+recorded speed when `-Speed` is omitted, so there is no silent fallback. Passing
+`-Speed` explicitly changes the same checkpoint for subsequent role and
+thread-resume calls.
 
 ## Unattended access
 
@@ -83,9 +85,11 @@ should never be placed in model-visible command output.
 ## Resume and `-NewRun`
 
 Running the same command resumes the latest compatible checkpoint by default.
-Resume requires the same repository, branch, symbolic review base, `HEAD`, and
-speed. The base commit recorded at run start remains pinned and must still
-exist. If the invocation used `-ReviewerInstructions`, pass the same value again
+Resume requires the same repository, branch, symbolic review base, and `HEAD`.
+The base commit recorded at run start remains pinned and must still exist. The
+recorded speed is inherited unless an explicit `-Speed standard|fast` selects a
+new speed for subsequent calls in the same checkpoint. If the invocation used
+`-ReviewerInstructions`, pass the same value again
 when resuming. Changing or omitting it requalifies existing review and
 clean-pass evidence before the loop can complete.
 
