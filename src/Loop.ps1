@@ -315,10 +315,255 @@ function Assert-ReviewLoopHostGatePreflight {
 function Get-ReviewLoopRepositorySnapshot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
+    $headRef = (& git -C $RepoPath symbolic-ref --quiet HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -notin @(0, 1)) {
+        throw "Git could not inspect the symbolic HEAD reference."
+    }
     return [pscustomobject]@{
         Head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
         Fingerprint = Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath
+        Branch = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+            "branch", "--show-current"
+        )
+        HeadRef = $headRef
     }
+}
+
+function Get-ReviewLoopReviewerRecoveryLocatorPath {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $path = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "--git-path", "codex-review-loop-reviewer-recovery.json"
+    )
+    if (-not [System.IO.Path]::IsPathRooted($path)) {
+        $path = Join-Path $RepoPath $path
+    }
+    return [System.IO.Path]::GetFullPath($path)
+}
+
+function Set-ReviewLoopReviewerRecoveryLocator {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$StatePath
+    )
+
+    Write-ReviewLoopAtomicJson `
+        -Path (Get-ReviewLoopReviewerRecoveryLocatorPath -RepoPath $RepoPath) `
+        -Value ([pscustomobject][ordered]@{
+            SchemaVersion = "1.0"
+            RepoPath = [System.IO.Path]::GetFullPath($RepoPath)
+            StatePath = [System.IO.Path]::GetFullPath($StatePath)
+        })
+}
+
+function Clear-ReviewLoopReviewerRecoveryLocator {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $path = Get-ReviewLoopReviewerRecoveryLocatorPath -RepoPath $RepoPath
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        [System.IO.File]::Delete($path)
+    }
+}
+
+function Get-ReviewLoopReviewerRecoveryStatePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$LogRoot,
+        [Parameter(Mandatory = $true)][string]$ReviewBase
+    )
+
+    $locatorPath = Get-ReviewLoopReviewerRecoveryLocatorPath -RepoPath $RepoPath
+    if (-not (Test-Path -LiteralPath $locatorPath -PathType Leaf)) {
+        return ""
+    }
+    $locator = Read-ReviewLoopJson -Path $locatorPath
+    if ([string](Get-ReviewLoopObjectProperty `
+            -Object $locator -Name "SchemaVersion" -Default "") -ne "1.0") {
+        throw "Reviewer recovery locator has an unsupported schema version."
+    }
+    if (-not (Test-ReviewLoopSamePath `
+            -Left ([string](Get-ReviewLoopObjectProperty `
+                -Object $locator -Name "RepoPath" -Default "")) `
+            -Right $RepoPath)) {
+        throw "Reviewer recovery locator belongs to another repository."
+    }
+
+    $statePath = [string](Get-ReviewLoopObjectProperty `
+        -Object $locator -Name "StatePath" -Default "")
+    if ([string]::IsNullOrWhiteSpace($statePath) -or
+        -not [System.IO.Path]::IsPathRooted($statePath)) {
+        throw "Reviewer recovery locator contains an invalid checkpoint path."
+    }
+    $resolvedLogRoot = [System.IO.Path]::GetFullPath($LogRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+    $resolvedStatePath = [System.IO.Path]::GetFullPath($statePath)
+    $logPrefix = $resolvedLogRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedStatePath.StartsWith(
+            $logPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Reviewer recovery checkpoint is outside the configured LogRoot."
+    }
+    if (-not (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf)) {
+        Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
+        return ""
+    }
+
+    $state = Read-ReviewLoopState -Path $resolvedStatePath
+    $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
+    if (-not (Test-ReviewLoopSamePath -Left ([string]$state.RepoPath) -Right $RepoPath) -or
+        [string]$state.ReviewBase -ne $ReviewBase) {
+        throw "Reviewer recovery checkpoint does not match this repository invocation."
+    }
+    if ($null -eq $active -or [string]$active.Role -ne "Reviewer" -or
+        -not (Test-ReviewLoopStateCanResume -State $state)) {
+        Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
+        return ""
+    }
+    return $resolvedStatePath
+}
+
+function Restore-ReviewLoopReviewerRepository {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Recovery,
+        [AllowNull()][object]$State = $null
+    )
+
+    $expectedCleanFingerprint = Get-ReviewLoopSha256 ""
+    $baselineFingerprint = [string](Get-ReviewLoopObjectProperty `
+        -Object $Recovery -Name "WorktreeFingerprint" -Default "")
+    if ($baselineFingerprint -ne $expectedCleanFingerprint) {
+        throw "Reviewer cleanup requires a checkpoint captured from a clean worktree."
+    }
+    $baselineHead = [string](Get-ReviewLoopObjectProperty `
+        -Object $Recovery -Name "RepositoryHead" -Default "")
+    $verifiedHead = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "--verify", "$baselineHead^{commit}"
+    )
+    if ($verifiedHead -ne $baselineHead) {
+        throw "Reviewer cleanup baseline commit could not be verified."
+    }
+
+    $baselineHeadRef = [string](Get-ReviewLoopObjectProperty `
+        -Object $Recovery -Name "RepositoryHeadRef" -Default "")
+    $baselineBranch = [string](Get-ReviewLoopObjectProperty `
+        -Object $Recovery -Name "RepositoryBranch" -Default "")
+    if ([string]::IsNullOrWhiteSpace($baselineHeadRef) -and
+        -not [string]::IsNullOrWhiteSpace($baselineBranch)) {
+        $baselineHeadRef = "refs/heads/$baselineBranch"
+    }
+    if ([string]::IsNullOrWhiteSpace($baselineHeadRef) -and $null -ne $State) {
+        $legacyBranch = [string](Get-ReviewLoopObjectProperty `
+            -Object $State -Name "Branch" -Default "")
+        if (-not [string]::IsNullOrWhiteSpace($legacyBranch)) {
+            $baselineHeadRef = "refs/heads/$legacyBranch"
+            $baselineBranch = $legacyBranch
+        }
+    }
+
+    $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$current.Head -eq $baselineHead -and
+        [string]$current.Fingerprint -eq $baselineFingerprint -and
+        [string]$current.HeadRef -eq $baselineHeadRef) {
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($baselineHeadRef)) {
+        & git -C $RepoPath check-ref-format $baselineHeadRef 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Reviewer cleanup baseline HEAD reference is invalid: $baselineHeadRef"
+        }
+        $currentRefValue = (& git -C $RepoPath show-ref --verify --hash $baselineHeadRef `
+            2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -notin @(0, 1)) {
+            throw "Git could not inspect the Reviewer cleanup branch reference."
+        }
+        if ($currentRefValue -ne $baselineHead) {
+            $oldValue = if ([string]::IsNullOrWhiteSpace($currentRefValue)) {
+                "0" * $baselineHead.Length
+            }
+            else {
+                $currentRefValue
+            }
+            $output = @(& git -C $RepoPath update-ref $baselineHeadRef `
+                $baselineHead $oldValue 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "Git could not restore the Reviewer branch reference: $($output -join ' ')"
+            }
+        }
+        $output = @(& git -C $RepoPath symbolic-ref HEAD $baselineHeadRef 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not restore the Reviewer symbolic HEAD: $($output -join ' ')"
+        }
+    }
+    else {
+        $output = @(& git -C $RepoPath checkout --detach --force $baselineHead 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not restore the detached Reviewer HEAD: $($output -join ' ')"
+        }
+    }
+
+    $output = @(& git -C $RepoPath reset --hard $baselineHead 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not restore Reviewer tracked or staged changes: $($output -join ' ')"
+    }
+    $output = @(& git -C $RepoPath clean -ffd 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not remove Reviewer untracked paths: $($output -join ' ')"
+    }
+
+    $restored = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$restored.Head -ne $baselineHead -or
+        [string]$restored.HeadRef -ne $baselineHeadRef -or
+        [string]$restored.Fingerprint -ne $baselineFingerprint) {
+        throw "Reviewer cleanup did not restore the exact repository checkpoint."
+    }
+}
+
+function Invoke-ReviewLoopReviewerRepositoryRecovery {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Recovery,
+        [AllowNull()][object]$State = $null
+    )
+
+    try {
+        Restore-ReviewLoopReviewerRepository `
+            -RepoPath $RepoPath -Recovery $Recovery -State $State
+    }
+    catch {
+        throw (New-ReviewLoopFailureException `
+            -Message "Automatic Reviewer cleanup could not restore the saved repository checkpoint: $($_.Exception.Message)" `
+            -NextSteps @(
+                "Inspect the repository and Reviewer logs without editing the checkpoint or recovery locator."
+                "Correct the reported Git or filesystem problem, then run the same command again."
+                "If recovery remains impossible, preserve the run directory before restoring the repository manually."
+            ))
+    }
+}
+
+function Complete-ReviewLoopInterruptedReviewerRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $active = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+    if ($null -eq $active -or [string]$active.Role -ne "Reviewer") {
+        return $false
+    }
+    Invoke-ReviewLoopReviewerRepositoryRecovery `
+        -RepoPath $RepoPath -Recovery $active -State $State
+    $checkpointStage = [string](Get-ReviewLoopObjectProperty `
+        -Object $active -Name "CheckpointStage" -Default "reviewing")
+    if ([string]$State.Stage -eq "stopped") {
+        $State.Stage = $checkpointStage
+    }
+    $State.ActiveRoleCall = $null
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
+    return $true
 }
 
 function Assert-ReviewLoopRepositoryUnchanged {
@@ -2561,10 +2806,22 @@ function Invoke-ReviewLoopCore {
     $resumedFromFailure = $false
     $resumedWithFreshReviewBudget = $false
     if (-not $NewRun) {
-        $active = Get-ReviewLoopLatestActiveStatePath -ProfileRoot $paths.StableProfileRoot
+        $active = Get-ReviewLoopReviewerRecoveryStatePath `
+            -RepoPath $repo `
+            -LogRoot ([string]$config.LogRoot) `
+            -ReviewBase ([string]$config.ReviewBase)
+        if ([string]::IsNullOrWhiteSpace($active)) {
+            $active = Get-ReviewLoopLatestActiveStatePath `
+                -ProfileRoot $paths.StableProfileRoot
+        }
         if (-not [string]::IsNullOrWhiteSpace($active)) {
             $statePath = $active
             $state = Read-ReviewLoopState -Path $statePath
+            $paths = New-ReviewLoopRunPaths `
+                -Config $config `
+                -RepoPath $repo `
+                -Branch ([string]$state.Branch) `
+                -ReviewBaseCommit $resolvedReviewBase
             $paths.RunRoot = Split-Path -Parent $statePath
             $resumed = $true
         }
@@ -2591,6 +2848,9 @@ function Invoke-ReviewLoopCore {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
     else {
+        Complete-ReviewLoopInterruptedReviewerRecovery `
+            -State $state -StatePath $statePath -RepoPath $repo | Out-Null
+        $branch = [string]$state.Branch
         Assert-ReviewLoopResumeInvariant `
             -State $state `
             -RepoPath $repo `

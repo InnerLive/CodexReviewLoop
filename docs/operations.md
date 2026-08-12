@@ -115,6 +115,16 @@ complete. The captured `ReviewAfterLessonsLearnedCommit` value also survives
 resume, so an interruption after the final commit cannot change whether
 post-commit native reviews are required.
 
+An interrupted native Reviewer is recovered before normal branch, `HEAD`, and
+worktree resume checks. Its durable checkpoint restores the branch or detached
+`HEAD`, commit, index, tracked files, and non-ignored untracked paths, then a
+fresh native review starts. A small locator in the repository's Git directory
+allows this checkpoint to be found even if the Reviewer switched branches.
+Successful cleanup is intentionally absent from terminal output. A cleanup
+that cannot reproduce the exact clean checkpoint stops safely and remains
+idempotently resumable. Other local refs, ignored files, and modified submodule
+worktrees are not cleaned automatically.
+
 Use `-NewRun` when you deliberately want a new run checkpoint. It still
 requires a clean worktree, respects the repository lock, and keeps compatible
 finding history. It is not needed to refresh an exhausted Fixer round because

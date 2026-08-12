@@ -43,6 +43,15 @@ output schema. Optional `ReviewerInstructions` are supplied as supplemental
 developer instructions without replacing the native `review --base` workflow.
 Every native review starts fresh; Reviewer threads are deliberately not reused.
 
+The native Reviewer is treated as a repository transaction. Each call starts
+from a clean Git checkpoint. If the Reviewer changes the active branch or
+`HEAD`, the index, tracked files, or non-ignored untracked paths, the loop
+silently restores that exact checkpoint before consuming the review text. A
+successful review remains usable after cleanup. If exact restoration cannot be
+verified, the call is not accepted and the run stops with its recovery
+checkpoint intact. Other analysis roles retain their strict no-mutation
+failure behavior.
+
 The loop first recognizes established finding and clean signals locally. If
 the text is ambiguous, the mechanical `ReviewClassifier` helper uses the
 configured Luna model to return one boolean. It has no confidence threshold,

@@ -674,6 +674,243 @@ Describe "Unattended Git and recovery reliability boundaries" `
         @((Read-ReviewLoopState -Path $statePath).RoleCalls).Count | Should Be 1
     }
 
+    It "silently removes an untracked file left by the native Reviewer" {
+        $planPath = Join-Path $caseRoot "reviewer-mutation.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{
+                result = "No actionable findings."
+                mutations = @([pscustomobject]@{
+                    path = "tmp-reviewer-output.txt"
+                    content = "temporary review output"
+                })
+            },
+            [pscustomobject]@{ result = "No actionable findings." }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        Test-Path -LiteralPath (Join-Path $repo "tmp-reviewer-output.txt") |
+            Should Be $false
+        (& git -C $repo status --porcelain=v1 | Out-String).Trim() | Should Be ""
+        (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
+            Should Not Match "Reviewer cleanup|tmp-reviewer-output"
+    }
+
+    It "restores tracked staged deleted and untracked Reviewer changes" {
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "reviewer edit"
+        [System.IO.File]::Delete((Join-Path $repo "review-loop-test.proj"))
+        Set-Content -LiteralPath (Join-Path $repo "staged.txt") -Value "staged"
+        Set-Content -LiteralPath (Join-Path $repo "untracked.txt") -Value "untracked"
+        & git -C $repo add README.txt review-loop-test.proj staged.txt
+
+        & (Get-Module CodexReviewLoop) {
+            param($repository, $baseline)
+            Restore-ReviewLoopReviewerRepository -RepoPath $repository -Recovery ([pscustomobject]@{
+                RepositoryHead = [string]$baseline.Head
+                WorktreeFingerprint = [string]$baseline.Fingerprint
+                RepositoryBranch = [string]$baseline.Branch
+                RepositoryHeadRef = [string]$baseline.HeadRef
+            })
+        } $repo $snapshot
+
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")).Trim() |
+            Should Be "initial"
+        Test-Path -LiteralPath (Join-Path $repo "review-loop-test.proj") |
+            Should Be $true
+        Test-Path -LiteralPath (Join-Path $repo "staged.txt") | Should Be $false
+        Test-Path -LiteralPath (Join-Path $repo "untracked.txt") | Should Be $false
+        (& git -C $repo status --porcelain=v1 | Out-String).Trim() | Should Be ""
+    }
+
+    It "restores the original branch and commit after Reviewer ref changes" {
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "reviewer commit"
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m "reviewer commit"
+        & git -C $repo switch -q -c reviewer-other
+
+        & (Get-Module CodexReviewLoop) {
+            param($repository, $baseline)
+            Restore-ReviewLoopReviewerRepository -RepoPath $repository -Recovery ([pscustomobject]@{
+                RepositoryHead = [string]$baseline.Head
+                WorktreeFingerprint = [string]$baseline.Fingerprint
+                RepositoryBranch = [string]$baseline.Branch
+                RepositoryHeadRef = [string]$baseline.HeadRef
+            })
+        } $repo $snapshot
+
+        (& git -C $repo branch --show-current) | Should Be $snapshot.Branch
+        (& git -C $repo rev-parse HEAD) | Should Be $snapshot.Head
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")).Trim() |
+            Should Be "initial"
+        (& git -C $repo show-ref --verify --hash refs/heads/reviewer-other) |
+            Should Not Be $snapshot.Head
+        (& git -C $repo status --porcelain=v1 | Out-String).Trim() | Should Be ""
+    }
+
+    It "restores a detached Reviewer HEAD" {
+        & git -C $repo checkout -q --detach HEAD
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "detached commit"
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m "detached reviewer commit"
+
+        & (Get-Module CodexReviewLoop) {
+            param($repository, $baseline)
+            Restore-ReviewLoopReviewerRepository -RepoPath $repository -Recovery ([pscustomobject]@{
+                RepositoryHead = [string]$baseline.Head
+                WorktreeFingerprint = [string]$baseline.Fingerprint
+                RepositoryBranch = [string]$baseline.Branch
+                RepositoryHeadRef = [string]$baseline.HeadRef
+            })
+        } $repo $snapshot
+
+        (& git -C $repo branch --show-current | Out-String).Trim() | Should Be ""
+        (& git -C $repo rev-parse HEAD) | Should Be $snapshot.Head
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")).Trim() |
+            Should Be "initial"
+        (& git -C $repo status --porcelain=v1 | Out-String).Trim() | Should Be ""
+    }
+
+    It "finds and recovers an interrupted Reviewer after it switches branches" {
+        $checkpoint = & (Get-Module CodexReviewLoop) {
+            param($profilePath, $repository)
+            $profile = Import-PowerShellDataFile -LiteralPath $profilePath
+            $paths = New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+            Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
+            $head = Get-ReviewLoopGitValue -RepoPath $repository -Arguments @(
+                "rev-parse", "HEAD"
+            )
+            $state = New-ReviewLoopState -RepoPath $repository -ReviewBase HEAD `
+                -Speed standard -RunRoot $paths.RunRoot -ReviewBaseCommit $head
+            $state.Stage = "reviewing"
+            $state.ReviewCycle = 1
+            $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+            $state.ActiveRoleCall = [pscustomobject]@{
+                CallId = "review-01"
+                Role = "Reviewer"
+                ExecutionFingerprint = ""
+                CheckpointStage = "reviewing"
+                RepositoryHead = [string]$snapshot.Head
+                WorktreeFingerprint = [string]$snapshot.Fingerprint
+                RepositoryBranch = [string]$snapshot.Branch
+                RepositoryHeadRef = [string]$snapshot.HeadRef
+            }
+            Write-ReviewLoopState -Path $paths.StatePath -State $state | Out-Null
+            Set-ReviewLoopReviewerRecoveryLocator `
+                -RepoPath $repository -StatePath $paths.StatePath
+            [pscustomobject]@{
+                StatePath = $paths.StatePath
+                Branch = [string]$snapshot.Branch
+                Head = [string]$snapshot.Head
+            }
+        } $configPath $repo
+        & git -C $repo switch -q -c reviewer-interrupted
+        Set-Content -LiteralPath (Join-Path $repo "reviewer-left.txt") -Value "left"
+        $planPath = Join-Path $caseRoot "reviewer-resume.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{ result = "No actionable findings." },
+            [pscustomobject]@{ result = "No actionable findings." }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.StatePath | Should Be $checkpoint.StatePath
+        (& git -C $repo branch --show-current) | Should Be $checkpoint.Branch
+        (& git -C $repo rev-parse HEAD) | Should Be $checkpoint.Head
+        Test-Path -LiteralPath (Join-Path $repo "reviewer-left.txt") | Should Be $false
+        (& git -C $repo status --porcelain=v1 | Out-String).Trim() | Should Be ""
+    }
+
+    It "recovers a legacy interrupted Reviewer checkpoint without new metadata" {
+        $checkpoint = & (Get-Module CodexReviewLoop) {
+            param($profilePath, $repository)
+            $profile = Import-PowerShellDataFile -LiteralPath $profilePath
+            $paths = New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+            Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
+            $head = Get-ReviewLoopGitValue -RepoPath $repository -Arguments @(
+                "rev-parse", "HEAD"
+            )
+            $state = New-ReviewLoopState -RepoPath $repository -ReviewBase HEAD `
+                -Speed standard -RunRoot $paths.RunRoot -ReviewBaseCommit $head
+            $state.Stage = "stopped"
+            $state.Status = "failed"
+            $state.ReviewCycle = 1
+            $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+            $state.ActiveRoleCall = [pscustomobject]@{
+                CallId = "review-01"
+                Role = "Reviewer"
+                ExecutionFingerprint = ""
+                CheckpointStage = "reviewing"
+                RepositoryHead = [string]$snapshot.Head
+                WorktreeFingerprint = [string]$snapshot.Fingerprint
+            }
+            Write-ReviewLoopState -Path $paths.StatePath -State $state | Out-Null
+            [pscustomobject]@{ StatePath = $paths.StatePath }
+        } $configPath $repo
+        Set-Content -LiteralPath (Join-Path $repo "tmp_review_diff.txt") -Value "left"
+        $planPath = Join-Path $caseRoot "legacy-reviewer-resume.json"
+        Write-ReliabilityJsonArray -Path $planPath -Values @(
+            [pscustomobject]@{ result = "No actionable findings." },
+            [pscustomobject]@{ result = "No actionable findings." }
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $result.StatePath | Should Be $checkpoint.StatePath
+        Test-Path -LiteralPath (Join-Path $repo "tmp_review_diff.txt") | Should Be $false
+    }
+
+    It "keeps an interrupted Reviewer checkpoint when cleanup is not provably safe" {
+        $runRoot = Join-Path $caseRoot "unsafe-reviewer"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $head = & git -C $repo rev-parse HEAD
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot -ReviewBaseCommit $head
+        $state.Stage = "reviewing"
+        $state.ActiveRoleCall = [pscustomobject]@{
+            Role = "Reviewer"
+            CheckpointStage = "reviewing"
+            RepositoryHead = $head
+            WorktreeFingerprint = "not-a-clean-fingerprint"
+        }
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $message = ""
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($loopState, $checkpoint, $repository)
+                Complete-ReviewLoopInterruptedReviewerRecovery `
+                    -State $loopState -StatePath $checkpoint -RepoPath $repository
+            } $state $statePath $repo | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        $message | Should Match "requires a checkpoint captured from a clean worktree"
+        (Read-ReviewLoopState -Path $statePath).ActiveRoleCall | Should Not BeNullOrEmpty
+    }
+
     It "uses ReviewerInstructions from the profile for native review" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").

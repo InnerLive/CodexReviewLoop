@@ -260,6 +260,13 @@ function Invoke-ConfiguredCodexRole {
         $null
     }
     if ($null -ne $pending) {
+        if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
+            Complete-ReviewLoopInterruptedReviewerRecovery `
+                -State $State -StatePath $StatePath -RepoPath $RepoPath | Out-Null
+            $pending = $null
+        }
+    }
+    if ($null -ne $pending) {
         $pendingSnapshot = [pscustomobject]@{
             Head = [string](Get-ReviewLoopObjectProperty `
                 -Object $pending -Name "RepositoryHead" -Default "")
@@ -288,14 +295,6 @@ function Invoke-ConfiguredCodexRole {
         elseif (-not $mayEditRepository -and
             [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint) {
             Stop-ReviewLoopBlocked -Message "Read-only role '$Role' changed the repository before interruption."
-        }
-        elseif ($Mode -eq "Review" -and $Role -eq "Reviewer") {
-            $State.ActiveRoleCall = $null
-            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-            $pending = $null
-            Write-ReviewLoopStatus `
-                -Message "Interrupted native review will start again from the current clean checkpoint." `
-                -Kind Info
         }
     }
 
@@ -354,10 +353,16 @@ Continue the interrupted $Role work from the current repository state and return
             CheckpointStage = [string]$State.Stage
             RepositoryHead = [string]$roleStartSnapshot.Head
             WorktreeFingerprint = [string]$roleStartSnapshot.Fingerprint
+            RepositoryBranch = [string]$roleStartSnapshot.Branch
+            RepositoryHeadRef = [string]$roleStartSnapshot.HeadRef
             StartedAt = [DateTimeOffset]::UtcNow.ToString("O")
             ThreadStartedAt = ""
         }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        if ($Role -eq "Reviewer") {
+            Set-ReviewLoopReviewerRecoveryLocator `
+                -RepoPath $RepoPath -StatePath $StatePath
+        }
     }
 
     $arguments = @{
@@ -407,10 +412,36 @@ Continue the interrupted $Role work from the current repository state and return
         }
         $arguments.OnThreadStarted = $onThreadStarted
     }
-    $call = Invoke-CodexCliRole @arguments
-    Assert-ReviewLoopExecutionUnchanged -Config $Config
+    $call = $null
+    $callError = $null
+    try {
+        $call = Invoke-CodexCliRole @arguments
+        Assert-ReviewLoopExecutionUnchanged -Config $Config
+    }
+    catch {
+        $callError = $_
+    }
 
-    if (-not $mayEditRepository -and
+    if ($Role -eq "Reviewer") {
+        $reviewerRecovery = if ($null -ne $State) {
+            $State.ActiveRoleCall
+        }
+        else {
+            [pscustomobject]@{
+                RepositoryHead = [string]$roleStartSnapshot.Head
+                WorktreeFingerprint = [string]$roleStartSnapshot.Fingerprint
+                RepositoryBranch = [string]$roleStartSnapshot.Branch
+                RepositoryHeadRef = [string]$roleStartSnapshot.HeadRef
+            }
+        }
+        Invoke-ReviewLoopReviewerRepositoryRecovery `
+            -RepoPath $RepoPath -Recovery $reviewerRecovery -State $State
+    }
+    if ($null -ne $callError) {
+        throw $callError
+    }
+
+    if (-not $mayEditRepository -and $Role -ne "Reviewer" -and
         $worktreeBefore -ne (Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath)) {
         throw "Read-only role '$Role' changed the repository worktree despite its role contract."
     }
@@ -429,6 +460,9 @@ Continue the interrupted $Role work from the current repository state and return
         Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
         $State.ActiveRoleCall = $null
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        if ($Role -eq "Reviewer") {
+            Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
+        }
     }
     return $call
 }
