@@ -217,8 +217,8 @@ if ($exitCode -eq 0 -and
             "review-classification-v1.schema.json" {
                 '{"schemaVersion":"1.0","hasFindings":false}'
             }
-            "lessons-learned-v1.schema.json" {
-                '{"schemaVersion":"1.0","summary":"No durable guidance is justified.","recommendations":[]}'
+            "lessons-learned-v2.schema.json" {
+                '{"schemaVersion":"2.0","summary":"No durable guidance change is justified.","diagnosis":{"summary":"The run does not prove a reusable improvement.","causes":[],"guidanceAssessment":[]},"changes":[]}'
             }
             "fixer-result-v3.schema.json" {
                 '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
@@ -296,6 +296,14 @@ if ($plannedMutations.Count -gt 0) {
         $parent = Split-Path -Parent $absolute
         if (-not [string]::IsNullOrWhiteSpace($parent)) {
             [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+        }
+        $delete = Test-FakeBoolean (Get-FakePlanValue `
+            -Plan $mutation -Name "delete" -Default $false)
+        if ($delete) {
+            if (Test-Path -LiteralPath $absolute -PathType Leaf) {
+                Remove-Item -LiteralPath $absolute -Force
+            }
+            continue
         }
         $content = [string](Get-FakePlanValue -Plan $mutation -Name "content" -Default "")
         $append = Test-FakeBoolean (Get-FakePlanValue -Plan $mutation -Name "append" -Default $false)
