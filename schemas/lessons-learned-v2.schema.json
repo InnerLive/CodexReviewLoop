@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "2.0" },
+    "summary": { "type": "string" },
+    "diagnosis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string" },
+        "causes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "title": { "type": "string" },
+              "category": {
+                "type": "string",
+                "enum": ["repository_guidance", "review_loop_process", "change_scope"]
+              },
+              "explanation": { "type": "string" },
+              "evidence": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["title", "category", "explanation", "evidence"]
+          }
+        },
+        "guidanceAssessment": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "target": { "type": "string" },
+              "assessment": {
+                "type": "string",
+                "enum": ["effective", "ineffective", "redundant", "too_specific", "obsolete"]
+              },
+              "explanation": { "type": "string" },
+              "evidence": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["target", "assessment", "explanation", "evidence"]
+          }
+        }
+      },
+      "required": ["summary", "causes", "guidanceAssessment"]
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" },
+          "action": {
+            "type": "string",
+            "enum": ["add", "update", "consolidate", "delete"]
+          },
+          "surface": {
+            "type": "string",
+            "enum": ["agents_md", "repository_skill"]
+          },
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "outcome": { "type": "string" },
+          "rationale": { "type": "string" },
+          "futureUse": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": [
+          "title",
+          "action",
+          "surface",
+          "targets",
+          "outcome",
+          "rationale",
+          "futureUse",
+          "evidence"
+        ]
+      }
+    }
+  },
+  "required": ["schemaVersion", "summary", "diagnosis", "changes"]
+}

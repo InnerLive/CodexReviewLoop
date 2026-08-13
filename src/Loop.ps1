@@ -2558,10 +2558,10 @@ function Get-ReviewLoopLessonsLearnedFinalCompletion {
     return [pscustomobject]@{
         CompletionAllowed = $true
         Evidence = if ($createdCommit) {
-            "final lessons-learned change verified"
+            "final retrospective guidance change verified"
         }
         else {
-            "lessons-learned recommendations accepted without a commit"
+            "retrospective accepted without a commit"
         }
     }
 }
@@ -2579,6 +2579,284 @@ function Get-ReviewLoopLessonsLearnedCommitText {
         "- $sha $subject"
     }
     return $lines -join [Environment]::NewLine
+}
+
+function ConvertTo-ReviewLoopRetrospectiveSummary {
+    param(
+        [AllowEmptyString()][string]$Text = "",
+        [int]$MaximumLength = 800
+    )
+
+    $compact = ($Text -replace "\s+", " ").Trim()
+    if ($compact.Length -le $MaximumLength) {
+        return $compact
+    }
+    return $compact.Substring(0, $MaximumLength - 1).TrimEnd() + "…"
+}
+
+function Get-ReviewLoopDiffStatistics {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [AllowEmptyString()][string]$From,
+        [AllowEmptyString()][string]$To
+    )
+
+    if ([string]::IsNullOrWhiteSpace($From) -or
+        [string]::IsNullOrWhiteSpace($To) -or $From -eq $To) {
+        return [pscustomobject][ordered]@{
+            files = 0
+            additions = 0
+            deletions = 0
+            binaryFiles = 0
+        }
+    }
+
+    $arguments = @("diff", "--numstat", $From, $To, "--")
+    $lines = @(& git -C $RepoPath @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not calculate retrospective diff statistics for $From..$To."
+    }
+    $files = 0
+    $additions = 0
+    $deletions = 0
+    $binaryFiles = 0
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace([string]$line)) {
+            continue
+        }
+        $parts = @([string]$line -split "`t", 3)
+        if ($parts.Count -lt 3) {
+            continue
+        }
+        $files++
+        if ($parts[0] -eq "-" -or $parts[1] -eq "-") {
+            $binaryFiles++
+            continue
+        }
+        $additions += [int]$parts[0]
+        $deletions += [int]$parts[1]
+    }
+    return [pscustomobject][ordered]@{
+        files = $files
+        additions = $additions
+        deletions = $deletions
+        binaryFiles = $binaryFiles
+    }
+}
+
+function Get-ReviewLoopRetrospectiveEvidence {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$CurrentHead
+    )
+
+    $roleCalls = @((Get-ReviewLoopObjectProperty `
+        -Object $State -Name "RoleCalls" -Default @()) | Where-Object {
+        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -ne
+            "LessonsLearned"
+    })
+    $nativeReviews = @($roleCalls | Where-Object {
+        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+            "Reviewer" -and
+        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
+            '^review-[0-9]+$'
+    })
+    $ordinaryFindings = @($Ledger.Findings | Where-Object {
+        [string](Get-ReviewLoopObjectProperty `
+            -Object $_ -Name "FirstSeenReview" -Default "") -match '^review-[0-9]+$'
+    })
+    $cycles = @()
+    $findingReviewCount = 0
+    $cleanReviewCount = 0
+    for ($cycle = 1; $cycle -le [int]$State.ReviewCycle; $cycle++) {
+        $reviewId = "review-{0:d2}" -f $cycle
+        $reviewCall = @($nativeReviews | Where-Object {
+            [string](Get-ReviewLoopObjectProperty `
+                -Object $_ -Name "CallId" -Default "") -eq $reviewId
+        } | Select-Object -Last 1)
+        $cycleFindings = @($ordinaryFindings | Where-Object {
+            [string](Get-ReviewLoopObjectProperty `
+                -Object $_ -Name "FirstSeenReview" -Default "") -eq $reviewId -or
+            [string](Get-ReviewLoopObjectProperty `
+                -Object $_ -Name "LastSeenReview" -Default "") -eq $reviewId
+        })
+
+        $reviewerResult = "not_recorded"
+        $reviewerSummary = ""
+        $reviewHead = ""
+        if ($reviewCall.Count -gt 0) {
+            $record = $reviewCall[0]
+            $reviewHead = [string](Get-ReviewLoopObjectProperty `
+                -Object $record -Name "RepositoryHead" -Default "")
+            $reviewerSummary = ConvertTo-ReviewLoopRetrospectiveSummary `
+                -Text ([string](Get-ReviewLoopObjectProperty `
+                    -Object $record -Name "FinalMessage" -Default ""))
+            if (-not [bool](Get-ReviewLoopObjectProperty `
+                -Object $record -Name "Success" -Default $false)) {
+                $reviewerResult = "technical_failure"
+            }
+            else {
+                $classification = Get-ReviewLoopLocalReviewClassification `
+                    -ReviewText ([string](Get-ReviewLoopObjectProperty `
+                        -Object $record -Name "FinalMessage" -Default ""))
+                if ([string]$classification.Classification -in @("clean", "finding")) {
+                    $reviewerResult = [string]$classification.Classification
+                }
+                else {
+                    $classifier = @($roleCalls | Where-Object {
+                        [string](Get-ReviewLoopObjectProperty `
+                            -Object $_ -Name "Role" -Default "") -eq "ReviewClassifier" -and
+                        [string](Get-ReviewLoopObjectProperty `
+                            -Object $_ -Name "CallId" -Default "") -eq "$reviewId-classify" -and
+                        [bool](Get-ReviewLoopObjectProperty `
+                            -Object $_ -Name "Success" -Default $false)
+                    } | Select-Object -Last 1)
+                    if ($classifier.Count -gt 0) {
+                        $classifierResult = Get-ReviewLoopObjectProperty `
+                            -Object $classifier[0] -Name "StructuredResult"
+                        $reviewerResult = if ([bool](Get-ReviewLoopObjectProperty `
+                            -Object $classifierResult `
+                            -Name "hasFindings" -Default $false)) { "finding" } else { "clean" }
+                    }
+                    elseif ($cycleFindings.Count -gt 0) {
+                        $reviewerResult = "finding"
+                    }
+                    else {
+                        $reviewerResult = "unclassified"
+                    }
+                }
+            }
+        }
+        if ($reviewerResult -eq "finding") { $findingReviewCount++ }
+        if ($reviewerResult -eq "clean") { $cleanReviewCount++ }
+
+        $architectCalls = @($roleCalls | Where-Object {
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+                "Architect" -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
+                "-c$cycle-architect$"
+        })
+        $fixerCalls = @($roleCalls | Where-Object {
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+                "Fixer" -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
+                "-c$cycle-fix-"
+        })
+        $verifierCalls = @($roleCalls | Where-Object {
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+                "Verifier" -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
+                "-c$cycle-verify-"
+        })
+        $cycles += [pscustomobject][ordered]@{
+            cycle = $cycle
+            head = $reviewHead
+            reviewerResult = $reviewerResult
+            reviewerSummary = $reviewerSummary
+            findings = @($cycleFindings | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    title = [string]$_.Title
+                    description = ConvertTo-ReviewLoopRetrospectiveSummary `
+                        -Text ([string]$_.Description)
+                    locations = @($_.Locations | ForEach-Object {
+                        "$([string]$_.path):$([int]$_.line)"
+                    })
+                    resolutionCommit = [string]$_.ResolutionCommit
+                }
+            })
+            architectSummaries = @($architectCalls | ForEach-Object {
+                $structured = Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "StructuredResult"
+                ConvertTo-ReviewLoopRetrospectiveSummary -Text (
+                    [string](Get-ReviewLoopObjectProperty `
+                        -Object $structured -Name "summary" -Default ""))
+            })
+            fixerAttempts = @($fixerCalls | ForEach-Object {
+                $structured = Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "StructuredResult"
+                [pscustomobject][ordered]@{
+                    callId = [string]$_.CallId
+                    success = [bool]$_.Success
+                    summary = ConvertTo-ReviewLoopRetrospectiveSummary -Text (
+                        [string](Get-ReviewLoopObjectProperty `
+                            -Object $structured -Name "summary" -Default ""))
+                }
+            })
+            verifierDecisions = @($verifierCalls | ForEach-Object {
+                $structured = Get-ReviewLoopObjectProperty `
+                    -Object $_ -Name "StructuredResult"
+                [pscustomobject][ordered]@{
+                    callId = [string]$_.CallId
+                    success = [bool]$_.Success
+                    accept = if ([bool]$_.Success) {
+                        [bool](Get-ReviewLoopObjectProperty `
+                            -Object $structured -Name "accept" -Default $false)
+                    }
+                    else { $null }
+                    summary = ConvertTo-ReviewLoopRetrospectiveSummary -Text (
+                        [string](Get-ReviewLoopObjectProperty `
+                            -Object $structured -Name "summary" -Default ""))
+                    feedback = @((Get-ReviewLoopObjectProperty `
+                        -Object $structured -Name "feedback" -Default @()) |
+                        ForEach-Object {
+                            ConvertTo-ReviewLoopRetrospectiveSummary -Text ([string]$_)
+                        })
+                }
+            })
+            resolutionCommits = @($cycleFindings | ForEach-Object {
+                [string]$_.ResolutionCommit
+            } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique)
+        }
+    }
+
+    $fixerCallCount = @($roleCalls | Where-Object {
+        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq "Fixer"
+    }).Count
+    $verifierRejections = @($roleCalls | Where-Object {
+        $structured = Get-ReviewLoopObjectProperty -Object $_ -Name "StructuredResult"
+        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
+            "Verifier" -and
+        [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false) -and
+        -not [bool](Get-ReviewLoopObjectProperty `
+            -Object $structured -Name "accept" -Default $false)
+    })
+    $technicalFailures = @($roleCalls | Where-Object {
+        -not [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false)
+    } | ForEach-Object {
+        [pscustomobject][ordered]@{
+            role = [string]$_.Role
+            callId = [string]$_.CallId
+            failureKind = [string]$_.FailureKind
+        }
+    })
+    $baseCommit = [string](Get-ReviewLoopObjectProperty `
+        -Object $State -Name "ReviewBaseCommit" -Default "")
+    $startHead = [string]$State.StartHead
+
+    return [pscustomobject][ordered]@{
+        counts = [pscustomobject][ordered]@{
+            cycles = [int]$State.ReviewCycle
+            nativeReviews = $nativeReviews.Count
+            findingReviews = $findingReviewCount
+            cleanReviews = $cleanReviewCount
+            fixerCalls = $fixerCallCount
+            verifierRejections = $verifierRejections.Count
+            technicalFailures = $technicalFailures.Count
+        }
+        diff = [pscustomobject][ordered]@{
+            initial = Get-ReviewLoopDiffStatistics `
+                -RepoPath $RepoPath -From $baseCommit -To $startHead
+            loopGrowth = Get-ReviewLoopDiffStatistics `
+                -RepoPath $RepoPath -From $startHead -To $CurrentHead
+            final = Get-ReviewLoopDiffStatistics `
+                -RepoPath $RepoPath -From $baseCommit -To $CurrentHead
+        }
+        cycles = $cycles
+        technicalFailures = $technicalFailures
+    }
 }
 
 function Invoke-ReviewLoopLessonsLearnedGate {
@@ -2599,7 +2877,7 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         -Config $Config -State $State -RepoPath $RepoPath
     if (-not $eligibility.Eligible) {
         Write-ReviewLoopStatus `
-            -Message "Lessons learned skipped: $($eligibility.Reason)." `
+            -Message "Retrospective skipped: $($eligibility.Reason)." `
             -Kind Info
         return $eligibility
     }
@@ -2620,8 +2898,11 @@ function Invoke-ReviewLoopLessonsLearnedGate {
     Set-ReviewLoopCheckpoint `
         -State $State -StatePath $StatePath -Stage "lessons_learned_analyzing"
     Write-ReviewLoopStatus `
-        -Message "Lessons learned triggered: $($eligibility.Reason)." `
+        -Message "Retrospective triggered: $($eligibility.Reason)." `
         -Kind Review
+
+    $retrospective = Get-ReviewLoopRetrospectiveEvidence `
+        -State $State -Ledger $Ledger -RepoPath $RepoPath -CurrentHead $head
 
     $prompt = Get-ReviewLoopPrompt -Name "lessons-learned.md" -Values @{
         REVIEW_CYCLE_COUNT = [string]$State.ReviewCycle
@@ -2630,23 +2911,24 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         CURRENT_HEAD = $head
         LOOP_COMMITS = Get-ReviewLoopLessonsLearnedCommitText `
             -State $State -RepoPath $RepoPath
+        RUN_RETROSPECTIVE = ConvertTo-ReviewLoopJsonCompact $retrospective
     }
     $headKey = if ($head.Length -gt 10) { $head.Substring(0, 10) } else { $head }
     $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "LessonsLearned" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot `
-        -SchemaName "lessons-learned-v1.schema.json" `
+        -SchemaName "lessons-learned-v2.schema.json" `
         -CodexPath $CodexPath `
         -CallId ("lessons-learned-a{0:d2}-{1}" -f
             [int]$State.LessonsLearned.Attempt, $headKey) `
         -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $call
 
-    $recommendations = @($call.StructuredResult.recommendations)
+    $changes = @($call.StructuredResult.changes)
     Write-ReviewLoopStatus `
-        -Message "Lessons learned: $($call.StructuredResult.summary) · $($recommendations.Count) recommendation(s)." `
-        -Kind $(if ($recommendations.Count -eq 0) { "Success" } else { "Review" })
-    if ($recommendations.Count -eq 0) {
+        -Message "Retrospective: $($call.StructuredResult.summary) · $($changes.Count) guidance change(s)." `
+        -Kind $(if ($changes.Count -eq 0) { "Success" } else { "Review" })
+    if ($changes.Count -eq 0) {
         $State.LessonsLearned.Status = "completed"
         $State.LessonsLearned.CompletedHead = $head
         Set-ReviewLoopCheckpoint `
@@ -2654,15 +2936,15 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         return [pscustomobject]@{
             Eligible = $true
             CompletionAllowed = $true
-            Reason = "the analysis returned no recommendations"
+            Reason = "the retrospective returned no guidance changes"
         }
     }
 
     $analysisText = ConvertTo-ReviewLoopJsonCompact $call.StructuredResult
-    $findings = foreach ($recommendation in $recommendations) {
+    $findings = foreach ($change in $changes) {
         [pscustomobject]@{
-            title = [string]$recommendation.title
-            description = ConvertTo-ReviewLoopJsonCompact $recommendation
+            title = [string]$change.title
+            description = ConvertTo-ReviewLoopJsonCompact $change
             locations = @()
         }
     }
@@ -2675,7 +2957,7 @@ function Invoke-ReviewLoopLessonsLearnedGate {
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "reviewed"
     Write-ReviewLoopStatus `
-        -Message "Implementing $($recommendations.Count) lessons-learned recommendation(s) through the normal fix workflow." `
+        -Message "Implementing $($changes.Count) retrospective guidance change(s) through the normal fix workflow." `
         -Kind Progress
     Invoke-ReviewLoopOpenClusters `
         -Config $Config -State $State -StatePath $StatePath `

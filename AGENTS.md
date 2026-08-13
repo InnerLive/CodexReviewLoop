@@ -177,8 +177,9 @@ supported developer-instructions setting.
   the patch, stage the exact tree, and advance HEAD with an old-value check.
 - Completion normally requires the configured clean passes on unchanged HEAD.
   Every ordinary fix commit resets them.
-- Lessons learned runs once at an eligible clean gate. Its recommendations use
-  the normal Architect/Fixer/Verifier/gate/commit path. An accepted result is
+- Lessons learned runs once at an eligible clean gate. Its retrospective uses
+  the full evidenced loop and sends only justified guidance changes through the
+  normal Architect/Fixer/Verifier/gate/commit path. An accepted result is
   final unless the captured `ReviewAfterLessonsLearnedCommit` setting requires
   clean reviews after a real lessons commit. Accepted no-ops finish directly.
 - `MaxReviewCycles` limits native reviews per invocation, not the durable run.

@@ -62,7 +62,7 @@ stages files, and commits.
 Raw model reasoning is never printed. Long-running roles and host gates update
 one in-place heartbeat line instead of flooding the terminal.
 When the clean gate is reached, compact and balanced output also state whether
-lessons learned were triggered or skipped, how many recommendations were
+the retrospective was triggered or skipped, how many guidance changes were
 returned, and whether they entered the normal implementation workflow.
 
 Normal invocations do not append a JSON copy of the result. For automation:

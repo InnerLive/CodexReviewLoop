@@ -173,7 +173,17 @@ function Enable-TestLessonsLearnedCheckpoint {
             }
             Set-Content -LiteralPath (Join-Path $historyTemplate $path) `
                 -Value $content -NoNewline
+            if ($index -eq 1) {
+                $obsolete = Join-Path $historyTemplate ".agents/skills/obsolete/SKILL.md"
+                New-Item -ItemType Directory -Path (Split-Path -Parent $obsolete) `
+                    -Force | Out-Null
+                Set-Content -LiteralPath $obsolete `
+                    -Value "---`nname: obsolete`ndescription: Obsolete fixture workflow.`n---`n"
+            }
             & git -C $historyTemplate add -- $path
+            if ($index -eq 1) {
+                & git -C $historyTemplate add -- ".agents/skills/obsolete/SKILL.md"
+            }
             & git -C $historyTemplate commit -q -m "verified loop change $index"
         }
     }
@@ -1896,14 +1906,21 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
                 Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") `
                     -ErrorAction Stop
         }) | Should Be $true
-        '{"schemaVersion":"1.0","summary":"Persist durable guidance.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Run the repository-owned gate after changing the parser.","evidence":["abc123 changed parser and tests"]}]}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") |
-            Should Be $true
-        (Test-Throws {
-            '{"schemaVersion":"1.0","summary":"Invalid surface.","recommendations":[{"title":"Bad","surface":"plugin","scope":"repository","lesson":"Bad","evidence":[]}]}' |
-                Test-Json -SchemaFile (Join-Path $root "schemas\lessons-learned-v1.schema.json") `
-                    -ErrorAction Stop
-        }) | Should Be $true
+        $retrospectiveSchema = Join-Path $root "schemas\lessons-learned-v2.schema.json"
+        @'
+{"schemaVersion":"2.0","summary":"Improve the reusable guidance set.","diagnosis":{"summary":"Serial findings exposed one reusable gap.","causes":[{"title":"The invariant was discovered incrementally","category":"repository_guidance","explanation":"Existing guidance did not make the decision boundary actionable.","evidence":["cycles 2 and 3 found sibling defects"]},{"title":"Fresh reviews broadened the inspection","category":"review_loop_process","explanation":"A later review found a sibling after a clean result.","evidence":["cycles 4 and 5 shared a HEAD"]},{"title":"The patch grew during correction","category":"change_scope","explanation":"Corrections expanded the reviewed surface.","evidence":["loopGrowth added two files"]}],"guidanceAssessment":[{"target":"AGENTS.md","assessment":"ineffective","explanation":"The rule existed but was not actionable at the decision point.","evidence":["the same class of issue recurred"]}]},"changes":[{"title":"Add a durable boundary","action":"add","surface":"agents_md","targets":["AGENTS.md"],"outcome":"Make the reusable invariant actionable.","rationale":"Different changes cross the same boundary.","futureUse":"Applies to future parser and persistence work.","evidence":["cycles 2 and 3"]},{"title":"Repair an existing workflow","action":"update","surface":"repository_skill","targets":[".agents/skills/validate/SKILL.md"],"outcome":"Move the check to the decision point.","rationale":"The existing procedure was too late.","futureUse":"Applies whenever the workflow runs.","evidence":["cycle 3"]},{"title":"Merge overlapping rules","action":"consolidate","surface":"agents_md","targets":["AGENTS.md","src/AGENTS.md"],"outcome":"Keep one authoritative rule.","rationale":"Two rules competed.","futureUse":"Reduces ambiguity for all source changes.","evidence":["guidance assessment"]},{"title":"Remove obsolete workflow detail","action":"delete","surface":"repository_skill","targets":[".agents/skills/validate/references/obsolete.md"],"outcome":"Remove misleading detail.","rationale":"The procedure no longer exists.","futureUse":"Prevents future branches following stale steps.","evidence":["current skill inspection"]}]}
+'@ | Test-Json -SchemaFile $retrospectiveSchema | Should Be $true
+        '{"schemaVersion":"2.0","summary":"Diagnosis only.","diagnosis":{"summary":"The cause belongs to the review process.","causes":[{"title":"Review breadth changed","category":"review_loop_process","explanation":"Later inspection found more.","evidence":["same HEAD"]}],"guidanceAssessment":[]},"changes":[]}' |
+            Test-Json -SchemaFile $retrospectiveSchema | Should Be $true
+        foreach ($invalid in @(
+            '{"schemaVersion":"2.0","summary":"Bad action.","diagnosis":{"summary":"x","causes":[],"guidanceAssessment":[]},"changes":[{"title":"Bad","action":"replace","surface":"agents_md","targets":["AGENTS.md"],"outcome":"x","rationale":"x","futureUse":"x","evidence":[]}]}',
+            '{"schemaVersion":"2.0","summary":"Bad surface.","diagnosis":{"summary":"x","causes":[],"guidanceAssessment":[]},"changes":[{"title":"Bad","action":"add","surface":"plugin","targets":["AGENTS.md"],"outcome":"x","rationale":"x","futureUse":"x","evidence":[]}]}',
+            '{"schemaVersion":"2.0","summary":"Incomplete.","diagnosis":{"summary":"x","causes":[],"guidanceAssessment":[]},"changes":[{"title":"Bad","action":"add","surface":"agents_md","targets":["AGENTS.md"],"outcome":"x","rationale":"x","evidence":[]}]}'
+        )) {
+            (Test-Throws {
+                $invalid | Test-Json -SchemaFile $retrospectiveSchema -ErrorAction Stop
+            }) | Should Be $true
+        }
     }
 
     It "keeps the complete free-role prompts stable" {
@@ -1913,7 +1930,7 @@ Role:
 You are the architect responsible for the coherence and integrity of this software system as a whole. You maintain a system-wide perspective across the current findings, repository context, and recent history, and understand individual findings as evidence about the system's design and invariants.
 
 Goal:
-Decide how the current findings should be handled so their underlying concern is resolved coherently, completely, and durably in the repository. Use your independent judgment to choose the appropriate scope.
+Decide how the current findings should be handled so the resulting repository state is coherent, complete, durable, and unlikely to reveal further defects arising from the same changes or underlying concerns. Correctness, security, maintainability, and appropriate scope take precedence. Use your independent judgment to choose the solution.
 
 Current findings:
 {{FINDINGS}}
@@ -2045,6 +2062,11 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $prompt | Should Match 'Keep AGENTS\.md small and practical'
         $prompt | Should Match 'definition of done'
         $prompt | Should Match '\{\{LOOP_COMMITS\}\}'
+        $prompt | Should Match '\{\{RUN_RETROSPECTIVE\}\}'
+        $prompt | Should Match 'materially different future tasks and branches'
+        $prompt | Should Match 'diagnosis.+does not justify a cross-repository guidance change'
+        $prompt | Should Match 'task-specific architecture, product concepts, class and file inventories'
+        $prompt | Should Match 'add`, `update`, `consolidate`, or `delete`'
     }
 
     It "keeps root AGENTS guidance practical and within the default context budget" {
@@ -2101,7 +2123,8 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $instructions.Verifier | Should Match 'accept field selects the implemented workflow transition'
         $instructions.Verifier | Should Match 'Rejection feedback is passed to the Fixer'
         $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
-        $instructions.LessonsLearned | Should Match 'recommendations array is the analysis result consumed by the orchestrator'
+        $instructions.LessonsLearned | Should Match 'changes array is the only part of the retrospective'
+        $instructions.LessonsLearned | Should Match 'complete diagnosis remains evidence for Architect and Verifier'
     }
 
     It "has no direct HTTP model invocation in active code" {
@@ -2133,6 +2156,140 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $text | Should Not Match '(?i)\bPKonf\b'
     }
 
+}
+
+Describe "Lessons-learned retrospective evidence" -Tags @("Fast", "FullLocal") {
+    It "preserves chronological loop evidence while excluding raw diagnostics and prior analyses" {
+        $repo = New-TestRepo (Join-Path $TestDrive "retrospective-evidence")
+        $base = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "initial.txt") -Value "initial scope"
+        & git -C $repo add -- initial.txt
+        & git -C $repo commit -q -m "start reviewed work"
+        $start = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "growth.txt") -Value "loop growth"
+        & git -C $repo add -- growth.txt
+        & git -C $repo commit -q -m "resolve serial finding"
+        $current = & git -C $repo rev-parse HEAD
+
+        $roleCalls = @(
+            [pscustomobject]@{
+                Role = "Reviewer"; CallId = "review-01"; Success = $true
+                RepositoryHead = $start; FinalMessage = "No findings."
+                JsonlPath = "secret-jsonl-marker"; ResultPath = "secret-result-marker"
+                Usage = [pscustomobject]@{ reasoning = "secret-reasoning-marker" }
+                Attempts = @("secret-attempt-marker")
+            },
+            [pscustomobject]@{
+                Role = "Reviewer"; CallId = "review-02"; Success = $true
+                RepositoryHead = $start
+                FinalMessage = "Review comment:`n`n- [P2] Enforce the sibling invariant — src/A.cs:10`n  A related path remains incomplete."
+            },
+            [pscustomobject]@{
+                Role = "Architect"; CallId = "C-test-c2-architect"; Success = $true
+                StructuredResult = [pscustomobject]@{ summary = "Handle both sibling paths." }
+            },
+            [pscustomobject]@{
+                Role = "Fixer"; CallId = "C-test-c2-fix-a1-c0"; Success = $true
+                StructuredResult = [pscustomobject]@{ summary = "Updated the first path." }
+            },
+            [pscustomobject]@{
+                Role = "Verifier"; CallId = "C-test-c2-verify-a1-c0"; Success = $true
+                StructuredResult = [pscustomobject]@{
+                    accept = $false; summary = "The sibling path is still open."
+                    feedback = @("Cover the related path.")
+                }
+            },
+            [pscustomobject]@{
+                Role = "Fixer"; CallId = "C-test-c2-fix-a2-c0"; Success = $true
+                StructuredResult = [pscustomobject]@{ summary = "Covered the sibling path." }
+            },
+            [pscustomobject]@{
+                Role = "Fixer"; CallId = "C-test-c2-fix-a2-c1"; Success = $false
+                FailureKind = "cli_error"; FailureReason = "secret-stderr-marker"
+            },
+            [pscustomobject]@{
+                Role = "Verifier"; CallId = "C-test-c2-verify-a2-c1"; Success = $true
+                StructuredResult = [pscustomobject]@{
+                    accept = $true; summary = "Both paths are covered."; feedback = @()
+                }
+            },
+            [pscustomobject]@{
+                Role = "Reviewer"; CallId = "review-03"; Success = $true
+                RepositoryHead = $current; FinalMessage = "No issues found."
+            },
+            [pscustomobject]@{
+                Role = "LessonsLearned"; CallId = "lessons-learned-old"; Success = $true
+                FinalMessage = "secret-old-analysis-marker"
+                StructuredResult = [pscustomobject]@{ summary = "secret-old-result-marker" }
+            }
+        )
+        $state = [pscustomobject]@{
+            ReviewCycle = 3
+            ReviewBaseCommit = $base
+            StartHead = $start
+            RoleCalls = $roleCalls
+        }
+        $ledger = [pscustomobject]@{
+            Findings = @(
+                [pscustomobject]@{
+                    Title = "Sibling invariant remains incomplete"
+                    Description = "The related path was discovered after a clean review."
+                    Locations = @([pscustomobject]@{ path = "src/A.cs"; line = 10 })
+                    FirstSeenReview = "review-02"
+                    LastSeenReview = "review-02"
+                    ResolutionCommit = $current
+                },
+                [pscustomobject]@{
+                    Title = "Old retrospective result"
+                    Description = "secret-old-finding-marker"
+                    Locations = @()
+                    FirstSeenReview = "lessons-learned-01"
+                    LastSeenReview = "lessons-learned-01"
+                    ResolutionCommit = ""
+                }
+            )
+        }
+
+        $evidence = & (Get-Module CodexReviewLoop) {
+            param($runState, $runLedger, $repository, $head)
+            Get-ReviewLoopRetrospectiveEvidence `
+                -State $runState -Ledger $runLedger -RepoPath $repository -CurrentHead $head
+        } $state $ledger $repo $current
+
+        $evidence.counts.cycles | Should Be 3
+        $evidence.counts.nativeReviews | Should Be 3
+        $evidence.counts.cleanReviews | Should Be 2
+        $evidence.counts.findingReviews | Should Be 1
+        $evidence.counts.fixerCalls | Should Be 3
+        $evidence.counts.verifierRejections | Should Be 1
+        $evidence.counts.technicalFailures | Should Be 1
+        @($evidence.cycles | ForEach-Object { $_.cycle }) | Should Be @(1, 2, 3)
+        $evidence.cycles[0].head | Should Be $evidence.cycles[1].head
+        $evidence.cycles[0].reviewerResult | Should Be "clean"
+        $evidence.cycles[1].reviewerResult | Should Be "finding"
+        @($evidence.cycles[1].fixerAttempts).Count | Should Be 3
+        @($evidence.cycles[1].verifierDecisions).Count | Should Be 2
+        @($evidence.cycles[1].resolutionCommits) | Should Be @($current)
+        $evidence.diff.initial.files | Should Be 1
+        $evidence.diff.initial.additions | Should Be 1
+        $evidence.diff.loopGrowth.files | Should Be 1
+        $evidence.diff.loopGrowth.additions | Should Be 1
+        $evidence.diff.final.files | Should Be 2
+        $evidence.diff.final.additions | Should Be 2
+        $serialized = ConvertTo-Json -InputObject $evidence -Depth 30 -Compress
+        foreach ($excluded in @(
+            "secret-jsonl-marker",
+            "secret-result-marker",
+            "secret-reasoning-marker",
+            "secret-attempt-marker",
+            "secret-stderr-marker",
+            "secret-old-analysis-marker",
+            "secret-old-result-marker",
+            "secret-old-finding-marker"
+        )) {
+            $serialized | Should Not Match ([regex]::Escape($excluded))
+        }
+    }
 }
 
 Describe "Native review classification" -Tags @("Fast", "FullLocal") {
@@ -2452,11 +2609,11 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         $terminal | Should Match "Review cycle 1"
         $terminal | Should Match "Reviewer"
         $terminal | Should Match "Clean pass 2/2"
-        $terminal | Should Match "Lessons learned skipped: only 0 of 6 verified loop commits exist"
+        $terminal | Should Match "Retrospective skipped: only 0 of 6 verified loop commits exist"
         $terminal | Should Match "Review Loop completed"
     }
 
-    It "implements multiple lessons-learned recommendations through the normal workflow" {
+    It "implements update, consolidation, and deletion through the normal workflow" {
         $configPath = New-TestConfig `
             -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
         $content = (Get-Content -Raw -LiteralPath $configPath).
@@ -2465,26 +2622,68 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         $checkpoint = Enable-TestLessonsLearnedCheckpoint `
             -RepoPath $repo -ConfigPath $configPath -Speed standard
         $analysis = ConvertTo-Json -Compress -Depth 20 ([pscustomobject]@{
-            schemaVersion = "1.0"
-            summary = "Two durable lessons are supported by the verified changes."
-            recommendations = @(
+            schemaVersion = "2.0"
+            summary = "Three net guidance changes are supported by the retrospective."
+            diagnosis = [pscustomobject]@{
+                summary = "Serial findings exposed ineffective and obsolete guidance."
+                causes = @(
+                    [pscustomobject]@{
+                        title = "Guidance did not prevent sibling findings"
+                        category = "repository_guidance"
+                        explanation = "The existing workflow did not expose the invariant early."
+                        evidence = @("Cycles 1 and 2 found related defects.")
+                    },
+                    [pscustomobject]@{
+                        title = "Broader reviews extended discovery"
+                        category = "review_loop_process"
+                        explanation = "This remains a tool-process observation, not repository work."
+                        evidence = @("A clean review preceded a later finding on one HEAD.")
+                    }
+                )
+                guidanceAssessment = @([pscustomobject]@{
+                    target = ".agents/skills/obsolete/SKILL.md"
+                    assessment = "obsolete"
+                    explanation = "The recorded workflow no longer applies."
+                    evidence = @("Repository inspection found no current trigger.")
+                })
+            }
+            changes = @(
                 [pscustomobject]@{
-                    title = "Record the verification invariant"
+                    title = "Update the verification invariant"
+                    action = "update"
                     surface = "agents_md"
-                    scope = "repository"
-                    lesson = "Run the repository gate after changing the loop."
+                    targets = @("AGENTS.md")
+                    outcome = "Make the existing invariant actionable."
+                    rationale = "The old wording did not guide the decision point."
+                    futureUse = "Applies across future orchestration changes."
                     evidence = @("The six verified loop commits repeatedly changed orchestration state.")
                 },
                 [pscustomobject]@{
-                    title = "Add a repeatable review skill"
+                    title = "Consolidate the repeatable review workflow"
+                    action = "consolidate"
                     surface = "repository_skill"
-                    scope = "review-loop maintenance"
-                    lesson = "Capture the non-obvious maintenance sequence as a repository skill."
+                    targets = @(
+                        ".agents/skills/review-loop-maintenance/SKILL.md",
+                        ".agents/skills/obsolete/SKILL.md"
+                    )
+                    outcome = "Keep one current workflow."
+                    rationale = "The procedures overlap."
+                    futureUse = "Future maintenance tasks use one authoritative workflow."
                     evidence = @("verified loop change 6 completed the repeated workflow.")
+                },
+                [pscustomobject]@{
+                    title = "Delete obsolete skill content"
+                    action = "delete"
+                    surface = "repository_skill"
+                    targets = @(".agents/skills/obsolete/SKILL.md")
+                    outcome = "Remove the obsolete workflow."
+                    rationale = "It conflicts with the consolidated procedure."
+                    futureUse = "Future branches cannot follow the stale path."
+                    evidence = @("Repository inspection showed it was obsolete.")
                 }
             )
         })
-        $architecture = '{"schemaVersion":"2.0","summary":"Apply both durable lessons.","approach":"Update repository guidance.","steps":[],"considerations":[]}'
+        $architecture = '{"schemaVersion":"2.0","summary":"Apply the three net guidance changes only.","approach":"Update, consolidate, and delete repository guidance.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Added repository guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"The guidance matches the evidence.","feedback":[],"commitMessage":{"subject":"Capture review-loop lessons","rationale":"Preserve verified maintenance knowledge.","changes":["Update repository instructions.","Add a repository skill."]}}'
         $plans = @(
@@ -2501,6 +2700,10 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
                     [pscustomobject]@{
                         path = ".agents/skills/review-loop-maintenance/SKILL.md"
                         content = "---`nname: review-loop-maintenance`ndescription: Maintain the review loop when orchestration changes.`n---`n`nRun the repository-owned verification gate.`n"
+                    },
+                    [pscustomobject]@{
+                        path = ".agents/skills/obsolete/SKILL.md"
+                        delete = $true
                     }
                 )
             },
@@ -2521,6 +2724,8 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         Test-Path -LiteralPath (Join-Path $repo ".agents/skills/review-loop-maintenance/SKILL.md") |
             Should Be $true
+        Test-Path -LiteralPath (Join-Path $repo ".agents/skills/obsolete/SKILL.md") |
+            Should Be $false
         $state = Read-ReviewLoopState -Path $checkpoint.StatePath
         $state.LessonsLearned.Status | Should Be "completed"
         $state.LessonsLearned.Attempt | Should Be 1
@@ -2531,23 +2736,32 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
             ForEach-Object { $_ | ConvertFrom-Json })
         $lessonsCalls = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "lessons-learned-v1.schema.json"
+                "lessons-learned-v2.schema.json"
         })
         $lessonsCalls.Count | Should Be 1
         $lessonsCalls[0].prompt | Should Match "Native review cycles completed: 1"
         $lessonsCalls[0].prompt | Should Match "verified loop change 6"
+        $lessonsCalls[0].prompt | Should Match '"diff"'
         $architectCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "architecture-advice-v2.schema.json"
         })[0]
         $architectCall.prompt | Should Match "repository_skill"
+        $architectCall.prompt | Should Match "Broader reviews extended discovery"
+        $verifierCall = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "verifier-result-v4.schema.json"
+        })[0]
+        $verifierCall.prompt | Should Match "Broader reviews extended discovery"
+        @((Read-ReviewLoopLedger -Path $checkpoint.LedgerPath).Findings).Count |
+            Should Be 3
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
-        $terminal | Should Match "Lessons learned triggered"
-        $terminal | Should Match "recommendation\(s\)"
-        $terminal | Should Match "Implementing 2 lessons-learned"
+        $terminal | Should Match "Retrospective triggered"
+        $terminal | Should Match "guidance change\(s\)"
+        $terminal | Should Match "Implementing 3 retrospective guidance change"
         $terminal | Should Match "Committed"
-        $terminal | Should Match "final lessons-learned change verified"
+        $terminal | Should Match "final retrospective guidance change verified"
         $terminal | Should Not Match "Review cycle 2"
     }
 
@@ -2581,7 +2795,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
         $checkpoint = Enable-TestLessonsLearnedCheckpoint `
             -RepoPath $repo -ConfigPath $configPath -Speed standard
-        $analysis = '{"schemaVersion":"1.0","summary":"One durable lesson.","recommendations":[{"title":"Record the invariant","surface":"agents_md","scope":"repository","lesson":"Keep the verified invariant.","evidence":["verified loop change 6"]}]}'
+        $analysis = '{"schemaVersion":"2.0","summary":"One durable change.","diagnosis":{"summary":"The existing rule was ineffective.","causes":[{"title":"The invariant was missed","category":"repository_guidance","explanation":"The rule was not actionable.","evidence":["verified loop change 6"]}],"guidanceAssessment":[{"target":"AGENTS.md","assessment":"ineffective","explanation":"The wording did not guide the decision.","evidence":["verified loop change 6"]}]},"changes":[{"title":"Record the invariant","action":"update","surface":"agents_md","targets":["AGENTS.md"],"outcome":"Keep the verified invariant actionable.","rationale":"The run proves the gap.","futureUse":"Applies to future repository work.","evidence":["verified loop change 6"]}]}'
         $architecture = '{"schemaVersion":"2.0","summary":"Record it.","approach":"Update guidance.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Updated guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Record the verified invariant","rationale":"Preserve the lesson.","changes":["Update repository guidance."]}}'
@@ -2620,10 +2834,10 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "Review cycle 2"
-        $terminal | Should Match "Lessons learned skipped: the lessons-learned phase already completed"
+        $terminal | Should Match "Retrospective skipped: the lessons-learned phase already completed"
     }
 
-    It "completes directly when fast lessons-learned analysis returns no recommendations" {
+    It "completes directly when fast retrospective analysis returns no guidance changes" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
@@ -2631,7 +2845,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
             -RepoPath $repo -ConfigPath $configPath -Speed fast
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             "No findings.",
-            '{"schemaVersion":"1.0","summary":"No durable guidance is justified.","recommendations":[]}'
+            '{"schemaVersion":"2.0","summary":"No durable guidance change is justified.","diagnosis":{"summary":"The run shows no transferable repository gap.","causes":[{"title":"Review breadth changed","category":"review_loop_process","explanation":"This is a process observation only.","evidence":["same HEAD"]}],"guidanceAssessment":[]},"changes":[]}'
         )
 
         $result = Invoke-CodexReviewLoop `
@@ -2647,7 +2861,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
             ForEach-Object { $_ | ConvertFrom-Json })
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "lessons-learned-v1.schema.json" -and
+                "lessons-learned-v2.schema.json" -and
             ($_.arguments -join " ") -match 'service_tier=\\?"?fast'
         }).Count | Should Be 1
         @($records | Where-Object {
@@ -2663,10 +2877,10 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $checkpoint = Enable-TestLessonsLearnedCheckpoint `
             -RepoPath $repo -ConfigPath $configPath -Speed standard
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA =
-            "lessons-learned-v1.schema.json"
+            "lessons-learned-v2.schema.json"
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             "No findings.",
-            '{"schemaVersion":"1.0","summary":"No changes.","recommendations":[]}'
+            '{"schemaVersion":"2.0","summary":"No changes.","diagnosis":{"summary":"No reusable gap.","causes":[],"guidanceAssessment":[]},"changes":[]}'
         )
 
         $result = Invoke-CodexReviewLoop `

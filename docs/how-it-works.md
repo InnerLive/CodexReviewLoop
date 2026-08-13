@@ -30,9 +30,9 @@ flowchart LR
     clean -- Yes --> eligible{Lessons learned eligible?}
     eligible -- No --> done
     eligible -- Yes --> lessons[Read-only LessonsLearned analysis]
-    lessons --> recommendations{Recommendations?}
-    recommendations -- No --> done
-    recommendations -- Yes --> architect
+    lessons --> changes{Guidance changes?}
+    changes -- No --> done
+    changes -- Yes --> architect
 ```
 
 ## 1. Native review
@@ -146,15 +146,24 @@ on an unchanged `HEAD`; two is the recommended default. Every commit or other
 At that clean gate, `LessonsLearnedCommitThreshold` is reloaded. When the run
 has created at least that many verified, non-empty commits and the current
 `HEAD` tracks an exact root `AGENTS.md`, one read-only `LessonsLearned` call
-reviews the run's commit SHAs, subjects, and diffs. Zero disables the phase.
-The prompt is self-contained and does not depend on plugins, network access,
-personal skills, or global Codex configuration. It may recommend concise
-instructions in the applicable `AGENTS.md` or a focused repository skill under
-`.agents/skills/<name>/SKILL.md`.
+reviews a compact retrospective of the complete evidenced run. It receives
+per-cycle review results, findings, Architect summaries, Fixer attempts,
+Verifier decisions, resolution commits, technical-failure counts, and diff
+growth alongside the verified loop commit SHAs and subjects. Raw JSONL,
+stderr, internal reasoning, and prior retrospective results are excluded.
+Zero disables the phase.
 
-An empty recommendation list completes the phase without another role call.
-Otherwise, each recommendation becomes a normal ledger finding and the full
-analysis is passed to the Architect. Architect, Fixer, targeted test, Verifier,
+The analyst diagnoses why repeated work was needed, assesses the effectiveness
+of existing repository guidance, and selects the smallest broadly reusable net
+change. It can add, update, consolidate, or delete guidance in an applicable
+`AGENTS.md` or repository skill under `.agents/skills/<name>/`. Process-only
+diagnoses remain visible but do not become cross-repository work. The prompt is
+self-contained and does not depend on plugins, network access, personal skills,
+or global Codex configuration.
+
+An empty `changes` list completes the phase without another role call.
+Otherwise, each guidance change becomes a normal ledger finding and the full
+diagnosis is passed to the Architect. Architect, Fixer, targeted test, Verifier,
 host gates, and commit behavior remain unchanged. An accepted no-op solution
 completes the phase without increasing the commit count. A real accepted
 commit is recorded as another verified loop commit. By default, the accepted

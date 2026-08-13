@@ -1633,7 +1633,7 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         } $reloaded
 
         $completion.CompletionAllowed | Should Be $true
-        $completion.Evidence | Should Match "final lessons-learned change verified"
+        $completion.Evidence | Should Match "final retrospective guidance change verified"
 
         $reloaded.LessonsLearned.ReviewAfterCommit = $true
         $postReviewCompletion = & (Get-Module CodexReviewLoop) {

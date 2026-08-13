@@ -26,7 +26,7 @@ into repository guidance before declaring the run complete.
    unchanged `HEAD` (two is the recommended default).
 9. Before completion, conditionally analyzes verified loop commits for durable
    `AGENTS.md` or repository-skill guidance.
-10. Sends any recommendations through the same Architect, Fixer, Verifier,
+10. Sends any retrospective guidance changes through the same Architect, Fixer, Verifier,
     host-gate, and commit path. An accepted solution is the final cycle by
     default; profiles may opt into clean native reviews after a real commit.
 
