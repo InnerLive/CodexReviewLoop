@@ -99,7 +99,12 @@ The Fixer may provide one targeted test through `targetedTest.executable` and
 `targetedTest.arguments`. The executable is the program started by the
 orchestrator, such as `dotnet`, `pwsh`, or a repository wrapper. Project,
 script, test, and filter paths are arguments. The Fixer may also report that no
-targeted test is available.
+targeted test is available. The loop durably snapshots the Fixer worktree
+before an available test. Repository mutations fail by default. With
+`TargetedTestRepositoryChanges.Mode = 'RestoreAll'`, regular test side effects
+are discarded and the exact Fixer worktree is restored before the test result
+is processed. Git identity, index, and special-filesystem mutations remain
+technical failures.
 
 ## 4. Direct verification
 
@@ -124,8 +129,14 @@ the durable run. Threads are never shared between roles.
 ## 5. Gates and commit
 
 Configured `HostGates` run after acceptance and before every commit. The loop
-then rechecks the patch, stages the exact verified worktree, seals that Git
-tree, and advances `HEAD` only if the expected old value still matches.
+durably snapshots the verified worktree before each gate. The default policy
+rejects any gate mutation. A gate configured with `RestoreMatching` or
+`RestoreAll` may discard only regular file side effects covered by that policy;
+the loop restores and fingerprints the complete pre-gate tree before
+continuing. Gate changes to Git identity or special filesystem entries always
+fail without cleanup. The loop then rechecks the patch, stages the exact
+verified worktree, seals that Git tree, and advances `HEAD` only if the expected
+old value still matches.
 
 After the gates pass, the orchestrator builds the final commit message from the
 Verifier proposal and the test and gate results it directly observed. It

@@ -36,6 +36,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `ReviewAfterLessonsLearnedCommit` | `$false` | Require normal clean native reviews after a real lessons-learned commit |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
 | `InactivityTimeoutMinutes` | `30` | Live-reloaded child-process inactivity limit; zero or less disables it |
+| `TargetedTestRepositoryChanges` | `Fail` | Live-reloaded policy for repository changes made by model-selected targeted tests |
 | `AutoCommit` | `$true` | Live-reloaded commit behavior |
 | `CommitMessagePrefix` | `Review-Loop` | Live-reloaded prefix for future verified commits |
 | `HostGates` | Detected checks | Required checks before every commit |
@@ -91,6 +92,8 @@ fix, and commit boundaries:
   rejected round and starts another native review; it never blocks a finding.
 - `InactivityTimeoutMinutes` applies when the next role, targeted test, or host
   gate starts. It is not changed underneath an already running process.
+- `TargetedTestRepositoryChanges` applies to the next targeted test and to
+  recovery from an interrupted targeted test.
 - `AutoCommit`
 - `CommitMessagePrefix` applies to the next commit that has not yet entered
   commit preparation. A pending commit keeps its complete sealed subject and
@@ -113,6 +116,32 @@ The same override must be passed again when resuming. A shadowed profile value
 does not affect the fingerprint. The instruction text is not written to the
 terminal or checkpoint; only its effect on the execution fingerprint is kept.
 
+## Targeted tests
+
+Model-selected targeted tests fail safely when they change the repository by
+default. Repositories whose test tooling has disposable file side effects may
+opt into restoring every regular change made during the targeted-test window:
+
+```powershell
+TargetedTestRepositoryChanges = @{
+    Mode = 'RestoreAll'
+}
+```
+
+Only `Fail` and `RestoreAll` are supported here, so no path pattern has to be
+guessed for a command selected dynamically by the Fixer. Existing profiles use
+`Fail` implicitly. `RestoreAll` assumes the loop has exclusive use of the
+repository while the targeted test runs. It restores the exact saved Fixer
+worktree before the test result is evaluated; a successful test may continue,
+while a failed test remains a normal targeted-test failure after cleanup.
+
+Changes to Git identity, refs, the index, or special filesystem entries are
+never restored automatically. When `Fail` detects a regular file mutation, the
+message names every changed path and the absolute profile path and provides the
+complete top-level `TargetedTestRepositoryChanges` block to copy. After changing
+the profile, run the same command again; the saved checkpoint performs cleanup
+before rerunning the targeted test.
+
 ## Host gates
 
 Every gate has a display name, an executable, and an argument array:
@@ -134,8 +163,47 @@ HostGates = @(
 
 Executables may be normal commands or repository wrappers. Relative executable
 paths resolve from the reviewed repository root. Gates are validated before the
-first Reviewer starts, must finish within 30 minutes, and must not mutate the
-verified patch or Git state.
+first Reviewer starts and use the configured inactivity timeout.
+
+Repository changes made by a gate fail safely by default. A gate may opt into
+restoring known disposable side effects without changing the reviewed
+repository:
+
+```powershell
+@{
+    Name = 'Generator tests'
+    FilePath = 'dotnet'
+    Arguments = @('test', '.\tests\Generator.Tests.csproj')
+    RepositoryChanges = @{
+        Mode = 'RestoreMatching'
+        PathRegex = @(
+            '^Source/Framework/PrimeFact5\.SourceGenerator/packages\.lock\.json$'
+        )
+    }
+}
+```
+
+`RepositoryChanges` supports three modes:
+
+- `Fail` is the default for existing and new gate entries. Any repository
+  change stops the loop and leaves every path untouched.
+- `RestoreMatching` requires at least one `PathRegex`. Every path changed by
+  the gate must match at least one expression; otherwise nothing is restored.
+- `RestoreAll` restores every regular tracked or non-ignored untracked file
+  change observed during the gate. This is substantially riskier: it assumes
+  the loop has exclusive use of the repository for the complete gate window.
+
+Paths are repository-relative and use `/`. Matching is case-insensitive and
+culture-invariant on Windows and has a finite timeout. Expressions should be
+exactly anchored whenever possible. `Fail` and `RestoreAll` do not accept
+`PathRegex`. Invalid modes, value types, empty lists, and invalid expressions
+are rejected when the profile loads.
+
+Before each host gate, the loop durably saves the exact verified patch and its
+regular non-ignored untracked files. An allowed side effect is restored to that
+snapshot and can never enter the commit. Changes to `HEAD`, branches, refs, or
+the index, and submodules, symlinks, reparse points, or other non-regular paths
+are never restored automatically.
 
 The generated profile always includes `git diff --check`. When exactly one
 `.sln` or `.slnx` exists at the repository root, it also includes `dotnet test`

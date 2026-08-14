@@ -96,6 +96,9 @@ function New-TestConfig {
     ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
+    TargetedTestRepositoryChanges = @{
+        Mode = 'Fail'
+    }
     AutoCommit = `$true
     CommitMessagePrefix = "Test Review Loop"
     HostGates = @($gate)
@@ -319,6 +322,9 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $content = Get-Content -Raw -LiteralPath $resolved
         $content | Should Match "# Role settings:"
         $content | Should Match "# Host gates"
+        $content | Should Match "TargetedTestRepositoryChanges"
+        $content | Should Match "RestoreMatching"
+        $content | Should Match "RestoreAll"
         $content | Should Match "Recommended: 2-3 clean passes"
         $content | Should Match "Recommended: 6-30 native review cycles per script invocation"
         $content | Should Match "Recommended: 2-5 fixer calls"
@@ -334,6 +340,7 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $profile.InactivityTimeoutMinutes | Should Be 30
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
+        $profile.TargetedTestRepositoryChanges.Mode | Should Be "Fail"
         $profile.Roles.Keys.Count | Should Be 6
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
@@ -440,6 +447,106 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         } $profilePath
 
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
+    }
+
+    It "validates targeted-test repository-change policies and preserves the safe default" {
+        $profilePath = New-TestConfig `
+            -Path (Join-Path $TestDrive "targeted-test-policy.psd1") `
+            -LogRoot (Join-Path $TestDrive "targeted-test-policy-logs")
+        $content = (Get-Content -Raw -LiteralPath $profilePath) -replace
+            "(?ms)^    TargetedTestRepositoryChanges = @\{.*?^    \}\r?\n", ""
+        Set-Content -LiteralPath $profilePath -Value $content -Encoding UTF8
+        $module = Get-Module CodexReviewLoop
+
+        $profile = & $module {
+            param($path)
+            Import-ReviewLoopConfig -ConfigPath $path
+        } $profilePath
+        $profile.TargetedTestRepositoryChanges.Mode | Should Be "Fail"
+        & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+
+        foreach ($policy in @(
+            @{ Mode = "Fail" },
+            @{ Mode = "RestoreAll" }
+        )) {
+            $profile.TargetedTestRepositoryChanges = $policy
+            (Test-Throws {
+                & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+            }) | Should Be $false
+        }
+
+        foreach ($invalidPolicy in @(
+            "RestoreAll",
+            @{},
+            @{ Mode = "Unknown" },
+            @{ Mode = "RestoreMatching" },
+            @{ Mode = "Fail"; PathRegex = @("^one$") },
+            @{ Mode = "RestoreAll"; Unexpected = $true }
+        )) {
+            $profile.TargetedTestRepositoryChanges = $invalidPolicy
+            (Test-Throws {
+                & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+            }) | Should Be $true
+        }
+    }
+
+    It "validates host-gate repository-change policies and preserves the safe default" {
+        $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
+            -Path (Join-Path $TestDrive "host-gate-policy.psd1") `
+            -LogRoot (Join-Path $TestDrive "host-gate-policy-logs"))
+        $gate = @{
+            Name = "policy gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+        }
+        $profile.HostGates = @($gate)
+        $module = Get-Module CodexReviewLoop
+
+        & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+        $defaultPolicy = & $module {
+            param($item)
+            Get-ReviewLoopHostGateRepositoryChanges -Gate $item
+        } $gate
+        $defaultPolicy.Mode | Should Be "Fail"
+        @($defaultPolicy.PathRegex).Count | Should Be 0
+
+        foreach ($policy in @(
+            @{ Mode = "Fail" },
+            @{ Mode = "RestoreAll" },
+            @{ Mode = "RestoreMatching"; PathRegex = @("^generated/.*[.]lock$") }
+        )) {
+            $gate.RepositoryChanges = $policy
+            (Test-Throws {
+                & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+            }) | Should Be $false
+        }
+        (& $module {
+            param($policy)
+            Test-ReviewLoopHostGateMutationAllowed `
+                -Policy $policy -Paths @("source/generated.lock")
+        } ([pscustomobject]@{
+            Mode = "RestoreMatching"
+            PathRegex = @("^SOURCE/GENERATED[.]LOCK$")
+        })) | Should Be $true
+
+        foreach ($invalidPolicy in @(
+            "RestoreAll",
+            @{ PathRegex = @("^one$") },
+            @{ Mode = "Unknown" },
+            @{ Mode = "RestoreMatching" },
+            @{ Mode = "RestoreMatching"; PathRegex = @() },
+            @{ Mode = "RestoreMatching"; PathRegex = "^one$" },
+            @{ Mode = "RestoreMatching"; PathRegex = @(42) },
+            @{ Mode = "RestoreMatching"; PathRegex = @("[") },
+            @{ Mode = "Fail"; PathRegex = @("^one$") },
+            @{ Mode = "RestoreAll"; PathRegex = @("^one$") },
+            @{ Mode = "Fail"; Unexpected = $true }
+        )) {
+            $gate.RepositoryChanges = $invalidPolicy
+            (Test-Throws {
+                & $module { param($config) Assert-ReviewLoopConfigValues -Config $config } $profile
+            }) | Should Be $true
+        }
     }
 
     It "preflights symbolic host-gate executables without changing the profile" {
@@ -1045,6 +1152,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
             Replace("LessonsLearnedCommitThreshold = 6", "LessonsLearnedCommitThreshold = 9").
             Replace("ReviewAfterLessonsLearnedCommit = `$false", "ReviewAfterLessonsLearnedCommit = `$true").
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 7").
+            Replace("Mode = 'Fail'", "Mode = 'RestoreAll'").
             Replace("AutoCommit = `$true", "AutoCommit = `$false").
             Replace(
                 'CommitMessagePrefix = "Test Review Loop"',
@@ -1116,6 +1224,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
     It "adds lessons-learned state to an older checkpoint" {
         $state.PSObject.Properties.Remove("ActiveFindingSource")
         $state.PSObject.Properties.Remove("LessonsLearned")
+        $state.PSObject.Properties.Remove("ActiveHostGateRecovery")
         $path = Join-Path $TestDrive "old-lessons-state.json"
         Write-ReviewLoopState -Path $path -State $state | Out-Null
 
@@ -1125,6 +1234,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
         $reloaded.LessonsLearned.Status | Should Be "pending"
         $reloaded.LessonsLearned.Attempt | Should Be 0
         $reloaded.LessonsLearned.ReviewAfterCommit | Should Be $false
+        $reloaded.ActiveHostGateRecovery | Should BeNullOrEmpty
     }
 
     It "reconstructs durable role sessions from an older checkpoint" {

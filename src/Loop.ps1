@@ -326,7 +326,31 @@ function Get-ReviewLoopRepositorySnapshot {
             "branch", "--show-current"
         )
         HeadRef = $headRef
+        RefsFingerprint = Get-ReviewLoopGitRefsFingerprint -RepoPath $RepoPath
+        IndexFingerprint = Get-ReviewLoopGitIndexFingerprint -RepoPath $RepoPath
     }
+}
+
+function Get-ReviewLoopGitRefsFingerprint {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $refs = @(& git -C $RepoPath for-each-ref `
+        "--format=%(refname) %(objectname)" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not inspect repository refs."
+    }
+    return Get-ReviewLoopSha256 (@($refs | Sort-Object) -join "`n")
+}
+
+function Get-ReviewLoopGitIndexFingerprint {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $entries = @(& git -C $RepoPath -c core.quotepath=false `
+        ls-files --stage -v 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not inspect the repository index."
+    }
+    return Get-ReviewLoopSha256 (@($entries) -join "`n")
 }
 
 function Get-ReviewLoopReviewerRecoveryLocatorPath {
@@ -643,28 +667,31 @@ function Invoke-ReviewLoopHostGate {
 
 function Invoke-ReviewLoopHostGates {
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$HostGates,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$ClusterId,
-        [long]$InactivityTimeoutSeconds = 1800,
-        [AllowNull()][hashtable]$Config = $null
+        [long]$InactivityTimeoutSeconds = 1800
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($gate in $HostGates) {
-        if ($null -ne $Config) {
-            Update-ReviewLoopLiveConfig -Config $Config
-            Assert-ReviewLoopExecutionUnchanged -Config $Config
-            $InactivityTimeoutSeconds =
-                Get-ReviewLoopInactivityTimeoutSeconds -Config $Config
-        }
-        $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        Update-ReviewLoopLiveConfig -Config $Config
+        Assert-ReviewLoopExecutionUnchanged -Config $Config
+        $InactivityTimeoutSeconds =
+            Get-ReviewLoopInactivityTimeoutSeconds -Config $Config
+        New-ReviewLoopHostGateRecovery `
+            -State $State -StatePath $StatePath -RepoPath $RepoPath `
+            -RunRoot $RunRoot -Gate $gate | Out-Null
         $result = Invoke-ReviewLoopHostGate `
             -RepoPath $RepoPath -Gate $gate -RunRoot $RunRoot -ClusterId $ClusterId `
             -InactivityTimeoutSeconds $InactivityTimeoutSeconds
-        Assert-ReviewLoopRepositoryUnchanged `
-            -RepoPath $RepoPath -Snapshot $snapshot -Operation "Host gate '$($gate.Name)'"
+        Complete-ReviewLoopHostGateRecovery `
+            -Config $Config -State $State -StatePath $StatePath `
+            -RepoPath $RepoPath -Gate $gate | Out-Null
         [void]$results.Add($result)
         if (-not $result.Success) {
             return [pscustomobject]@{ Success = $false; Results = $results.ToArray(); Failure = $result }
@@ -675,6 +702,9 @@ function Invoke-ReviewLoopHostGates {
 
 function Invoke-ReviewLoopTargetedTests {
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$FixerResult,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
@@ -736,13 +766,20 @@ function Invoke-ReviewLoopTargetedTests {
         Name = "Targeted regression test"
         FilePath = [string]$test.executable
         Arguments = $arguments
+        RepositoryChanges = $Config.TargetedTestRepositoryChanges
     }
+    New-ReviewLoopHostGateRecovery `
+        -State $State -StatePath $StatePath -RepoPath $RepoPath `
+        -RunRoot $RunRoot -Gate $gate -Kind TargetedTest | Out-Null
     $result = Invoke-ReviewLoopHostGate `
         -RepoPath $RepoPath `
         -Gate $gate `
         -RunRoot $RunRoot `
         -ClusterId "$ClusterId-fix-$Attempt" `
         -InactivityTimeoutSeconds $InactivityTimeoutSeconds
+    Complete-ReviewLoopHostGateRecovery `
+        -Config $Config -State $State -StatePath $StatePath `
+        -RepoPath $RepoPath -Gate $gate | Out-Null
     $FixerResult | Add-Member -Force -NotePropertyName testExecution -NotePropertyValue ([pscustomobject]@{
         FilePath = [string]$result.FilePath
         Arguments = @($result.Arguments)
@@ -923,6 +960,705 @@ function Write-ReviewLoopGitBinaryPatch {
         }
         $process.Dispose()
     }
+}
+
+function Get-ReviewLoopHostGateIdentity {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Gate)
+
+    return Get-ReviewLoopSha256 (ConvertTo-ReviewLoopJsonCompact ([ordered]@{
+        Name = [string]$Gate.Name
+        FilePath = [string]$Gate.FilePath
+        Arguments = @($Gate.Arguments | ForEach-Object { [string]$_ })
+    }))
+}
+
+function Get-ReviewLoopHostGatePathDescriptor {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Head,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $normalized = $Path.Replace("\", "/")
+    $headEntry = @(& git -C $RepoPath ls-tree $Head -- $normalized 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not classify host-gate path '$normalized'."
+    }
+    if ($headEntry.Count -gt 0) {
+        $mode = ([string]$headEntry[0] -split '\s+')[0]
+        if ($mode -eq "160000") {
+            throw "Host-gate recovery does not support submodule changes: $normalized"
+        }
+        if ($mode -eq "120000") {
+            throw "Host-gate recovery does not support symbolic-link changes: $normalized"
+        }
+        $absolute = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath $RepoPath -RelativePath $normalized `
+            -Description "Host-gate recovery"
+        $fileType = if (Test-Path -LiteralPath $absolute) {
+            if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+                throw "Tracked host-gate path is not a regular file: $normalized"
+            }
+            "tracked_file"
+        }
+        else {
+            "tracked_deletion"
+        }
+        return [pscustomobject][ordered]@{
+            Path = $normalized
+            FileType = $fileType
+            PatchHash = Get-ReviewLoopTrackedPathPatchHash `
+                -RepoPath $RepoPath -Head $Head -Path $normalized
+            Sha256 = ""
+            Length = 0L
+        }
+    }
+
+    $absolute = Assert-ReviewLoopPathWithoutReparsePoints `
+        -RootPath $RepoPath -RelativePath $normalized `
+        -Description "Host-gate recovery"
+    if (-not (Test-Path -LiteralPath $absolute)) {
+        return [pscustomobject][ordered]@{
+            Path = $normalized
+            FileType = "absent"
+            PatchHash = ""
+            Sha256 = ""
+            Length = 0L
+        }
+    }
+    if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+        throw "Untracked host-gate path is not a regular file: $normalized"
+    }
+    $item = Get-Item -LiteralPath $absolute -Force
+    return [pscustomobject][ordered]@{
+        Path = $normalized
+        FileType = "untracked_file"
+        PatchHash = ""
+        Sha256 = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+        Length = [int64]$item.Length
+    }
+}
+
+function Get-ReviewLoopHostGateHeadDescriptor {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Head,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $normalized = $Path.Replace("\", "/")
+    $headEntry = @(& git -C $RepoPath ls-tree $Head -- $normalized 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git could not classify saved host-gate path '$normalized'."
+    }
+    if ($headEntry.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Path = $normalized
+            FileType = "absent"
+            PatchHash = ""
+            Sha256 = ""
+            Length = 0L
+        }
+    }
+    $mode = ([string]$headEntry[0] -split '\s+')[0]
+    if ($mode -eq "160000") {
+        throw "Host-gate recovery does not support submodule changes: $normalized"
+    }
+    if ($mode -eq "120000") {
+        throw "Host-gate recovery does not support symbolic-link changes: $normalized"
+    }
+    return [pscustomobject][ordered]@{
+        Path = $normalized
+        FileType = "tracked_file"
+        PatchHash = Get-ReviewLoopSha256 ""
+        Sha256 = ""
+        Length = 0L
+    }
+}
+
+function Test-ReviewLoopHostGateDescriptorEqual {
+    param(
+        [Parameter(Mandatory = $true)][object]$Left,
+        [Parameter(Mandatory = $true)][object]$Right
+    )
+    return (ConvertTo-ReviewLoopJsonCompact $Left) -eq
+        (ConvertTo-ReviewLoopJsonCompact $Right)
+}
+
+function Assert-ReviewLoopHostGateRepositoryIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Manifest
+    )
+
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$snapshot.Head -ne [string]$Manifest.Head -or
+        [string]$snapshot.HeadRef -ne [string]$Manifest.HeadRef -or
+        [string]$snapshot.Branch -ne [string]$Manifest.Branch -or
+        [string]$snapshot.RefsFingerprint -ne [string]$Manifest.RefsFingerprint) {
+        throw "HEAD, branch, or repository refs changed during host-gate recovery; automatic restoration was not attempted."
+    }
+    & git -C $RepoPath diff --cached --quiet ([string]$Manifest.Head) -- 2>$null
+    if ($LASTEXITCODE -gt 1) {
+        throw "Git could not inspect the index during host-gate recovery."
+    }
+    if ($LASTEXITCODE -eq 1) {
+        throw "The Git index changed during the host gate; automatic restoration was not attempted."
+    }
+    if ([string]$snapshot.IndexFingerprint -ne [string]$Manifest.IndexFingerprint) {
+        throw "The Git index metadata changed during the host gate; automatic restoration was not attempted."
+    }
+}
+
+function New-ReviewLoopHostGateRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Gate,
+        [ValidateSet("HostGate", "TargetedTest")][string]$Kind = "HostGate"
+    )
+
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    & git -C $RepoPath diff --cached --quiet ([string]$snapshot.Head) -- 2>$null
+    if ($LASTEXITCODE -gt 1) {
+        throw "Git could not inspect the index before host gate '$($Gate.Name)'."
+    }
+    if ($LASTEXITCODE -eq 1) {
+        throw "Host gate '$($Gate.Name)' cannot start because the verified patch is already staged; the orchestrator requires a clean index."
+    }
+
+    $parent = Join-Path $RunRoot "host-gate-recovery"
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+    $artifactRoot = Join-Path $parent ([Guid]::NewGuid().ToString("N"))
+    $temporaryRoot = "$artifactRoot.tmp"
+    [System.IO.Directory]::CreateDirectory($temporaryRoot) | Out-Null
+    try {
+        $changedPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
+        $entries = [System.Collections.Generic.List[object]]::new()
+        foreach ($path in $changedPaths) {
+            $descriptor = Get-ReviewLoopHostGatePathDescriptor `
+                -RepoPath $RepoPath -Head ([string]$snapshot.Head) -Path $path
+            [void]$entries.Add($descriptor)
+            if ([string]$descriptor.FileType -ne "untracked_file") {
+                continue
+            }
+            $source = Resolve-ReviewLoopRepositoryRelativePath `
+                -RepoPath $RepoPath -RelativePath $path
+            $destination = Join-Path (Join-Path $temporaryRoot "untracked") $path
+            [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+            [System.IO.File]::Copy($source, $destination, $false)
+            $copiedHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($copiedHash -ne [string]$descriptor.Sha256) {
+                throw "Host-gate recovery could not preserve untracked file '$path'."
+            }
+        }
+        $patchPath = Join-Path $temporaryRoot "tracked.patch"
+        Write-ReviewLoopGitBinaryPatch `
+            -RepoPath $RepoPath -Head ([string]$snapshot.Head) -Path $patchPath
+        $manifest = [pscustomobject][ordered]@{
+            SchemaVersion = "1.0"
+            GateName = [string]$Gate.Name
+            GateIdentity = Get-ReviewLoopHostGateIdentity -Gate $Gate
+            Head = [string]$snapshot.Head
+            HeadRef = [string]$snapshot.HeadRef
+            Branch = [string]$snapshot.Branch
+            RefsFingerprint = [string]$snapshot.RefsFingerprint
+            IndexFingerprint = [string]$snapshot.IndexFingerprint
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+            ChangedPaths = @($changedPaths)
+            Entries = @($entries)
+            PatchFile = "tracked.patch"
+            PatchSha256 = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            CreatedAt = [DateTimeOffset]::UtcNow.ToString("O")
+        }
+        Write-ReviewLoopAtomicJson `
+            -Path (Join-Path $temporaryRoot "manifest.json") -Value $manifest
+        $manifestSha256 = (Get-FileHash `
+            -LiteralPath (Join-Path $temporaryRoot "manifest.json") `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+        Move-Item -LiteralPath $temporaryRoot -Destination $artifactRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryRoot) {
+            Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+        }
+    }
+
+    $recovery = [pscustomobject][ordered]@{
+        GateName = [string]$Gate.Name
+        GateIdentity = Get-ReviewLoopHostGateIdentity -Gate $Gate
+        Kind = $Kind
+        FilePath = [string]$Gate.FilePath
+        Arguments = @($Gate.Arguments | ForEach-Object { [string]$_ })
+        ArtifactRoot = $artifactRoot
+        ManifestPath = Join-Path $artifactRoot "manifest.json"
+        ManifestSha256 = $manifestSha256
+        Phase = "running"
+        ObservedFingerprint = ""
+        ObservedPaths = @()
+        ObservedEntries = @()
+    }
+    $State.ActiveHostGateRecovery = $recovery
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    return $recovery
+}
+
+function Get-ReviewLoopHostGateMutation {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Manifest
+    )
+
+    Assert-ReviewLoopHostGateRepositoryIdentity -RepoPath $RepoPath -Manifest $Manifest
+    $currentPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
+    $allPaths = @(@($Manifest.ChangedPaths) + $currentPaths | Sort-Object -Unique)
+    $baselineByPath = @{}
+    foreach ($entry in @($Manifest.Entries)) {
+        $baselineByPath[[string]$entry.Path] = $entry
+    }
+    $observed = [System.Collections.Generic.List[object]]::new()
+    $mutations = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in $allPaths) {
+        $baseline = if ($baselineByPath.ContainsKey([string]$path)) {
+            $baselineByPath[[string]$path]
+        }
+        else {
+            Get-ReviewLoopHostGateHeadDescriptor `
+                -RepoPath $RepoPath -Head ([string]$Manifest.Head) -Path ([string]$path)
+        }
+        $current = Get-ReviewLoopHostGatePathDescriptor `
+            -RepoPath $RepoPath -Head ([string]$Manifest.Head) -Path ([string]$path)
+        [void]$observed.Add($current)
+        if (-not (Test-ReviewLoopHostGateDescriptorEqual -Left $baseline -Right $current)) {
+            [void]$mutations.Add(([string]$path).Replace("\", "/"))
+        }
+    }
+    return [pscustomobject]@{
+        Paths = @($mutations)
+        ObservedPaths = @($allPaths)
+        ObservedEntries = @($observed)
+        Fingerprint = Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath
+    }
+}
+
+function Test-ReviewLoopHostGateMutationAllowed {
+    param(
+        [Parameter(Mandatory = $true)][object]$Policy,
+        [Parameter(Mandatory = $true)][string[]]$Paths
+    )
+
+    if ([string]$Policy.Mode -eq "RestoreAll") {
+        return $true
+    }
+    if ([string]$Policy.Mode -ne "RestoreMatching") {
+        return $false
+    }
+    $options = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    foreach ($path in $Paths) {
+        $matched = $false
+        foreach ($pattern in @($Policy.PathRegex)) {
+            try {
+                if ([regex]::IsMatch($path, [string]$pattern, $options, [TimeSpan]::FromSeconds(1))) {
+                    $matched = $true
+                    break
+                }
+            }
+            catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+                throw "RepositoryChanges PathRegex '$pattern' timed out while matching '$path'."
+            }
+        }
+        if (-not $matched) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function New-ReviewLoopHostGateMutationException {
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Gate,
+        [Parameter(Mandatory = $true)][string[]]$Paths,
+        [ValidateSet("HostGate", "TargetedTest")][string]$Kind = "HostGate"
+    )
+
+    $profilePath = if (
+        $Config -is [System.Collections.IDictionary] -and
+        $Config.Contains("__ConfigPath")
+    ) {
+        [string]$Config["__ConfigPath"]
+    }
+    else {
+        "<active profile>"
+    }
+    if ($Kind -eq "TargetedTest") {
+        $pathText = @($Paths | ForEach-Object { "- $_" }) -join [Environment]::NewLine
+        $restoreBlock = @"
+TargetedTestRepositoryChanges = @{
+    Mode = 'RestoreAll'
+}
+"@.Trim()
+        return New-ReviewLoopFailureException `
+            -Message "Targeted test '$($Gate.Name)' changed repository path(s); automatic restoration is disabled:`n$pathText" `
+            -NextSteps @(
+                "Edit '$profilePath'. Add or replace this top-level profile setting:`n$restoreBlock"
+                "Run the same review-loop command again. The saved checkpoint will restore the targeted-test changes before rerunning the test."
+            ) `
+            -RecommendedStepCount 2
+    }
+    $policy = Get-ReviewLoopHostGateRepositoryChanges -Gate $Gate
+    $patterns = [System.Collections.Generic.List[string]]::new()
+    foreach ($existing in @($policy.PathRegex)) {
+        if (-not $patterns.Contains([string]$existing)) {
+            [void]$patterns.Add([string]$existing)
+        }
+    }
+    foreach ($path in $Paths) {
+        $pattern = "^$([regex]::Escape($path.Replace('\', '/')))$"
+        if (-not $patterns.Contains($pattern)) {
+            [void]$patterns.Add($pattern)
+        }
+    }
+    $patternLines = @($patterns | ForEach-Object {
+        "        " + (ConvertTo-ReviewLoopPowerShellLiteral ([string]$_))
+    }) -join [Environment]::NewLine
+    $matchingBlock = @"
+RepositoryChanges = @{
+    Mode = 'RestoreMatching'
+    PathRegex = @(
+$patternLines
+    )
+}
+"@.Trim()
+    $allBlock = @"
+RepositoryChanges = @{
+    Mode = 'RestoreAll'
+}
+"@.Trim()
+    $pathText = @($Paths | ForEach-Object { "- $_" }) -join [Environment]::NewLine
+    return New-ReviewLoopFailureException `
+        -Message "Host gate '$($Gate.Name)' changed repository path(s) that are not authorized for automatic restoration:`n$pathText" `
+        -NextSteps @(
+            "Edit '$profilePath'. Inside the HostGates entry named '$($Gate.Name)', add or replace this RepositoryChanges block:`n$matchingBlock"
+            "Run the same review-loop command again. The saved checkpoint will restore the gate changes before continuing."
+            "Broader alternative: RestoreAll treats every regular file change during this gate as disposable and requires exclusive repository use:`n$allBlock"
+        ) `
+        -RecommendedStepCount 2
+}
+
+function Restore-ReviewLoopHostGateBaseline {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Recovery,
+        [Parameter(Mandatory = $true)][object]$Manifest
+    )
+
+    Assert-ReviewLoopHostGateRepositoryIdentity -RepoPath $RepoPath -Manifest $Manifest
+    $artifactRoot = [string]$Recovery.ArtifactRoot
+    $patchPath = Assert-ReviewLoopPathWithoutReparsePoints `
+        -RootPath $artifactRoot -RelativePath ([string]$Manifest.PatchFile) `
+        -Description "Host-gate recovery artifact"
+    if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
+        throw "The host-gate recovery patch is missing."
+    }
+    $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($patchHash -ne [string]$Manifest.PatchSha256) {
+        throw "The host-gate recovery patch failed its integrity check."
+    }
+    foreach ($entry in @($Manifest.Entries | Where-Object {
+        [string]$_.FileType -eq "untracked_file"
+    })) {
+        $saved = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath (Join-Path $artifactRoot "untracked") `
+            -RelativePath ([string]$entry.Path) `
+            -Description "Host-gate recovery artifact"
+        if (-not (Test-Path -LiteralPath $saved -PathType Leaf)) {
+            throw "Saved host-gate recovery file is missing: $($entry.Path)"
+        }
+        $savedItem = Get-Item -LiteralPath $saved -Force
+        $savedHash = (Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ([int64]$savedItem.Length -ne [int64]$entry.Length -or
+            $savedHash -ne [string]$entry.Sha256) {
+            throw "Saved host-gate recovery file failed its integrity check: $($entry.Path)"
+        }
+    }
+    $currentPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
+    $allowedPaths = @(@($Manifest.ChangedPaths) + @($Recovery.ObservedPaths) | Sort-Object -Unique)
+    foreach ($path in $currentPaths) {
+        if ([string]$path -notin $allowedPaths) {
+            throw "Unexpected path appeared during host-gate recovery: $path"
+        }
+    }
+    if ([string]$Recovery.Phase -eq "restoring") {
+        $baselineByPath = @{}
+        foreach ($entry in @($Manifest.Entries)) {
+            $baselineByPath[[string]$entry.Path] = $entry
+        }
+        $observedByPath = @{}
+        foreach ($entry in @($Recovery.ObservedEntries)) {
+            $observedByPath[[string]$entry.Path] = $entry
+        }
+        foreach ($path in $allowedPaths) {
+            $headDescriptor = Get-ReviewLoopHostGateHeadDescriptor `
+                -RepoPath $RepoPath -Head ([string]$Manifest.Head) -Path ([string]$path)
+            $baselineDescriptor = if ($baselineByPath.ContainsKey([string]$path)) {
+                $baselineByPath[[string]$path]
+            }
+            else {
+                $headDescriptor
+            }
+            $observedDescriptor = if ($observedByPath.ContainsKey([string]$path)) {
+                $observedByPath[[string]$path]
+            }
+            else {
+                $baselineDescriptor
+            }
+            $currentDescriptor = Get-ReviewLoopHostGatePathDescriptor `
+                -RepoPath $RepoPath -Head ([string]$Manifest.Head) -Path ([string]$path)
+            if (-not (Test-ReviewLoopHostGateDescriptorEqual `
+                    -Left $currentDescriptor -Right $baselineDescriptor) -and
+                -not (Test-ReviewLoopHostGateDescriptorEqual `
+                    -Left $currentDescriptor -Right $observedDescriptor) -and
+                -not (Test-ReviewLoopHostGateDescriptorEqual `
+                    -Left $currentDescriptor -Right $headDescriptor)) {
+                throw "Path '$path' changed independently during interrupted host-gate recovery; automatic restoration was not attempted."
+            }
+        }
+    }
+    else {
+        $currentFingerprint = Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath
+        if ($currentFingerprint -ne [string]$Recovery.ObservedFingerprint) {
+            throw "The worktree changed after host-gate mutations were recorded; automatic restoration was not attempted."
+        }
+        $Recovery.Phase = "restoring"
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
+
+    $trackedPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in $allowedPaths) {
+        $headEntry = @(& git -C $RepoPath ls-tree ([string]$Manifest.Head) -- $path 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not inspect host-gate recovery path '$path'."
+        }
+        if ($headEntry.Count -gt 0) {
+            [void]$trackedPaths.Add([string]$path)
+            continue
+        }
+        $absolute = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath $RepoPath -RelativePath ([string]$path) `
+            -Description "Host-gate recovery"
+        if (Test-Path -LiteralPath $absolute) {
+            if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+                throw "Host-gate recovery path is not a regular file: $path"
+            }
+            Remove-Item -LiteralPath $absolute -Force
+        }
+    }
+    if ($trackedPaths.Count -gt 0) {
+        $output = @(& git -C $RepoPath restore "--source=$($Manifest.Head)" `
+            --staged --worktree -- @($trackedPaths) 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not reset host-gate paths: $($output -join ' ')"
+        }
+    }
+
+    $trackedBaseline = @($Manifest.Entries | Where-Object {
+        [string]$_.FileType -in @("tracked_file", "tracked_deletion")
+    })
+    if ($trackedBaseline.Count -gt 0) {
+        $output = @(& git -C $RepoPath apply --binary --whitespace=nowarn -- $patchPath 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git could not reapply the verified pre-gate patch: $($output -join ' ')"
+        }
+    }
+    foreach ($entry in @($Manifest.Entries | Where-Object {
+        [string]$_.FileType -eq "untracked_file"
+    })) {
+        $saved = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath (Join-Path $artifactRoot "untracked") `
+            -RelativePath ([string]$entry.Path) `
+            -Description "Host-gate recovery artifact"
+        $destination = Resolve-ReviewLoopRepositoryRelativePath `
+            -RepoPath $RepoPath -RelativePath ([string]$entry.Path)
+        [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+        [System.IO.File]::Copy($saved, $destination, $true)
+    }
+    $restored = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$restored.Head -ne [string]$Manifest.Head -or
+        [string]$restored.HeadRef -ne [string]$Manifest.HeadRef -or
+        [string]$restored.Branch -ne [string]$Manifest.Branch -or
+        [string]$restored.RefsFingerprint -ne [string]$Manifest.RefsFingerprint -or
+        [string]$restored.IndexFingerprint -ne [string]$Manifest.IndexFingerprint -or
+        [string]$restored.Fingerprint -ne [string]$Manifest.WorktreeFingerprint) {
+        throw "Host-gate recovery did not restore the exact verified repository state."
+    }
+}
+
+function Clear-ReviewLoopHostGateRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath
+    )
+
+    $recovery = $State.ActiveHostGateRecovery
+    $State.ActiveHostGateRecovery = $null
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    if ($null -eq $recovery) {
+        return
+    }
+    $artifactRoot = [System.IO.Path]::GetFullPath([string]$recovery.ArtifactRoot)
+    $runRoot = [System.IO.Path]::GetFullPath([string]$State.RunRoot).TrimEnd('\', '/')
+    if ($artifactRoot.StartsWith(
+        $runRoot + [System.IO.Path]::DirectorySeparatorChar,
+        [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $artifactRoot)) {
+        Remove-Item -LiteralPath $artifactRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Complete-ReviewLoopHostGateRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Gate
+    )
+
+    $recovery = $State.ActiveHostGateRecovery
+    if ($null -eq $recovery) {
+        return @()
+    }
+    $kind = [string](Get-ReviewLoopObjectProperty `
+        -Object $recovery -Name "Kind" -Default "HostGate")
+    $operationTitle = if ($kind -eq "TargetedTest") { "Targeted test" } else { "Host gate" }
+    if ([string]$recovery.GateIdentity -ne (Get-ReviewLoopHostGateIdentity -Gate $Gate)) {
+        throw "The active repository recovery does not match $($operationTitle.ToLowerInvariant()) '$($Gate.Name)'; restore the original command before resuming."
+    }
+    $runRoot = [System.IO.Path]::GetFullPath([string]$State.RunRoot)
+    $artifactRelative = [System.IO.Path]::GetRelativePath(
+        $runRoot,
+        [System.IO.Path]::GetFullPath([string]$recovery.ArtifactRoot))
+    $artifactRoot = Assert-ReviewLoopPathWithoutReparsePoints `
+        -RootPath $runRoot -RelativePath $artifactRelative `
+        -Description "Host-gate recovery artifact"
+    $expectedManifestPath = Join-Path $artifactRoot "manifest.json"
+    if (-not (Test-ReviewLoopSamePath `
+            -Left $expectedManifestPath -Right ([string]$recovery.ManifestPath))) {
+        throw "The host-gate recovery manifest path is outside its artifact."
+    }
+    if (-not (Test-Path -LiteralPath $expectedManifestPath -PathType Leaf)) {
+        throw "The host-gate recovery manifest is missing."
+    }
+    $manifestHash = (Get-FileHash `
+        -LiteralPath $expectedManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($manifestHash -ne [string]$recovery.ManifestSha256) {
+        throw "The host-gate recovery manifest failed its integrity check."
+    }
+    $manifest = Read-ReviewLoopJson -Path $expectedManifestPath
+    if ([string]$manifest.SchemaVersion -ne "1.0" -or
+        [string]$manifest.GateIdentity -ne [string]$recovery.GateIdentity) {
+        throw "The host-gate recovery manifest is incompatible with the saved checkpoint."
+    }
+    if ([string]$recovery.Phase -eq "running") {
+        $mutation = Get-ReviewLoopHostGateMutation `
+            -RepoPath $RepoPath -Manifest $manifest
+        if (@($mutation.Paths).Count -eq 0) {
+            Clear-ReviewLoopHostGateRecovery -State $State -StatePath $StatePath
+            return @()
+        }
+        $recovery.Phase = "observed"
+        $recovery.ObservedFingerprint = [string]$mutation.Fingerprint
+        $recovery.ObservedPaths = @($mutation.ObservedPaths)
+        $recovery.ObservedEntries = @($mutation.ObservedEntries)
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
+    $mutationPaths = [System.Collections.Generic.List[string]]::new()
+    $baselineByPath = @{}
+    foreach ($entry in @($manifest.Entries)) {
+        $baselineByPath[[string]$entry.Path] = $entry
+    }
+    foreach ($observed in @($recovery.ObservedEntries)) {
+        $path = [string]$observed.Path
+        $baseline = if ($baselineByPath.ContainsKey($path)) {
+            $baselineByPath[$path]
+        }
+        else {
+            Get-ReviewLoopHostGateHeadDescriptor `
+                -RepoPath $RepoPath -Head ([string]$manifest.Head) -Path $path
+        }
+        if (-not (Test-ReviewLoopHostGateDescriptorEqual -Left $baseline -Right $observed)) {
+            [void]$mutationPaths.Add($path)
+        }
+    }
+    $policy = Get-ReviewLoopHostGateRepositoryChanges -Gate $Gate
+    if (-not (Test-ReviewLoopHostGateMutationAllowed `
+        -Policy $policy -Paths @($mutationPaths))) {
+        throw (New-ReviewLoopHostGateMutationException `
+            -Config $Config -Gate $Gate -Paths @($mutationPaths) -Kind $kind)
+    }
+    if ([string]$policy.Mode -eq "RestoreAll") {
+        Write-ReviewLoopStatus `
+            -Message "$operationTitle '$($Gate.Name)' uses RestoreAll; every regular file change during this operation is treated as disposable." `
+            -Kind Warning
+    }
+    Restore-ReviewLoopHostGateBaseline `
+        -State $State -StatePath $StatePath -RepoPath $RepoPath `
+        -Recovery $recovery -Manifest $manifest
+    Write-ReviewLoopStatus `
+        -Message "$operationTitle '$($Gate.Name)' repository side effects restored: $(@($mutationPaths) -join ', ')" `
+        -Kind Success -Indent 1
+    Clear-ReviewLoopHostGateRecovery -State $State -StatePath $StatePath
+    return @($mutationPaths)
+}
+
+function Resume-ReviewLoopHostGateRecovery {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $recovery = Get-ReviewLoopObjectProperty `
+        -Object $State -Name "ActiveHostGateRecovery"
+    if ($null -eq $recovery) {
+        return $false
+    }
+    Update-ReviewLoopLiveConfig -Config $Config
+    $kind = [string](Get-ReviewLoopObjectProperty `
+        -Object $recovery -Name "Kind" -Default "HostGate")
+    $gates = @(if ($kind -eq "TargetedTest") {
+        @{
+            Name = [string]$recovery.GateName
+            FilePath = [string]$recovery.FilePath
+            Arguments = @($recovery.Arguments | ForEach-Object { [string]$_ })
+            RepositoryChanges = $Config.TargetedTestRepositoryChanges
+        }
+    }
+    else {
+        $Config.HostGates | Where-Object {
+            (Get-ReviewLoopHostGateIdentity -Gate $_) -eq [string]$recovery.GateIdentity
+        }
+    })
+    if ($gates.Count -ne 1 -or
+        (Get-ReviewLoopHostGateIdentity -Gate $gates[0]) -ne [string]$recovery.GateIdentity) {
+        $operation = if ($kind -eq "TargetedTest") { "targeted test" } else { "host gate" }
+        throw "The $operation '$($recovery.GateName)' awaiting repository recovery no longer has the same command."
+    }
+    $operationTitle = if ($kind -eq "TargetedTest") { "targeted test" } else { "host gate" }
+    Write-ReviewLoopStatus `
+        -Message "Resuming repository recovery for $operationTitle '$($recovery.GateName)'." `
+        -Kind Warning
+    Complete-ReviewLoopHostGateRecovery `
+        -Config $Config -State $State -StatePath $StatePath `
+        -RepoPath $RepoPath -Gate $gates[0] | Out-Null
+    return $true
 }
 
 function Get-ReviewLoopBlockedArtifact {
@@ -1790,6 +2526,7 @@ function Complete-ReviewLoopPendingCommit {
         Assert-ReviewLoopExecutionUnchanged -Config $Config
         $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
         $gates = Invoke-ReviewLoopHostGates `
+            -State $State -StatePath $StatePath `
             -RepoPath $RepoPath -HostGates @($Config.HostGates) `
             -RunRoot $RunRoot -ClusterId $State.ActiveClusterId `
             -InactivityTimeoutSeconds (Get-ReviewLoopInactivityTimeoutSeconds -Config $Config) `
@@ -1829,6 +2566,7 @@ function Complete-ReviewLoopFix {
     Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $gates = Invoke-ReviewLoopHostGates `
+        -State $State -StatePath $StatePath `
         -RepoPath $RepoPath `
         -HostGates @($Config.HostGates) `
         -RunRoot $RunRoot `
@@ -1917,6 +2655,7 @@ function Invoke-ReviewLoopAttemptAssessment {
     Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $tests = Invoke-ReviewLoopTargetedTests `
+        -Config $Config -State $State -StatePath $StatePath `
         -FixerResult $FixerCall.StructuredResult `
         -RepoPath $RepoPath `
         -RunRoot $RunRoot `
@@ -3130,6 +3869,16 @@ function Invoke-ReviewLoopCore {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
     else {
+        $terminalPath = Join-Path $paths.RunRoot "terminal.log"
+        Initialize-ReviewLoopConsole `
+            -OutputMode $OutputMode `
+            -HeartbeatSeconds $HeartbeatSeconds `
+            -ColorMode $ColorMode `
+            -HostOutputEnabled (-not $Json) `
+            -TranscriptPath $terminalPath
+        Resume-ReviewLoopHostGateRecovery `
+            -Config $config -State $state -StatePath $statePath `
+            -RepoPath $repo | Out-Null
         Complete-ReviewLoopInterruptedReviewerRecovery `
             -State $state -StatePath $statePath -RepoPath $repo | Out-Null
         $branch = [string]$state.Branch
@@ -3246,13 +3995,15 @@ function Invoke-ReviewLoopCore {
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
 
-    $terminalPath = Join-Path $paths.RunRoot "terminal.log"
-    Initialize-ReviewLoopConsole `
-        -OutputMode $OutputMode `
-        -HeartbeatSeconds $HeartbeatSeconds `
-        -ColorMode $ColorMode `
-        -HostOutputEnabled (-not $Json) `
-        -TranscriptPath $terminalPath
+    if (-not $resumed) {
+        $terminalPath = Join-Path $paths.RunRoot "terminal.log"
+        Initialize-ReviewLoopConsole `
+            -OutputMode $OutputMode `
+            -HeartbeatSeconds $HeartbeatSeconds `
+            -ColorMode $ColorMode `
+            -HostOutputEnabled (-not $Json) `
+            -TranscriptPath $terminalPath
+    }
 
     Import-ReviewLoopLegacyLedgers `
         -Paths $paths -RepoPath $repo -Branch $branch `

@@ -60,6 +60,9 @@ function New-ReliabilityConfig {
     ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
     InactivityTimeoutMinutes = 30
+    TargetedTestRepositoryChanges = @{
+        Mode = 'Fail'
+    }
     AutoCommit = `$true
     CommitMessagePrefix = 'Reliability'
     HostGates = @()
@@ -89,6 +92,18 @@ function Write-ReliabilityJsonArray {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Values
     )
     Set-Content -LiteralPath $Path -Value (ConvertTo-Json -InputObject @($Values) -Depth 30) -Encoding UTF8
+}
+
+function Test-ReliabilityThrows {
+    param([Parameter(Mandatory = $true)][scriptblock]$Script)
+
+    try {
+        & $Script | Out-Null
+        return $false
+    }
+    catch {
+        return $true
+    }
 }
 
 function New-ReliabilityTestCase {
@@ -607,12 +622,20 @@ Describe "Unattended Git and recovery reliability boundaries" `
                 rationale = "repository-specific regression wrapper"
             }
         }
+        $runRoot = Join-Path $caseRoot "targeted-success"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
         $module = Get-Module CodexReviewLoop
         $result = & $module {
-            param($value, $repository, $logs)
-            Invoke-ReviewLoopTargetedTests -FixerResult $value -RepoPath $repository `
+            param($profile, $loopState, $loopStatePath, $value, $repository, $logs)
+            Invoke-ReviewLoopTargetedTests `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -FixerResult $value -RepoPath $repository `
                 -RunRoot $logs -ClusterId custom -Attempt 1
-        } $fixer $repo $logRoot
+        } $config $state $statePath $fixer $repo $runRoot
         $result.Success | Should Be $true
         $fixer.testExecution.Passed | Should Be $true
     }
@@ -1066,13 +1089,18 @@ Describe "Unattended Git and recovery reliability boundaries" `
                 arguments = @("ignored")
             }
         }
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
 
         $result = & (Get-Module CodexReviewLoop) {
-            param($fix, $repository, $logs)
+            param($profile, $loopState, $loopStatePath, $fix, $repository, $logs)
             Invoke-ReviewLoopTargetedTests `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
                 -FixerResult $fix -RepoPath $repository -RunRoot $logs `
                 -ClusterId "C-start-failure" -Attempt 1
-        } $fixerResult $repo $runRoot
+        } $config $state $statePath $fixerResult $repo $runRoot
 
         $result.Success | Should Be $false
         $result.Correctable | Should Be $true
@@ -1208,7 +1236,15 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $config.HostGates = @(@{
             Name = "Solution tests"
             FilePath = "pwsh"
-            Arguments = @("-NoProfile", "-Command", "exit 0")
+            Arguments = @(
+                "-NoProfile",
+                "-Command",
+                "Set-Content -LiteralPath gate-output.tmp -Value generated; exit 0"
+            )
+            RepositoryChanges = @{
+                Mode = "RestoreMatching"
+                PathRegex = @("^gate-output[.]tmp$")
+            }
         })
         $runRoot = Join-Path $caseRoot "structured-message-run"
         New-Item -ItemType Directory -Path $runRoot | Out-Null
@@ -1271,6 +1307,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
             $verification $fixer $repo $runRoot $snapshot
 
         $result.Success | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $repo "gate-output.tmp")) | Should Be $false
         $subject = & git -C $repo show -s --format=%s HEAD
         $message = (& git -C $repo show -s --format=%B HEAD | Out-String).Trim()
         $subject | Should Be "Reliability: Fix dependency-aware cache invalidation"
@@ -1727,8 +1764,423 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
 
         $failure | Should Not BeNullOrEmpty
         $failure.Exception.Data["ReviewLoopStatus"] | Should Be "failed"
-        $failure.Exception.Message | Should Match "host gate.*changed repository state"
+        $failure.Exception.Message | Should Match "Host gate 'mutating gate'.*not authorized"
+        $failure.Exception.Message | Should Match "generated[.]txt"
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery.Phase |
+            Should Be "observed"
+        (Test-Path -LiteralPath (Join-Path $repo "generated.txt")) | Should Be $true
         (& git -C $repo rev-list --count HEAD) | Should Be 1
+    }
+
+    It "restores every allowed tracked and untracked gate side effect and supports policy update on resume" {
+        Set-Content -LiteralPath (Join-Path $repo "tracked-delete.txt") -Value "tracked baseline"
+        Set-Content -LiteralPath (Join-Path $repo "tracked-change.txt") -Value "tracked original"
+        & git -C $repo add tracked-delete.txt tracked-change.txt
+        & git -C $repo commit -q -m "recovery fixtures"
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fixer change"
+        New-Item -ItemType Directory -Path (Join-Path $repo "cache") | Out-Null
+        Set-Content -LiteralPath (Join-Path $repo "cache/deleted.tmp") -Value "saved deleted untracked"
+        Set-Content -LiteralPath (Join-Path $repo "cache/changed.tmp") -Value "saved changed untracked"
+
+        $runRoot = Join-Path $caseRoot "host-gate-recovery-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $gate = @{
+            Name = "generator gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+        }
+        $profilePath = [System.IO.Path]::GetFullPath((Join-Path $caseRoot "active-profile.psd1"))
+        $terminalPath = Join-Path $runRoot "terminal.log"
+        $config = @{ HostGates = @($gate); __ConfigPath = $profilePath }
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($path)
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath $path
+        } $terminalPath
+        $baseline = & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+            return $snapshot
+        } $state $statePath $repo $runRoot $gate
+
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "gate overwrote fixer change"
+        Set-Content -LiteralPath (Join-Path $repo "tracked-change.txt") -Value "gate changed tracked"
+        Remove-Item -LiteralPath (Join-Path $repo "tracked-delete.txt")
+        Remove-Item -LiteralPath (Join-Path $repo "cache/deleted.tmp")
+        Set-Content -LiteralPath (Join-Path $repo "cache/changed.tmp") -Value "gate changed untracked"
+        Set-Content -LiteralPath (Join-Path $repo "cache/new.tmp") -Value "gate-created untracked"
+
+        $failure = $null
+        try {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }
+        catch {
+            $failure = $_
+        }
+
+        & $module {
+            param($errorRecord, $path)
+            $steps = @(Get-ReviewLoopFailureNextSteps `
+                -Exception $errorRecord.Exception -Context failed)
+            Write-ReviewLoopFailureSummary `
+                -Title "Review Loop stopped" `
+                -Problem $errorRecord.Exception.Message -Status failed `
+                -NextSteps $steps -RecommendedStepCount 2 `
+                -TranscriptPath $path
+        } $failure $terminalPath
+
+        $failure | Should Not BeNullOrEmpty
+        $failure.Exception.Message | Should Match "generator gate"
+        $steps = @($failure.Exception.Data["ReviewLoopNextSteps"]) -join "`n"
+        $steps | Should Match ([regex]::Escape($profilePath))
+        $steps | Should Match "inside the HostGates entry named 'generator gate'"
+        $steps | Should Match "Mode = 'RestoreMatching'"
+        $steps | Should Match "Mode = 'RestoreAll'"
+        $steps | Should Match ([regex]::Escape("'^README\.txt$'"))
+        $steps | Should Match "Run the same review-loop command again"
+        $terminalText = Get-Content -Raw -LiteralPath $terminalPath
+        $terminalText | Should Match ([regex]::Escape((Split-Path -Leaf $profilePath)))
+        $terminalText | Should Match "generator gate"
+        $terminalText | Should Match "README[.]txt"
+        $terminalText | Should Match "Mode = 'RestoreMatching'"
+        $terminalText | Should Match "Run the same review-loop command again"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "gate overwrote fixer change"
+        (Test-Path -LiteralPath (Join-Path $repo "tracked-delete.txt")) | Should Be $false
+
+        $gate.RepositoryChanges = @{
+            Mode = "RestoreMatching"
+            PathRegex = @(
+                "^README[.]txt$",
+                "^tracked-change[.]txt$",
+                "^tracked-delete[.]txt$",
+                "^cache/deleted[.]tmp$",
+                "^cache/changed[.]tmp$",
+                "^cache/new[.]tmp$"
+            )
+        }
+        [void]$config.Remove("__ConfigPath")
+        (& $module {
+            param($activeConfig, $loopState, $loopStatePath, $repository)
+            Resume-ReviewLoopHostGateRecovery `
+                -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository
+        } $config $state $statePath $repo) | Should Be $true
+
+        (& $module {
+            param($repository)
+            (Get-ReviewLoopRepositorySnapshot -RepoPath $repository).Fingerprint
+        } $repo) | Should Be $baseline.Fingerprint
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "verified fixer change"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "tracked-change.txt")) |
+            Should Match "tracked original"
+        (Test-Path -LiteralPath (Join-Path $repo "tracked-delete.txt")) | Should Be $true
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "cache/deleted.tmp")) |
+            Should Match "saved deleted untracked"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "cache/changed.tmp")) |
+            Should Match "saved changed untracked"
+        (Test-Path -LiteralPath (Join-Path $repo "cache/new.tmp")) | Should Be $false
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery |
+            Should BeNullOrEmpty
+        & $module {
+            Initialize-ReviewLoopConsole `
+                -OutputMode compact -HeartbeatSeconds 0 -ColorMode Never `
+                -TranscriptPath ""
+        }
+    }
+
+    It "does not partially restore a mixed mutation and RestoreAll can restore it explicitly" {
+        $runRoot = Join-Path $caseRoot "host-gate-mixed-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $gate = @{
+            Name = "mixed gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+            RepositoryChanges = @{
+                Mode = "RestoreMatching"
+                PathRegex = @("^allowed[.]txt$")
+            }
+        }
+        $config = @{ HostGates = @($gate) }
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+        } $state $statePath $repo $runRoot $gate
+        Set-Content -LiteralPath (Join-Path $repo "allowed.txt") -Value "allowed"
+        Set-Content -LiteralPath (Join-Path $repo "denied.txt") -Value "denied"
+
+        (Test-ReliabilityThrows {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $repo "allowed.txt")) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $repo "denied.txt")) | Should Be $true
+
+        $gate.RepositoryChanges = @{ Mode = "RestoreAll" }
+        & $module {
+            param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+            Complete-ReviewLoopHostGateRecovery `
+                -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository -Gate $hostGate | Out-Null
+        } $config $state $statePath $repo $gate
+        (Test-Path -LiteralPath (Join-Path $repo "allowed.txt")) | Should Be $false
+        (Test-Path -LiteralPath (Join-Path $repo "denied.txt")) | Should Be $false
+    }
+
+    It "refuses concurrent worktree changes after gate mutations were recorded" {
+        $runRoot = Join-Path $caseRoot "host-gate-concurrent-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $gate = @{
+            Name = "concurrent gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+        }
+        $config = @{ HostGates = @($gate) }
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+        } $state $statePath $repo $runRoot $gate
+        Set-Content -LiteralPath (Join-Path $repo "generated.txt") -Value "gate value"
+        (Test-ReliabilityThrows {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }) | Should Be $true
+
+        Set-Content -LiteralPath (Join-Path $repo "generated.txt") -Value "concurrent value"
+        $gate.RepositoryChanges = @{ Mode = "RestoreAll" }
+        $failure = $null
+        try {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }
+        catch {
+            $failure = $_
+        }
+        $failure.Exception.Message | Should Match "changed after host-gate mutations were recorded"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "generated.txt")) |
+            Should Match "concurrent value"
+    }
+
+    It "finishes an interrupted host-gate restoration idempotently" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified baseline"
+        Set-Content -LiteralPath (Join-Path $repo "saved.tmp") -Value "saved untracked"
+        $runRoot = Join-Path $caseRoot "host-gate-interrupted-restore-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $gate = @{
+            Name = "interrupted restore gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+            RepositoryChanges = @{ Mode = "RestoreAll" }
+        }
+        $config = @{ HostGates = @($gate) }
+        $module = Get-Module CodexReviewLoop
+        $baseline = & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+            return $snapshot
+        } $state $statePath $repo $runRoot $gate
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "gate value"
+        Remove-Item -LiteralPath (Join-Path $repo "saved.tmp")
+        Set-Content -LiteralPath (Join-Path $repo "new.tmp") -Value "gate output"
+
+        (& $module {
+            param($activeConfig, $loopState, $loopStatePath, $repository)
+            Resume-ReviewLoopHostGateRecovery `
+                -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository
+        } $config $state $statePath $repo) | Should Be $true
+        & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+        } $state $statePath $repo $runRoot $gate
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "gate value"
+        Remove-Item -LiteralPath (Join-Path $repo "saved.tmp")
+        Set-Content -LiteralPath (Join-Path $repo "new.tmp") -Value "gate output"
+
+        & $module {
+            param($loopState, $loopStatePath, $repository)
+            $manifest = Read-ReviewLoopJson `
+                -Path ([string]$loopState.ActiveHostGateRecovery.ManifestPath)
+            $mutation = Get-ReviewLoopHostGateMutation `
+                -RepoPath $repository -Manifest $manifest
+            $loopState.ActiveHostGateRecovery.Phase = "restoring"
+            $loopState.ActiveHostGateRecovery.ObservedFingerprint = [string]$mutation.Fingerprint
+            $loopState.ActiveHostGateRecovery.ObservedPaths = @($mutation.ObservedPaths)
+            $loopState.ActiveHostGateRecovery.ObservedEntries = @($mutation.ObservedEntries)
+            Write-ReviewLoopState -Path $loopStatePath -State $loopState | Out-Null
+        } $state $statePath $repo
+        & git -C $repo restore --source=HEAD --staged --worktree -- README.txt
+        Remove-Item -LiteralPath (Join-Path $repo "new.tmp")
+
+        (& $module {
+            param($activeConfig, $loopState, $loopStatePath, $repository)
+            Resume-ReviewLoopHostGateRecovery `
+                -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository
+        } $config $state $statePath $repo) | Should Be $true
+        (& $module {
+            param($repository)
+            (Get-ReviewLoopRepositorySnapshot -RepoPath $repository).Fingerprint
+        } $repo) | Should Be $baseline.Fingerprint
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "verified baseline"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "saved.tmp")) |
+            Should Match "saved untracked"
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery |
+            Should BeNullOrEmpty
+    }
+
+    It "checks host-gate artifacts before changing the worktree" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified baseline"
+        $runRoot = Join-Path $caseRoot "host-gate-integrity-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $gate = @{
+            Name = "integrity gate"
+            FilePath = "pwsh"
+            Arguments = @("-NoProfile", "-Command", "exit 0")
+        }
+        $config = @{ HostGates = @($gate) }
+        $module = Get-Module CodexReviewLoop
+        & $module {
+            param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+            New-ReviewLoopHostGateRecovery `
+                -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                -RunRoot $logs -Gate $hostGate | Out-Null
+        } $state $statePath $repo $runRoot $gate
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "gate value"
+        Set-Content -LiteralPath (Join-Path $repo "generated.txt") -Value "gate output"
+        (Test-ReliabilityThrows {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }) | Should Be $true
+        $gate.RepositoryChanges = @{ Mode = "RestoreAll" }
+        Set-Content -LiteralPath $state.ActiveHostGateRecovery.ManifestPath `
+            -Value "damaged manifest"
+
+        $failure = $null
+        try {
+            & $module {
+                param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                Complete-ReviewLoopHostGateRecovery `
+                    -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                    -RepoPath $repository -Gate $hostGate | Out-Null
+            } $config $state $statePath $repo $gate
+        }
+        catch {
+            $failure = $_
+        }
+        $failure.Exception.Message | Should Match "manifest failed its integrity check"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "gate value"
+        (Test-Path -LiteralPath (Join-Path $repo "generated.txt")) | Should Be $true
+    }
+
+    It "refuses index and ref mutations without automatic restoration" {
+        foreach ($kind in @("index", "ref")) {
+            $scenarioRepo = New-ReliabilityRepo -Path (Join-Path $caseRoot "host-gate-$kind-repo")
+            $runRoot = Join-Path $caseRoot "host-gate-$kind-run"
+            New-Item -ItemType Directory -Path $runRoot | Out-Null
+            $statePath = Join-Path $runRoot "run-v1.json"
+            $state = New-ReviewLoopState `
+                -RepoPath $scenarioRepo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+            Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+            $gate = @{
+                Name = "$kind gate"
+                FilePath = "pwsh"
+                Arguments = @("-NoProfile", "-Command", "exit 0")
+                RepositoryChanges = @{ Mode = "RestoreAll" }
+            }
+            $config = @{ HostGates = @($gate) }
+            $module = Get-Module CodexReviewLoop
+            & $module {
+                param($loopState, $loopStatePath, $repository, $logs, $hostGate)
+                New-ReviewLoopHostGateRecovery `
+                    -State $loopState -StatePath $loopStatePath -RepoPath $repository `
+                    -RunRoot $logs -Gate $hostGate | Out-Null
+            } $state $statePath $scenarioRepo $runRoot $gate
+            Set-Content -LiteralPath (Join-Path $scenarioRepo "generated.txt") -Value "generated"
+            if ($kind -eq "index") {
+                & git -C $scenarioRepo add generated.txt
+            }
+            else {
+                & git -C $scenarioRepo tag gate-mutated-ref
+            }
+
+            $failure = $null
+            try {
+                & $module {
+                    param($activeConfig, $loopState, $loopStatePath, $repository, $hostGate)
+                    Complete-ReviewLoopHostGateRecovery `
+                        -Config $activeConfig -State $loopState -StatePath $loopStatePath `
+                        -RepoPath $repository -Gate $hostGate | Out-Null
+                } $config $state $statePath $scenarioRepo $gate
+            }
+            catch {
+                $failure = $_
+            }
+            $failure | Should Not BeNullOrEmpty
+            $failure.Exception.Message | Should Match $(if ($kind -eq "index") { "index changed" } else { "refs changed" })
+            (Test-Path -LiteralPath (Join-Path $scenarioRepo "generated.txt")) |
+                Should Be $true
+        }
     }
 
     It "does not treat an unrelated concurrent commit as the pending verified commit" {
@@ -1853,8 +2305,82 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         (& git -C $repo rev-parse HEAD) | Should Be $committedHead
     }
 
-    It "fails technically when a targeted test mutates repository state" {
+    It "restores all regular targeted-test side effects when configured" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.TargetedTestRepositoryChanges = @{ Mode = "RestoreAll" }
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fix"
+        Set-Content -LiteralPath (Join-Path $repo "fixer-untracked.txt") -Value "preserved fixer file"
+        $runRoot = Join-Path $caseRoot "targeted-restore-all"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $scriptPath = Join-Path $caseRoot "mutating-targeted-test.ps1"
+        Set-Content -LiteralPath $scriptPath -Value @'
+param([string]$Repository)
+[System.IO.File]::WriteAllText((Join-Path $Repository "README.txt"), "targeted mutation")
+[System.IO.File]::WriteAllText((Join-Path $Repository "fixer-untracked.txt"), "targeted mutation")
+[System.IO.File]::WriteAllText((Join-Path $Repository "targeted-side-effect.txt"), "disposable")
+exit 0
+'@ -Encoding UTF8
+        $fixer = [pscustomobject]@{
+            targetedTest = [pscustomobject]@{
+                executable = (Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1).Source
+                arguments = @("-NoProfile", "-File", $scriptPath, $repo)
+                rationale = "exercise targeted-test cleanup"
+            }
+        }
+        $module = Get-Module CodexReviewLoop
+        $before = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+
+        $result = & $module {
+            param($profile, $loopState, $loopStatePath, $fix, $repository, $logs)
+            Invoke-ReviewLoopTargetedTests `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -FixerResult $fix -RepoPath $repository -RunRoot $logs `
+                -ClusterId "C-targeted-restore" -Attempt 1
+        } $config $state $statePath $fixer $repo $runRoot
+
+        $after = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $result.Success | Should Be $true
+        $after.Fingerprint | Should Be $before.Fingerprint
+        $after.IndexFingerprint | Should Be $before.IndexFingerprint
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")).Trim() |
+            Should Be "verified fix"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "fixer-untracked.txt")).Trim() |
+            Should Be "preserved fixer file"
+        Test-Path -LiteralPath (Join-Path $repo "targeted-side-effect.txt") | Should Be $false
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery | Should BeNullOrEmpty
+
+        $failingScript = (Get-Content -Raw -LiteralPath $scriptPath).Replace("exit 0", "exit 7")
+        Set-Content -LiteralPath $scriptPath -Value $failingScript -Encoding UTF8
+        $failedResult = & $module {
+            param($profile, $loopState, $loopStatePath, $fix, $repository, $logs)
+            Invoke-ReviewLoopTargetedTests `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -FixerResult $fix -RepoPath $repository -RunRoot $logs `
+                -ClusterId "C-targeted-restore" -Attempt 2
+        } $config $state $statePath $fixer $repo $runRoot
+        $afterFailure = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $failedResult.Success | Should Be $false
+        $failedResult.Results[0].ExitCode | Should Be 7
+        $afterFailure.Fingerprint | Should Be $before.Fingerprint
+        Test-Path -LiteralPath (Join-Path $repo "targeted-side-effect.txt") | Should Be $false
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery | Should BeNullOrEmpty
+    }
+
+    It "explains and resumes a targeted-test mutation under the safe default" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config["__ConfigPath"] = [System.IO.Path]::GetFullPath($configPath)
         Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fix"
         Set-Content -LiteralPath (Join-Path $repo "review-loop-test.proj") -Value @'
 <Project>
@@ -1919,9 +2445,35 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
 
         $failure | Should Not BeNullOrEmpty
         $failure.Exception.Data["ReviewLoopStatus"] | Should Be "failed"
-        $failure.Exception.Message | Should Match "targeted test.*changed repository state"
+        $failure.Exception.Message | Should Match "Targeted test 'Targeted regression test'"
+        $failure.Exception.Message | Should Match "target-test-mutated\.txt"
+        $nextSteps = @($failure.Exception.Data["ReviewLoopNextSteps"])
+        ($nextSteps -join "`n") | Should Match ([regex]::Escape([System.IO.Path]::GetFullPath($configPath)))
+        ($nextSteps -join "`n") | Should Match "TargetedTestRepositoryChanges = @\{"
+        ($nextSteps -join "`n") | Should Match "Mode = 'RestoreAll'"
+        ($nextSteps -join "`n") | Should Match "same review-loop command again"
+        ($nextSteps -join "`n") | Should Not Match "RestoreMatching|PathRegex"
         Test-Path -LiteralPath (Join-Path $repo "target-test-mutated.txt") | Should Be $true
         (& git -C $repo rev-list --count HEAD) | Should Be 1
+        $saved = Read-ReviewLoopState -Path $statePath
+        $saved.ActiveHostGateRecovery.Kind | Should Be "TargetedTest"
+
+        $profileText = (Get-Content -Raw -LiteralPath $configPath).Replace(
+            "Mode = 'Fail'",
+            "Mode = 'RestoreAll'")
+        Set-Content -LiteralPath $configPath -Value $profileText -Encoding UTF8
+        $resumed = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository)
+            Resume-ReviewLoopHostGateRecovery `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -RepoPath $repository
+        } $config $state $statePath $repo
+
+        $resumed | Should Be $true
+        Test-Path -LiteralPath (Join-Path $repo "target-test-mutated.txt") | Should Be $false
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")).Trim() |
+            Should Be "verified fix"
+        (Read-ReviewLoopState -Path $statePath).ActiveHostGateRecovery | Should BeNullOrEmpty
     }
 
     It "recovers a commit made immediately before a crash" {
@@ -1988,6 +2540,81 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         (& git -C $repo rev-parse HEAD) | Should Be $committedHead
         (& git -C $repo rev-list --count HEAD) | Should Be 2
         (Read-ReviewLoopLedger -Path $paths.LedgerPath).Findings[0].Status | Should Be "resolved"
+    }
+
+    It "uses host-gate recovery when requalifying an already committed transaction" {
+        $runRoot = Join-Path $caseRoot "requalification-gate-run"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot "run-v1.json"
+        $ledgerPath = Join-Path $runRoot "ledger-v2.json"
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified committed change"
+        $fingerprint = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+        & git -C $repo add -A
+        $tree = & git -C $repo write-tree
+        & git -C $repo commit -q -m "Reliability: requalification gate"
+        $commit = & git -C $repo rev-parse HEAD
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $preHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.Verification = [pscustomobject]@{
+            schemaVersion = "4.0"
+            accept = $true
+            summary = "Accepted."
+        }
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $preHead
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.PendingCommit = [pscustomobject]@{
+            PreHead = $preHead
+            PatchFingerprint = $fingerprint
+            ExpectedTree = $tree
+            ExpectedCommit = $commit
+            Message = "Reliability: requalification gate"
+            NeedsCurrentGates = $true
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $config = @{
+            AutoCommit = $true
+            HostGates = @(@{
+                Name = "requalification gate"
+                FilePath = "pwsh"
+                Arguments = @(
+                    "-NoProfile",
+                    "-Command",
+                    "Set-Content -LiteralPath requalification.tmp -Value generated; exit 0"
+                )
+                RepositoryChanges = @{
+                    Mode = "RestoreMatching"
+                    PathRegex = @("^requalification[.]tmp$")
+                }
+            })
+        }
+
+        $completed = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $loopLedger,
+                $loopLedgerPath, $repository, $logs)
+            Complete-ReviewLoopPendingCommit `
+                -Config $profile -State $loopState -StatePath $loopStatePath `
+                -Ledger $loopLedger -LedgerPath $loopLedgerPath `
+                -RepoPath $repository -RunRoot $logs
+        } $config $state $statePath $ledger $ledgerPath $repo $runRoot
+
+        $completed | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $repo "requalification.tmp")) |
+            Should Be $false
+        (Read-ReviewLoopState -Path $statePath).PendingCommit | Should BeNullOrEmpty
+        (Read-ReviewLoopLedger -Path $ledgerPath).Findings[0].Status |
+            Should Be "resolved"
     }
 
     It "invalidates a clean pass when a CLI ReviewerInstructions override is omitted" {

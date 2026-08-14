@@ -444,6 +444,7 @@ function New-ReviewLoopState {
         LastFixerResult = $null
         PartialFixRecovery = $null
         PendingCommit = $null
+        ActiveHostGateRecovery = $null
         BlockedCleanup = $null
         BlockedReason = ""
         RoleCalls = @()
@@ -475,7 +476,7 @@ function Read-ReviewLoopState {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $state = Read-ReviewLoopJson -Path $Path
-    foreach ($name in @("ActiveRoleCall", "PartialFixRecovery")) {
+    foreach ($name in @("ActiveRoleCall", "PartialFixRecovery", "ActiveHostGateRecovery")) {
         if ($state.PSObject.Properties.Name -notcontains $name) {
             $state | Add-Member -NotePropertyName $name -NotePropertyValue $null
         }

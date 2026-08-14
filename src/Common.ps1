@@ -476,6 +476,13 @@ function New-ReviewLoopProfile {
     # role, targeted test, or host gate that starts.
     InactivityTimeoutMinutes = 30
 
+    # Model-selected targeted tests must not change the verified fixer worktree.
+    # Use Mode = 'RestoreAll' only when every regular file side effect from the
+    # targeted-test window is disposable and the repository is used exclusively.
+    TargetedTestRepositoryChanges = @{
+        Mode = 'Fail'
+    }
+
     # When false, verified changes are staged and the loop waits for a manual
     # commit or for AutoCommit to be enabled before continuing.
     AutoCommit = `$true
@@ -485,7 +492,10 @@ function New-ReviewLoopProfile {
 
     # Host gates run after successful finding verification and before the commit.
     # A gate consists of Name, FilePath, and an Arguments list. Add project-specific
-    # tests as additional hashtables.
+    # tests as additional hashtables. RepositoryChanges is optional. Its Mode is
+    # Fail (default), RestoreMatching with a PathRegex list, or RestoreAll.
+    # RestoreAll assumes exclusive repository use while the gate runs and is
+    # substantially broader than an exact RestoreMatching allowlist.
     HostGates = @(
 $($hostGates -join "`n")
     )
@@ -589,6 +599,7 @@ function Import-ReviewLoopConfig {
         ReviewAfterLessonsLearnedCommit = $false
         MaxFixAttempts = 2
         InactivityTimeoutMinutes = 30
+        TargetedTestRepositoryChanges = @{ Mode = "Fail" }
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
         ReviewerInstructions = ""
@@ -630,6 +641,19 @@ function Assert-ReviewLoopConfigValues {
     }
     if ($Config.ReviewAfterLessonsLearnedCommit -isnot [bool]) {
         throw "Configuration value 'ReviewAfterLessonsLearnedCommit' must be a boolean."
+    }
+    $targetedChanges = $Config.TargetedTestRepositoryChanges
+    if ($targetedChanges -isnot [System.Collections.IDictionary]) {
+        throw "Configuration value 'TargetedTestRepositoryChanges' must be a hashtable."
+    }
+    foreach ($key in @($targetedChanges.Keys)) {
+        if ([string]$key -ne "Mode") {
+            throw "TargetedTestRepositoryChanges contains unsupported key '$key'."
+        }
+    }
+    if (-not $targetedChanges.Contains("Mode") -or
+        [string]$targetedChanges.Mode -notin @("Fail", "RestoreAll")) {
+        throw "TargetedTestRepositoryChanges Mode must be 'Fail' or 'RestoreAll'."
     }
 
     foreach ($name in @(
@@ -674,6 +698,73 @@ function Assert-ReviewLoopConfigValues {
         if ($gate.Arguments -is [string] -or $null -eq $gate.Arguments) {
             throw "Host gate '$($gate.Name)' Arguments must be a list."
         }
+        if (-not $gate.Contains("RepositoryChanges")) {
+            continue
+        }
+        $changes = $gate.RepositoryChanges
+        if ($changes -isnot [System.Collections.IDictionary]) {
+            throw "Host gate '$($gate.Name)' RepositoryChanges must be a hashtable."
+        }
+        foreach ($key in @($changes.Keys)) {
+            if ([string]$key -notin @("Mode", "PathRegex")) {
+                throw "Host gate '$($gate.Name)' RepositoryChanges contains unsupported key '$key'."
+            }
+        }
+        if (-not $changes.Contains("Mode")) {
+            throw "Host gate '$($gate.Name)' RepositoryChanges is missing 'Mode'."
+        }
+        $mode = [string]$changes.Mode
+        if ($mode -notin @("Fail", "RestoreMatching", "RestoreAll")) {
+            throw "Host gate '$($gate.Name)' RepositoryChanges Mode '$mode' is unsupported."
+        }
+        $hasPathRegex = $changes.Contains("PathRegex")
+        if ($mode -ne "RestoreMatching" -and $hasPathRegex) {
+            throw "Host gate '$($gate.Name)' RepositoryChanges PathRegex is only valid with Mode 'RestoreMatching'."
+        }
+        if ($mode -ne "RestoreMatching") {
+            continue
+        }
+        if (-not $hasPathRegex -or $null -eq $changes.PathRegex -or
+            $changes.PathRegex -is [string]) {
+            throw "Host gate '$($gate.Name)' RestoreMatching requires PathRegex to be a non-empty list."
+        }
+        $patterns = @($changes.PathRegex)
+        if ($patterns.Count -eq 0) {
+            throw "Host gate '$($gate.Name)' RestoreMatching requires at least one PathRegex entry."
+        }
+        foreach ($patternValue in $patterns) {
+            if ($patternValue -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$patternValue)) {
+                throw "Host gate '$($gate.Name)' RepositoryChanges PathRegex entries must be non-empty strings."
+            }
+            try {
+                [void][regex]::new(
+                    [string]$patternValue,
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+                        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,
+                    [TimeSpan]::FromSeconds(1))
+            }
+            catch {
+                throw "Host gate '$($gate.Name)' contains invalid RepositoryChanges PathRegex '$patternValue': $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+function Get-ReviewLoopHostGateRepositoryChanges {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Gate)
+
+    if (-not $Gate.Contains("RepositoryChanges")) {
+        return [pscustomobject]@{ Mode = "Fail"; PathRegex = @() }
+    }
+    return [pscustomobject]@{
+        Mode = [string]$Gate.RepositoryChanges.Mode
+        PathRegex = if ($Gate.RepositoryChanges.Contains("PathRegex")) {
+            @($Gate.RepositoryChanges.PathRegex | ForEach-Object { [string]$_ })
+        }
+        else {
+            @()
+        }
     }
 }
 
@@ -684,6 +775,7 @@ $script:ReviewLoopLiveConfigKeys = @(
     "ReviewAfterLessonsLearnedCommit",
     "MaxFixAttempts",
     "InactivityTimeoutMinutes",
+    "TargetedTestRepositoryChanges",
     "AutoCommit",
     "CommitMessagePrefix",
     "HostGates",
@@ -872,6 +964,23 @@ function Write-ReviewLoopLiveConfigChanges {
         switch ($name) {
             "CommitMessagePrefix" {
                 Write-ReviewLoopStatus -Message "CommitMessagePrefix updated" -Kind Muted -Indent 1
+            }
+            "TargetedTestRepositoryChanges" {
+                $beforeMode = if ($change.Before -is [System.Collections.IDictionary]) {
+                    [string]$change.Before.Mode
+                }
+                else {
+                    "not configured"
+                }
+                $afterMode = if ($change.After -is [System.Collections.IDictionary]) {
+                    [string]$change.After.Mode
+                }
+                else {
+                    "not configured"
+                }
+                Write-ReviewLoopStatus `
+                    -Message "TargetedTestRepositoryChanges: $beforeMode -> $afterMode" `
+                    -Kind Muted -Indent 1
             }
             "HostGates" {
                 Write-ReviewLoopHostGateConfigChange -Before $change.Before -After $change.After

@@ -106,14 +106,36 @@ attempt. If that recovery also fails, the latest diff is retained as evidence,
 the clean checkpoint is restored, and native review starts again. A changed
 tool or execution-affecting profile fingerprint resets
 clean-pass evidence and starts a fresh native review when the repository is
-clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, host gates, and
-commit settings are reloaded at safe boundaries. An interrupted
+clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, targeted-test
+repository policy, host gates, and commit settings are reloaded at safe
+boundaries. An interrupted
 lessons-learned analysis uses the same role-call checkpoint and repository
 postconditions. A changed execution fingerprint requalifies unfinished
 analysis, while a successfully completed lessons-learned phase remains
 complete. The captured `ReviewAfterLessonsLearnedCommit` value also survives
 resume, so an interruption after the final commit cannot change whether
 post-commit native reviews are required.
+
+An interrupted host gate is recovered before the normal resume checks. Its
+checkpoint records the gate command, `HEAD`, refs, clean index, exact verified
+patch, path classifications, hashes, and regular non-ignored untracked files.
+If the gate changed files under the default `Fail` policy, the failure output
+lists every path, the absolute active-profile path, and copyable
+`RestoreMatching` and `RestoreAll` blocks. After the profile owner selects a
+policy and runs the same command again, the saved checkpoint performs the
+cleanup and the host gates run again. Cleanup is idempotent across interruption
+and refuses concurrent worktree, index, ref, submodule, symlink, reparse-point,
+or other non-regular changes. `RestoreAll` requires exclusive repository use
+for the gate window.
+
+Targeted tests use the same durable recovery before normal resume checks.
+Their profile-wide policy supports only `Fail` and `RestoreAll`. Under `Fail`,
+the output gives the absolute profile path and a complete copyable
+`TargetedTestRepositoryChanges` block. After changing the profile and rerunning
+the same command, cleanup completes and the targeted test is run again. A
+configured `RestoreAll` cleans regular file side effects before either a pass
+or failure is handled and likewise requires exclusive repository use for the
+targeted-test window.
 
 An interrupted native Reviewer is recovered before normal branch, `HEAD`, and
 worktree resume checks. Its durable checkpoint restores the branch or detached
