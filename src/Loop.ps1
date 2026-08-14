@@ -1085,6 +1085,13 @@ function Test-ReviewLoopHostGateDescriptorEqual {
         (ConvertTo-ReviewLoopJsonCompact $Right)
 }
 
+function ConvertTo-ReviewLoopGitApplyLiteralPattern {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return $Path.Replace("\", "\\").Replace("*", "\*").
+        Replace("?", "\?").Replace("[", "\[")
+}
+
 function Assert-ReviewLoopHostGateRepositoryIdentity {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -1355,7 +1362,8 @@ function Restore-ReviewLoopHostGateBaseline {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][object]$Recovery,
-        [Parameter(Mandatory = $true)][object]$Manifest
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$MutationPaths
     )
 
     Assert-ReviewLoopHostGateRepositoryIdentity -RepoPath $RepoPath -Manifest $Manifest
@@ -1388,9 +1396,10 @@ function Restore-ReviewLoopHostGateBaseline {
         }
     }
     $currentPaths = @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)
-    $allowedPaths = @(@($Manifest.ChangedPaths) + @($Recovery.ObservedPaths) | Sort-Object -Unique)
+    $knownPaths = @(@($Manifest.ChangedPaths) + @($Recovery.ObservedPaths) | Sort-Object -Unique)
+    $restorePaths = @($MutationPaths | Sort-Object -Unique)
     foreach ($path in $currentPaths) {
-        if ([string]$path -notin $allowedPaths) {
+        if ([string]$path -notin $knownPaths) {
             throw "Unexpected path appeared during host-gate recovery: $path"
         }
     }
@@ -1403,7 +1412,7 @@ function Restore-ReviewLoopHostGateBaseline {
         foreach ($entry in @($Recovery.ObservedEntries)) {
             $observedByPath[[string]$entry.Path] = $entry
         }
-        foreach ($path in $allowedPaths) {
+        foreach ($path in $restorePaths) {
             $headDescriptor = Get-ReviewLoopHostGateHeadDescriptor `
                 -RepoPath $RepoPath -Head ([string]$Manifest.Head) -Path ([string]$path)
             $baselineDescriptor = if ($baselineByPath.ContainsKey([string]$path)) {
@@ -1440,7 +1449,7 @@ function Restore-ReviewLoopHostGateBaseline {
     }
 
     $trackedPaths = [System.Collections.Generic.List[string]]::new()
-    foreach ($path in $allowedPaths) {
+    foreach ($path in $restorePaths) {
         $headEntry = @(& git -C $RepoPath ls-tree ([string]$Manifest.Head) -- $path 2>$null)
         if ($LASTEXITCODE -ne 0) {
             throw "Git could not inspect host-gate recovery path '$path'."
@@ -1468,15 +1477,23 @@ function Restore-ReviewLoopHostGateBaseline {
     }
 
     $trackedBaseline = @($Manifest.Entries | Where-Object {
+        [string]$_.Path -in $restorePaths -and
         [string]$_.FileType -in @("tracked_file", "tracked_deletion")
     })
     if ($trackedBaseline.Count -gt 0) {
-        $output = @(& git -C $RepoPath apply --binary --whitespace=nowarn -- $patchPath 2>&1)
+        $applyArguments = @("apply", "--binary", "--whitespace=nowarn")
+        foreach ($entry in $trackedBaseline) {
+            $pattern = ConvertTo-ReviewLoopGitApplyLiteralPattern -Path ([string]$entry.Path)
+            $applyArguments += "--include=$pattern"
+        }
+        $applyArguments += @("--", $patchPath)
+        $output = @(& git -C $RepoPath @applyArguments 2>&1)
         if ($LASTEXITCODE -ne 0) {
             throw "Git could not reapply the verified pre-gate patch: $($output -join ' ')"
         }
     }
     foreach ($entry in @($Manifest.Entries | Where-Object {
+        [string]$_.Path -in $restorePaths -and
         [string]$_.FileType -eq "untracked_file"
     })) {
         $saved = Assert-ReviewLoopPathWithoutReparsePoints `
@@ -1609,7 +1626,7 @@ function Complete-ReviewLoopHostGateRecovery {
     }
     Restore-ReviewLoopHostGateBaseline `
         -State $State -StatePath $StatePath -RepoPath $RepoPath `
-        -Recovery $recovery -Manifest $manifest
+        -Recovery $recovery -Manifest $manifest -MutationPaths @($mutationPaths)
     Write-ReviewLoopStatus `
         -Message "$operationTitle '$($Gate.Name)' repository side effects restored: $(@($mutationPaths) -join ', ')" `
         -Kind Success -Indent 1

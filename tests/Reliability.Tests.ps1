@@ -1778,6 +1778,13 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         & git -C $repo add tracked-delete.txt tracked-change.txt
         & git -C $repo commit -q -m "recovery fixtures"
         Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fixer change"
+        Set-Content -LiteralPath (Join-Path $repo "untouched-fixer.txt") -Value "verified untouched fixer change"
+        $untouchedTimestamp = [DateTime]::SpecifyKind(
+            [DateTime]::Parse("2001-02-03T04:05:06"),
+            [DateTimeKind]::Utc)
+        [System.IO.File]::SetLastWriteTimeUtc(
+            (Join-Path $repo "untouched-fixer.txt"),
+            $untouchedTimestamp)
         New-Item -ItemType Directory -Path (Join-Path $repo "cache") | Out-Null
         Set-Content -LiteralPath (Join-Path $repo "cache/deleted.tmp") -Value "saved deleted untracked"
         Set-Content -LiteralPath (Join-Path $repo "cache/changed.tmp") -Value "saved changed untracked"
@@ -1889,6 +1896,10 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
             Should Match "verified fixer change"
         (Get-Content -Raw -LiteralPath (Join-Path $repo "tracked-change.txt")) |
             Should Match "tracked original"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "untouched-fixer.txt")) |
+            Should Match "verified untouched fixer change"
+        (Get-Item -LiteralPath (Join-Path $repo "untouched-fixer.txt")).LastWriteTimeUtc |
+            Should Be $untouchedTimestamp
         (Test-Path -LiteralPath (Join-Path $repo "tracked-delete.txt")) | Should Be $true
         (Get-Content -Raw -LiteralPath (Join-Path $repo "cache/deleted.tmp")) |
             Should Match "saved deleted untracked"
