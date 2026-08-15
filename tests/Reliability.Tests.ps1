@@ -2698,6 +2698,39 @@ exit 0
         $selected | Should BeNullOrEmpty
     }
 
+    It "orders ISO checkpoint timestamps independently of the process culture" {
+        $profileRoot = Join-Path $caseRoot "iso-run-generations"
+        $oldRoot = Join-Path $profileRoot "old"
+        $newRoot = Join-Path $profileRoot "new"
+        New-Item -ItemType Directory -Path $oldRoot, $newRoot -Force | Out-Null
+        $old = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $oldRoot
+        $old.Status = "completed"
+        $old.Stage = "completed"
+        $old.CreatedAt = "2026-08-09T10:19:09.0000000+02:00"
+        Write-ReviewLoopState -Path (Join-Path $oldRoot "run-v1.json") -State $old | Out-Null
+        $new = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $newRoot
+        $new.CreatedAt = "2026-08-13T07:48:16.0000000+02:00"
+        $newPath = Join-Path $newRoot "run-v1.json"
+        Write-ReviewLoopState -Path $newPath -State $new | Out-Null
+        $previousCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+
+        try {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture =
+                [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+            $selected = & (Get-Module CodexReviewLoop) {
+                param($root)
+                Get-ReviewLoopLatestActiveStatePath -ProfileRoot $root
+            } $profileRoot
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
+        }
+
+        $selected | Should Be $newPath
+    }
+
     It "isolates ledgers by branch while keeping a moving review base stable" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $config.ReviewBase = "main"

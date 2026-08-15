@@ -29,7 +29,11 @@ function Get-ReviewLoopLatestActiveStatePath {
             $state = Read-ReviewLoopState -Path $path
             $createdAt = [DateTimeOffset]::MinValue
             if ($state.PSObject.Properties.Name -contains "CreatedAt") {
-                [DateTimeOffset]::TryParse([string]$state.CreatedAt, [ref]$createdAt) | Out-Null
+                [DateTimeOffset]::TryParse(
+                    [string]$state.CreatedAt,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None,
+                    [ref]$createdAt) | Out-Null
             }
             [pscustomobject]@{
                 Path = $path
