@@ -127,6 +127,9 @@ the behavior.
 - The modular root CLI is the only active implementation. Do not add a second
   execution path or legacy compatibility shim.
 - Public repository content is English.
+- Never start or resume a productive review loop unless the user explicitly
+  asks you to run it. Otherwise, provide the shortest command line that starts
+  or resumes the requested loop.
 - Do not require interactive architecture approval, routine command approval,
   manual finding classification, or manual profile creation.
 - Never silently change speed, model, reasoning effort, service tier, or CLI
