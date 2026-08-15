@@ -1147,12 +1147,56 @@ function Get-ReviewLoopGitValue {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $value = & git -C $RepoPath @Arguments 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        $failure = & git -C $RepoPath @Arguments 2>&1
-        throw "git $($Arguments -join ' ') failed: $($failure -join [Environment]::NewLine)"
+    $invoke = {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = "git"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($argument in @("-C", $RepoPath) + $Arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        try {
+            if (-not $process.Start()) {
+                throw "Git could not start."
+            }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit()
+            return [pscustomobject]@{
+                ExitCode = $process.ExitCode
+                Stdout = $stdoutTask.GetAwaiter().GetResult()
+                Stderr = $stderrTask.GetAwaiter().GetResult()
+            }
+        }
+        finally {
+            $process.Dispose()
+        }
     }
-    return (($value | Out-String).Trim())
+
+    $last = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $last = & $invoke
+        if ([int]$last.ExitCode -eq 0) {
+            return ([string]$last.Stdout).Trim()
+        }
+        if ($attempt -lt 2) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+
+    $detail = ([string]$last.Stderr).Trim()
+    if ([string]::IsNullOrWhiteSpace($detail)) {
+        $detail = ([string]$last.Stdout).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($detail)) {
+        $detail = "exit code $($last.ExitCode)"
+    }
+    throw "git $($Arguments -join ' ') failed after 2 attempts: $detail"
 }
 
 function Test-ReviewLoopGitClean {
