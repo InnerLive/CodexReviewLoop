@@ -108,7 +108,9 @@ tool or execution-affecting profile fingerprint resets
 clean-pass evidence and starts a fresh native review when the repository is
 clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, targeted-test
 repository policy, host gates, and commit settings are reloaded at safe
-boundaries. An interrupted
+boundaries. If interrupted commit preparation left the exact recorded fixer
+patch staged, requalification first restores a clean index without changing
+the verified worktree. An interrupted
 lessons-learned analysis uses the same role-call checkpoint and repository
 postconditions. A changed execution fingerprint requalifies unfinished
 analysis, while a successfully completed lessons-learned phase remains

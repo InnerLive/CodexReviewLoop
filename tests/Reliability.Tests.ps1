@@ -613,6 +613,23 @@ Describe "Unattended Git and recovery reliability boundaries" `
         Clear-ReliabilityTestCase
     }
 
+    It "continues when an idempotent Git value command fails transiently" {
+        $alias = @'
+!f() { if test -f .git/review-loop-flaky; then echo recovered; exit 0; fi; echo first >.git/review-loop-flaky; echo first-failure >&2; exit 17; }; f
+'@
+        & git -C $repo config alias.review-loop-flaky $alias.Trim()
+
+        $value = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopGitValue `
+                -RepoPath $repository -Arguments @("review-loop-flaky")
+        } $repo
+
+        $value | Should Be "recovered"
+        Test-Path -LiteralPath (Join-Path $repo ".git/review-loop-flaky") |
+            Should Be $true
+    }
+
     It "executes an arbitrary structured targeted test" {
         $pwsh = (Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1).Source
         $fixer = [pscustomobject]@{
@@ -1121,6 +1138,129 @@ Describe "Unattended Git and recovery reliability boundaries" `
             Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
         } $repo
         $after | Should Be $before
+    }
+
+    It "does not alter a partially staged fixer patch during requalification" {
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "staged version"
+        & git -C $repo add README.txt
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "newer unstaged version"
+        $module = Get-Module CodexReviewLoop
+        $head = & git -C $repo rev-parse HEAD
+        $fingerprint = & $module {
+            param($repository)
+            Get-ReviewLoopWorktreeFingerprint -RepoPath $repository
+        } $repo
+        $runRoot = Join-Path $caseRoot "partial-staged-requalification"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+
+        $message = ""
+        try {
+            & $module {
+                param($repository, $expectedHead, $expectedFingerprint, $logs)
+                Restore-ReviewLoopVerifiedPatchToCleanIndex `
+                    -RepoPath $repository -ExpectedHead $expectedHead `
+                    -ExpectedFingerprint $expectedFingerprint `
+                    -RunRoot $logs -ClusterId "C-partial-requalification"
+            } $repo $head $fingerprint $runRoot | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        $message | Should Match "cannot stage completely|fully staged"
+        (& git -C $repo diff --cached --name-only) | Should Be "README.txt"
+        (& git -C $repo diff --name-only) | Should Be "README.txt"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
+            Should Match "newer unstaged version"
+    }
+
+    It "requalifies a staged commit checkpoint through completion" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $paths = & (Get-Module CodexReviewLoop) {
+            param($profile, $repository)
+            New-ReviewLoopRunPaths -Config $profile -RepoPath $repository
+        } $config $repo
+        $paths.RunRoot = Join-Path $paths.ProfileRoot "99999999-staged-requalification"
+        New-Item -ItemType Directory -Path $paths.RunRoot -Force | Out-Null
+        $statePath = Join-Path $paths.RunRoot "run-v1.json"
+        $head = & git -C $repo rev-parse HEAD
+
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $head | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = "fixing"
+        $finding.FixAttempts = 1
+        $finding.FixerThreadId = "fixer-thread"
+        Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "verified fix"
+        Set-Content -LiteralPath (Join-Path $repo "new.txt") -Value "verified new file"
+        $module = Get-Module CodexReviewLoop
+        $snapshot = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $pwsh = (Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1).Source
+        $state = New-ReviewLoopState `
+            -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $paths.RunRoot `
+            -ReviewBaseCommit $head -ExecutionFingerprint "stale-execution-fingerprint"
+        $state.Status = "failed"
+        $state.Stage = "commit_preparing"
+        $state.CurrentHead = $head
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.LastFixerResult = [pscustomobject]@{
+            Success = $true
+            FailureKind = ""
+            ThreadId = "fixer-thread"
+            Attempt = 1
+            Correction = 0
+            WorktreeHead = $head
+            WorktreeFingerprint = [string]$snapshot.Fingerprint
+            StructuredResult = [pscustomobject]@{
+                schemaVersion = "1.0"
+                outcome = "changed"
+                summary = "Applied the verified fix."
+                changedPaths = @("README.txt", "new.txt")
+                targetedTest = [pscustomobject]@{
+                    available = $true
+                    executable = $pwsh
+                    arguments = @("-NoProfile", "-Command", "exit 0")
+                    rationale = "focused regression"
+                }
+                remainingRisk = ""
+            }
+        }
+        $state.PendingCommit = [pscustomobject]@{
+            PreHead = $head
+            PatchFingerprint = [string]$snapshot.Fingerprint
+            ExpectedTree = ""
+            ExpectedCommit = ""
+            Message = "Reliability: interrupted commit preparation"
+            NeedsCurrentGates = $false
+        }
+        & git -C $repo add -A
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $sequence = Join-Path $caseRoot "staged-requalification-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @(
+            '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Resume the verified staged fix","rationale":"The complete patch was requalified.","changes":["Preserve the verified change."]}}',
+            "No actionable findings.",
+            "No actionable findings."
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+
+        $resumed = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $resumed.Status | Should Be "completed"
+        (& git -C $repo rev-parse HEAD) | Should Not Be $head
+        (@(& git -C $repo show --format= --name-only HEAD) -contains "new.txt") |
+            Should Be $true
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        (Read-ReviewLoopState -Path $statePath).PendingCommit | Should BeNullOrEmpty
+        (Read-ReviewLoopLedger -Path $paths.LedgerPath).Findings[0].Status |
+            Should Be "resolved"
     }
 
     It "builds a redacted structured commit message from accepted evidence" {

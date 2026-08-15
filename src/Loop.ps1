@@ -2214,6 +2214,65 @@ function Assert-ReviewLoopVerifiedWorktreeIsFullyStaged {
     }
 }
 
+function Restore-ReviewLoopVerifiedPatchToCleanIndex {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedHead,
+        [Parameter(Mandatory = $true)][string]$ExpectedFingerprint,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$ClusterId
+    )
+
+    & git -C $RepoPath diff --cached --quiet HEAD -- 2>$null
+    if ($LASTEXITCODE -gt 1) {
+        throw "Git could not inspect the staged fixer patch before requalification."
+    }
+    if ($LASTEXITCODE -eq 0) {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedHead) -or
+        [string]::IsNullOrWhiteSpace($ExpectedFingerprint)) {
+        throw "A staged fixer patch cannot be requalified without its recorded HEAD and worktree fingerprint."
+    }
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$snapshot.Head -ne $ExpectedHead -or
+        [string]$snapshot.Fingerprint -ne $ExpectedFingerprint) {
+        throw "The staged fixer patch no longer matches its recorded repository state; automatic index cleanup was not attempted."
+    }
+
+    $stagedTree = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("write-tree")
+    Assert-ReviewLoopVerifiedWorktreeIsFullyStaged `
+        -RepoPath $RepoPath -PreHead $ExpectedHead `
+        -PatchFingerprint $ExpectedFingerprint -StagedTree $stagedTree
+    $confirmed = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    foreach ($property in @(
+        "Head", "Fingerprint", "Branch", "HeadRef", "RefsFingerprint", "IndexFingerprint"
+    )) {
+        if ([string]$confirmed.$property -ne [string]$snapshot.$property) {
+            throw "The repository changed while the staged fixer patch was being checked; automatic index cleanup was not attempted."
+        }
+    }
+
+    Invoke-ReviewLoopGitStep -Name "Fix requalification" -Arguments @(
+        "restore", "--source=$ExpectedHead", "--staged", "--", "."
+    ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $ClusterId | Out-Null
+
+    $restored = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ([string]$restored.Head -ne [string]$snapshot.Head -or
+        [string]$restored.Fingerprint -ne $ExpectedFingerprint -or
+        [string]$restored.Branch -ne [string]$snapshot.Branch -or
+        [string]$restored.HeadRef -ne [string]$snapshot.HeadRef -or
+        [string]$restored.RefsFingerprint -ne [string]$snapshot.RefsFingerprint) {
+        throw "The repository changed while restoring the clean index for fix requalification."
+    }
+    & git -C $RepoPath diff --cached --quiet $ExpectedHead -- 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fix requalification did not restore the required clean index."
+    }
+    return $true
+}
+
 function ConvertTo-ReviewLoopCommitLine {
     param(
         [AllowNull()][string]$Text,
@@ -2948,6 +3007,10 @@ function Invoke-ReviewLoopFixWorkflow {
             $retryCurrentAttempt = $false
         }
         else {
+            Restore-ReviewLoopVerifiedPatchToCleanIndex `
+                -RepoPath $RepoPath -ExpectedHead $storedHead `
+                -ExpectedFingerprint $storedFingerprint `
+                -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
             $lastFixer = [pscustomobject]@{
                 Success = $true
                 StructuredResult = $State.LastFixerResult.StructuredResult
