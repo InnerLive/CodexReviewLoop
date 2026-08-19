@@ -49,15 +49,16 @@ This role classifies the supplied review text; the orchestrator compares reposit
         return @"
 $instructions$testOwnership
 The changes array is the only part of the retrospective that the orchestrator converts into repository work. An empty array means that no durable repository guidance change is justified.
-The complete diagnosis remains evidence for Architect and Verifier. Review-loop-process causes are diagnostic only and do not create cross-repository work.
+The complete diagnosis remains evidence for Architect advice and assessment. Review-loop-process causes are diagnostic only and do not create cross-repository work.
 This role analyzes the supplied run evidence and verified loop commits; the orchestrator compares repository state before and after the call.
 "@
     }
     $handoff = switch ($Role) {
         "Architect" {
             @"
-The complete Architect result is passed unchanged to the Fixer as advice and is later shown to the Verifier.
+The first Architect result is passed unchanged to the Fixer as advice. Later calls in the same Architect thread assess the resulting repository state.
 The Fixer acts on described repository changes; the orchestrator does not execute steps from architecture prose.
+During assessment, the accept field selects the implemented workflow transition. Judge the result against the findings and repository state, not by whether it follows the earlier advice. Rejection feedback is passed to the Fixer; an accepted commitMessage proposal is used after configured host gates pass.
 "@
         }
         "Fixer" {
@@ -65,12 +66,6 @@ The Fixer acts on described repository changes; the orchestrator does not execut
 The Architect result is advice to this role. This role owns worktree edits but not commits or Git refs.
 The targetedTest fields are the interface for asking the orchestrator to run one targeted test after this role returns; the summary is descriptive.
 The fixer workspace is the worktree observed by the orchestrator.
-"@
-        }
-        "Verifier" {
-            @"
-The accept field selects the implemented workflow transition. Rejection feedback is passed to the Fixer; an accepted commitMessage proposal is used after configured host gates pass.
-The orchestrator does not infer additional actions from the summary or feedback prose.
 "@
         }
         default {
@@ -277,7 +272,24 @@ function Invoke-ConfiguredCodexRole {
         $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
         $pendingExecution = [string](Get-ReviewLoopObjectProperty `
             -Object $pending -Name "ExecutionFingerprint" -Default "")
-        if ($pendingExecution -ne $executionFingerprint) {
+        $legacyVerifierTransition = (
+            [string](Get-ReviewLoopObjectProperty -Object $pending -Name "Role" -Default "") -eq
+                "Verifier" -and
+            [string](Get-ReviewLoopObjectProperty -Object $pending -Name "CallId" -Default "") -match
+                "-verify-" -and
+            $Role -eq "Architect" -and
+            $CallId -match "-architect-assess-"
+        )
+        if ($legacyVerifierTransition) {
+            if ([string]$pendingSnapshot.Head -ne [string]$currentSnapshot.Head -or
+                [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint) {
+                Stop-ReviewLoopBlocked -Message "Interrupted legacy Verifier checkpoint no longer matches the saved repository state."
+            }
+            $State.ActiveRoleCall = $null
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+            $pending = $null
+        }
+        elseif ($pendingExecution -ne $executionFingerprint) {
             if (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
                 $State.ActiveRoleCall = $null
                 Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
@@ -805,7 +817,7 @@ function Invoke-ReviewLoopFixer {
         -CallId $stableCallId -State $State -StatePath $StatePath
 }
 
-function Invoke-ReviewLoopVerifier {
+function Invoke-ReviewLoopArchitectAssessment {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
         [Parameter(Mandatory = $true)][object]$State,
@@ -819,7 +831,7 @@ function Invoke-ReviewLoopVerifier {
         [string]$CodexPath = ""
     )
 
-    $prompt = Get-ReviewLoopPrompt -Name "verifier.md" -Values @{
+    $prompt = Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values @{
         FINDINGS = [string]$State.ActiveReviewText
         ARCHITECT_ADVICE = ConvertTo-ReviewLoopJsonCompact $State.ActiveStrategy
         FIXER_RESULT = ConvertTo-ReviewLoopJsonCompact $FixerCall.StructuredResult
@@ -832,16 +844,16 @@ function Invoke-ReviewLoopVerifier {
     }
     $verificationKey = (Get-ReviewLoopSha256 $fixerCallId).Substring(0, 12)
     $call = Invoke-ReviewLoopRoleCall `
-        -Config $Config -Role "Verifier" -RepoPath $RepoPath -Speed $Speed `
-        -Prompt $prompt -LogRoot $RunRoot -SchemaName "verifier-result-v4.schema.json" `
+        -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
+        -Prompt $prompt -LogRoot $RunRoot -SchemaName "architecture-assessment-v1.schema.json" `
         -CodexPath $CodexPath `
-        -CallId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-verify-$verificationKey" `
+        -CallId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-architect-assess-$verificationKey" `
         -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $call
     return [pscustomobject]@{
         Accepted = [bool]$call.StructuredResult.accept
         Result = $call.StructuredResult
         Calls = @($call)
-        Basis = "Verifier decision"
+        Basis = "Architect assessment"
     }
 }

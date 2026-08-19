@@ -4,8 +4,8 @@
 verified code.**
 
 Codex Review Loop uses Codex's native review function on the complete branch
-diff, lets free Architect and Fixer roles choose the solution, asks a Verifier
-to accept or reject it, runs the repository's quality gates, and commits only
+diff, lets free Architect and Fixer roles choose the solution, asks the same
+Architect to accept or reject the result, runs the repository's quality gates, and commits only
 accepted work. It repeats unattended until the branch is demonstrably clean.
 After enough verified loop commits, it can also extract evidence-backed lessons
 into repository guidance before declaring the run complete.
@@ -18,7 +18,7 @@ into repository guidance before declaring the run complete.
    review text is ambiguous.
 3. Passes review output containing findings unchanged to an Architect.
 4. Passes the Architect's advice unchanged to a Fixer.
-5. Lets a Verifier directly accept the solution or return feedback to the Fixer.
+5. Lets the same Architect directly accept the solution or return feedback to the Fixer.
 6. Executes configured host gates and commits the exact accepted tree.
 7. Starts a new native review instead of blocking when a Fixer round is
    exhausted.
@@ -26,7 +26,7 @@ into repository guidance before declaring the run complete.
    unchanged `HEAD` (two is the recommended default).
 9. Before completion, conditionally analyzes verified loop commits for durable
    `AGENTS.md` or repository-skill guidance.
-10. Sends any retrospective guidance changes through the same Architect, Fixer, Verifier,
+10. Sends any retrospective guidance changes through the same Architect advice, Fixer, assessment,
     host-gate, and commit path. An accepted solution is the final cycle by
     default; profiles may opt into clean native reviews after a real commit.
 

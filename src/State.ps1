@@ -13,8 +13,7 @@ function Get-ReviewLoopSessionRoleNames {
         "ReviewClassifier",
         "LessonsLearned",
         "Architect",
-        "Fixer",
-        "Verifier"
+        "Fixer"
     )
 }
 

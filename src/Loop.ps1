@@ -2754,7 +2754,7 @@ function Invoke-ReviewLoopAttemptAssessment {
     }
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "tested"
 
-    $verification = Invoke-ReviewLoopVerifier `
+    $verification = Invoke-ReviewLoopArchitectAssessment `
         -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
         -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
         -Attempt $Attempt -CodexPath $CodexPath
@@ -2776,7 +2776,7 @@ function Invoke-ReviewLoopAttemptAssessment {
         "failed"
     }
     Write-ReviewLoopStatus `
-        -Message "Verifier: $(if ($verification.Accepted) { 'accepted' } else { 'changes requested' }) · $($verification.Result.summary) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
+        -Message "Architect assessment: $(if ($verification.Accepted) { 'accepted' } else { 'changes requested' }) · $($verification.Result.summary) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
         -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
     Assert-ReviewLoopRepositoryUnchanged `
@@ -3567,11 +3567,11 @@ function Get-ReviewLoopRetrospectiveEvidence {
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
                 "-c$cycle-fix-"
         })
-        $verifierCalls = @($roleCalls | Where-Object {
-            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
-                "Verifier" -and
-            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
-                "-c$cycle-verify-"
+        $assessmentCalls = @($roleCalls | Where-Object {
+            $role = [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "")
+            $callId = [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "")
+            ($role -eq "Architect" -and $callId -match "-c$cycle-architect-assess-") -or
+                ($role -eq "Verifier" -and $callId -match "-c$cycle-verify-")
         })
         $cycles += [pscustomobject][ordered]@{
             cycle = $cycle
@@ -3607,7 +3607,7 @@ function Get-ReviewLoopRetrospectiveEvidence {
                             -Object $structured -Name "summary" -Default ""))
                 }
             })
-            verifierDecisions = @($verifierCalls | ForEach-Object {
+            architectAssessments = @($assessmentCalls | ForEach-Object {
                 $structured = Get-ReviewLoopObjectProperty `
                     -Object $_ -Name "StructuredResult"
                 [pscustomobject][ordered]@{
@@ -3638,10 +3638,12 @@ function Get-ReviewLoopRetrospectiveEvidence {
     $fixerCallCount = @($roleCalls | Where-Object {
         [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq "Fixer"
     }).Count
-    $verifierRejections = @($roleCalls | Where-Object {
+    $architectRejections = @($roleCalls | Where-Object {
         $structured = Get-ReviewLoopObjectProperty -Object $_ -Name "StructuredResult"
-        [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
-            "Verifier" -and
+        $role = [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "")
+        $callId = [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "")
+        (($role -eq "Architect" -and $callId -match "-architect-assess-") -or
+            ($role -eq "Verifier" -and $callId -match "-verify-")) -and
         [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false) -and
         -not [bool](Get-ReviewLoopObjectProperty `
             -Object $structured -Name "accept" -Default $false)
@@ -3666,7 +3668,7 @@ function Get-ReviewLoopRetrospectiveEvidence {
             findingReviews = $findingReviewCount
             cleanReviews = $cleanReviewCount
             fixerCalls = $fixerCallCount
-            verifierRejections = $verifierRejections.Count
+            architectRejections = $architectRejections.Count
             technicalFailures = $technicalFailures.Count
         }
         diff = [pscustomobject][ordered]@{

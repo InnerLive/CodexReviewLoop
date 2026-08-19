@@ -513,7 +513,6 @@ $($hostGates -join "`n")
         LessonsLearned = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Fixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
-        Verifier = @{ Model = 'gpt-5.6-sol'; Thinking = 'low' }
     }
 }
 "@
@@ -673,7 +672,7 @@ function Assert-ReviewLoopConfigValues {
     }
     $roles = @(
         "Reviewer", "ReviewClassifier", "LessonsLearned",
-        "Architect", "Fixer", "Verifier"
+        "Architect", "Fixer"
     )
     foreach ($role in $roles) {
         $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $role
@@ -1120,7 +1119,6 @@ function Get-ReviewLoopRoleConfig {
         }
         $legacyRole = switch ($Role) {
             "Fixer" { "PointFixer" }
-            "Verifier" { "FindingVerifier" }
             default { "" }
         }
         if (-not [string]::IsNullOrWhiteSpace($legacyRole) -and

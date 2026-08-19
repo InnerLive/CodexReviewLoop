@@ -3,7 +3,7 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "schemaVersion": { "type": "string", "const": "4.0" },
+    "schemaVersion": { "type": "string", "const": "1.0" },
     "accept": { "type": "boolean" },
     "summary": { "type": "string" },
     "feedback": {

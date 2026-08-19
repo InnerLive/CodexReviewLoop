@@ -274,9 +274,9 @@ Describe "Codex Review Loop module" -Tags @("Fast", "FullLocal") {
         $profile = Import-PowerShellDataFile -LiteralPath $generated
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
-        $profile.Roles.Keys.Count | Should Be 6
+        $profile.Roles.Keys.Count | Should Be 5
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
-            "Architect", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer", "Verifier")
+            "Architect", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer")
     }
 }
 
@@ -341,7 +341,7 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
         $profile.TargetedTestRepositoryChanges.Mode | Should Be "Fail"
-        $profile.Roles.Keys.Count | Should Be 6
+        $profile.Roles.Keys.Count | Should Be 5
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -654,24 +654,19 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $text | Should Not Match '"Arguments"\s*:'
     }
 
-    It "maps legacy fixer and verifier role names in existing profiles" {
+    It "maps the legacy fixer role and ignores old verifier entries" {
         $profile = Import-PowerShellDataFile -LiteralPath (New-TestConfig `
             -Path (Join-Path $TestDrive "legacy-roles.psd1") `
             -LogRoot (Join-Path $TestDrive "legacy-role-logs"))
         $profile.Roles.PointFixer = $profile.Roles.Fixer
         $profile.Roles.FindingVerifier = $profile.Roles.Verifier
         $profile.Roles.Remove("Fixer")
-        $profile.Roles.Remove("Verifier")
         $resolved = & (Get-Module CodexReviewLoop) {
             param($config)
             Assert-ReviewLoopConfigValues -Config $config
-            [pscustomobject]@{
-                Fixer = Get-ReviewLoopRoleConfig -Config $config -Role Fixer
-                Verifier = Get-ReviewLoopRoleConfig -Config $config -Role Verifier
-            }
+            Get-ReviewLoopRoleConfig -Config $config -Role Fixer
         } $profile
-        $resolved.Fixer.Model | Should Be "fake"
-        $resolved.Verifier.Thinking | Should Be "low"
+        $resolved.Model | Should Be "fake"
     }
 
     It "supplies the Luna classifier defaults to existing four-role profiles" {
@@ -1122,7 +1117,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
         $state.LessonsLearned.ReviewAfterCommit | Should Be $false
         $state.RoleSessions.Architect | Should Be ""
         $state.RoleSessions.Fixer | Should Be ""
-        $state.RoleSessions.Verifier | Should Be ""
+        @($state.RoleSessions.PSObject.Properties.Name -eq "Verifier").Count | Should Be 0
         @($state.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
@@ -1253,7 +1248,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
 
         $reloaded.RoleSessions.Architect | Should Be "architect-current"
         $reloaded.RoleSessions.Fixer | Should Be "fixer-current"
-        $reloaded.RoleSessions.Verifier | Should Be ""
+        @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Verifier").Count | Should Be 0
         @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
@@ -1429,7 +1424,7 @@ Describe "Fake Codex integration" -Tags @("Process") {
         $call.ThreadId | Should Be "fake-thread-123"
     }
 
-    It "reuses separate durable sessions while native reviews stay fresh" {
+    It "uses one Architect session for advice and assessment while native reviews stay fresh" {
         $repoPath = New-TestRepo $repo.FullName
         $configPath = New-TestConfig `
             -Path (Join-Path $TestDrive "role-sessions.psd1") `
@@ -1438,9 +1433,9 @@ Describe "Fake Codex integration" -Tags @("Process") {
         $planPath = Join-Path $TestDrive "role-sessions-invocations.json"
         Set-Content -LiteralPath $planPath -Value (@(
             @{ threadId = "architect-thread" },
-            @{ threadId = "verifier-thread" },
             @{ threadId = "architect-thread" },
-            @{ threadId = "verifier-thread" },
+            @{ threadId = "architect-thread" },
+            @{ threadId = "architect-thread" },
             @{},
             @{}
         ) | ConvertTo-Json -Depth 10) -Encoding UTF8
@@ -1458,10 +1453,10 @@ Describe "Fake Codex integration" -Tags @("Process") {
             Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
 
             foreach ($call in @(
-                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-1" },
-                @{ Role = "Verifier"; Schema = "verifier-result-v4.schema.json"; Id = "verifier-1" },
-                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-2" },
-                @{ Role = "Verifier"; Schema = "verifier-result-v4.schema.json"; Id = "verifier-2" }
+                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-advice-1" },
+                @{ Role = "Architect"; Schema = "architecture-assessment-v1.schema.json"; Id = "architect-assess-1" },
+                @{ Role = "Architect"; Schema = "architecture-advice-v2.schema.json"; Id = "architect-advice-2" },
+                @{ Role = "Architect"; Schema = "architecture-assessment-v1.schema.json"; Id = "architect-assess-2" }
             )) {
                 Invoke-ConfiguredCodexRole `
                     -Config $config -Role $call.Role -RepoPath $repository -Speed standard `
@@ -1480,12 +1475,13 @@ Describe "Fake Codex integration" -Tags @("Process") {
 
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
-        @($records.callKind) | Should Be @("exec", "exec", "resume", "resume", "review", "review")
+        @($records.callKind) | Should Be @("exec", "resume", "resume", "resume", "review", "review")
+        $records[1].resumeThreadId | Should Be "architect-thread"
         $records[2].resumeThreadId | Should Be "architect-thread"
-        $records[3].resumeThreadId | Should Be "verifier-thread"
+        $records[3].resumeThreadId | Should Be "architect-thread"
         $reloaded = Read-ReviewLoopState -Path $statePath
         $reloaded.RoleSessions.Architect | Should Be "architect-thread"
-        $reloaded.RoleSessions.Verifier | Should Be "verifier-thread"
+        @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Verifier").Count | Should Be 0
         @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
     }
 
@@ -1986,7 +1982,7 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
     }
 
     It "contains every production prompt" {
-        @("architect.md", "fixer.md", "verifier.md", "lessons-learned.md") |
+        @("architect.md", "architect-assessment.md", "fixer.md", "lessons-learned.md") |
             ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
     }
 
@@ -2005,15 +2001,15 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
                 Test-Json -SchemaFile (Join-Path $root "schemas\fixer-result-v3.schema.json") `
                     -ErrorAction Stop
         }) | Should Be $true
-        '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct.","changes":["Update the implementation."]}}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+        '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct.","changes":["Update the implementation."]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\architecture-assessment-v1.schema.json") |
             Should Be $true
-        '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}' |
-            Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") |
+        '{"schemaVersion":"1.0","accept":false,"summary":"Continue.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}' |
+            Test-Json -SchemaFile (Join-Path $root "schemas\architecture-assessment-v1.schema.json") |
             Should Be $true
         (Test-Throws {
-            '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
-                Test-Json -SchemaFile (Join-Path $root "schemas\verifier-result-v4.schema.json") `
+            '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the defect","rationale":"Keep the result correct."}}' |
+                Test-Json -SchemaFile (Join-Path $root "schemas\architecture-assessment-v1.schema.json") `
                     -ErrorAction Stop
         }) | Should Be $true
         $retrospectiveSchema = Join-Path $root "schemas\lessons-learned-v2.schema.json"
@@ -2052,7 +2048,7 @@ Recent history:
 {{HISTORY}}
 
 Workflow:
-Current findings → Architect advice [current role] → Fixer changes → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice [current role] → Fixer changes → Architect assessment. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Result:
 Return your advice in the supplied structured format.
@@ -2074,7 +2070,7 @@ Previous feedback:
 {{FEEDBACK}}
 
 Workflow:
-Current findings → Architect advice → Fixer changes [current role] → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice → Fixer changes [current role] → Architect assessment. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Targeted test:
 `targetedTest.executable` is the program started by the orchestrator, for example `dotnet`, `pwsh`, or a repository wrapper. Project, script, test, and filter values belong in `targetedTest.arguments`; for `dotnet test`, `dotnet` is the executable and `test` is the first argument.
@@ -2082,24 +2078,24 @@ Targeted test:
 Result:
 Return your work summary and targeted-test information in the supplied structured format.
 '@
-            "verifier.md" = @'
+            "architect-assessment.md" = @'
 Role:
-You are the verifier for the current solution.
+You are the architect assessing the current solution in the same thread that produced the architectural advice.
 
 Goal:
-Decide whether the current repository state is a satisfactory response to the findings.
+Decide whether the current repository state is a satisfactory, coherent response to the findings. Assess the result against the findings and repository state, not by whether the Fixer followed your earlier advice. A better deviation may be accepted.
 
 Current findings:
 {{FINDINGS}}
 
-Architectural advice:
+Earlier architectural advice:
 {{ARCHITECT_ADVICE}}
 
 Fixer result and targeted-test execution:
 {{FIXER_RESULT}}
 
 Workflow:
-Current findings → Architect advice → Fixer changes → Verifier decision [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice → Fixer changes → Architect assessment [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Commit message:
 When accepting, propose a solution-oriented subject, a brief rationale, and the key changes. Keep the subject concise, ideally within 72 characters before the configured prefix, and follow the repository's established language and style when clear. Leave test and host-gate evidence, Git trailers, and authorship out; the orchestrator adds verified evidence.
@@ -2125,7 +2121,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         }
         $rendered = & (Get-Module CodexReviewLoop) {
             param($promptValues)
-            Get-ReviewLoopPrompt -Name "verifier.md" -Values $promptValues
+            Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values $promptValues
         } $values
 
         $rendered | Should Match ([regex]::Escape("Finding contains {{DIFF}}."))
@@ -2136,7 +2132,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $message = ""
         try {
             & (Get-Module CodexReviewLoop) {
-                Get-ReviewLoopPrompt -Name "verifier.md" -Values @{
+                Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values @{
                     FINDINGS = "findings"
                     ARCHITECT_ADVICE = "advice"
                 }
@@ -2151,7 +2147,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
     }
 
     It "keeps role instructions factual and leaves decisions to the models" {
-        $prompts = @("architect.md", "fixer.md", "verifier.md") | ForEach-Object {
+        $prompts = @("architect.md", "architect-assessment.md", "fixer.md") | ForEach-Object {
             Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$_")
         }
         $prompts = $prompts -join "`n"
@@ -2159,9 +2155,11 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         $prompts | Should Match 'Use your judgment'
     }
 
-    It "gives the verifier the fixer result and test execution" {
-        $verifier = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\verifier.md")
-        $verifier | Should Match 'Fixer result and targeted-test execution'
+    It "gives the Architect assessment the fixer result without requiring advice conformance" {
+        $assessment = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\architect-assessment.md")
+        $assessment | Should Match 'Fixer result and targeted-test execution'
+        $assessment | Should Match 'not by whether the Fixer followed your earlier advice'
+        $assessment | Should Match 'A better deviation may be accepted'
     }
 
     It "keeps the lessons-learned prompt self-contained and read-only" {
@@ -2195,9 +2193,9 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
     }
 
     It "gives each free role the shared workflow and marks its current position" {
-        foreach ($name in @("architect.md", "fixer.md", "verifier.md")) {
+        foreach ($name in @("architect.md", "architect-assessment.md", "fixer.md")) {
             $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$name")
-            $prompt | Should Match 'Current findings.+Architect advice.+Fixer changes.+Verifier decision'
+            $prompt | Should Match 'Current findings.+Architect advice.+Fixer changes.+Architect assessment'
             $prompt | Should Match '\[current role\]'
             $prompt | Should Match 'orchestrator runs tests and host gates and commits accepted changes'
         }
@@ -2211,7 +2209,6 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
             [pscustomobject]@{
                 Architect = Get-ReviewLoopOperationalInstructions -Role Architect -Config $config
                 Fixer = Get-ReviewLoopOperationalInstructions -Role Fixer -Config $config
-                Verifier = Get-ReviewLoopOperationalInstructions -Role Verifier -Config $config
                 ReviewClassifier = Get-ReviewLoopOperationalInstructions `
                     -Role ReviewClassifier -Config $config
                 LessonsLearned = Get-ReviewLoopOperationalInstructions `
@@ -2220,7 +2217,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         }
 
         foreach ($role in @(
-            "Architect", "Fixer", "Verifier", "ReviewClassifier", "LessonsLearned"
+            "Architect", "Fixer", "ReviewClassifier", "LessonsLearned"
         )) {
             $instructions.$role | Should Match 'orchestrator is deterministic PowerShell code, not an LLM'
             $instructions.$role | Should Match 'does not interpret prose as instructions'
@@ -2228,13 +2225,13 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         }
         $instructions.Architect | Should Match 'passed unchanged to the Fixer as advice'
         $instructions.Architect | Should Match 'orchestrator does not execute steps from architecture prose'
+        $instructions.Architect | Should Match 'accept field selects the implemented workflow transition'
+        $instructions.Architect | Should Match 'Rejection feedback is passed to the Fixer'
         $instructions.Fixer | Should Match 'owns worktree edits but not commits or Git refs'
         $instructions.Fixer | Should Match 'targetedTest fields are the interface'
-        $instructions.Verifier | Should Match 'accept field selects the implemented workflow transition'
-        $instructions.Verifier | Should Match 'Rejection feedback is passed to the Fixer'
         $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
         $instructions.LessonsLearned | Should Match 'changes array is the only part of the retrospective'
-        $instructions.LessonsLearned | Should Match 'complete diagnosis remains evidence for Architect and Verifier'
+        $instructions.LessonsLearned | Should Match 'complete diagnosis remains evidence for Architect advice and assessment'
     }
 
     It "has no direct HTTP model invocation in active code" {
@@ -2303,7 +2300,7 @@ Describe "Lessons-learned retrospective evidence" -Tags @("Fast", "FullLocal") {
                 StructuredResult = [pscustomobject]@{ summary = "Updated the first path." }
             },
             [pscustomobject]@{
-                Role = "Verifier"; CallId = "C-test-c2-verify-a1-c0"; Success = $true
+                Role = "Architect"; CallId = "C-test-c2-architect-assess-a1-c0"; Success = $true
                 StructuredResult = [pscustomobject]@{
                     accept = $false; summary = "The sibling path is still open."
                     feedback = @("Cover the related path.")
@@ -2371,14 +2368,14 @@ Describe "Lessons-learned retrospective evidence" -Tags @("Fast", "FullLocal") {
         $evidence.counts.cleanReviews | Should Be 2
         $evidence.counts.findingReviews | Should Be 1
         $evidence.counts.fixerCalls | Should Be 3
-        $evidence.counts.verifierRejections | Should Be 1
+        $evidence.counts.architectRejections | Should Be 1
         $evidence.counts.technicalFailures | Should Be 1
         @($evidence.cycles | ForEach-Object { $_.cycle }) | Should Be @(1, 2, 3)
         $evidence.cycles[0].head | Should Be $evidence.cycles[1].head
         $evidence.cycles[0].reviewerResult | Should Be "clean"
         $evidence.cycles[1].reviewerResult | Should Be "finding"
         @($evidence.cycles[1].fixerAttempts).Count | Should Be 3
-        @($evidence.cycles[1].verifierDecisions).Count | Should Be 2
+        @($evidence.cycles[1].architectAssessments).Count | Should Be 2
         @($evidence.cycles[1].resolutionCommits) | Should Be @($current)
         $evidence.diff.initial.files | Should Be 1
         $evidence.diff.initial.additions | Should Be 1
@@ -2795,7 +2792,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         })
         $architecture = '{"schemaVersion":"2.0","summary":"Apply the three net guidance changes only.","approach":"Update, consolidate, and delete repository guidance.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Added repository guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"The guidance matches the evidence.","feedback":[],"commitMessage":{"subject":"Capture review-loop lessons","rationale":"Preserve verified maintenance knowledge.","changes":["Update repository instructions.","Add a repository skill."]}}'
+        $assessment = '{"schemaVersion":"1.0","accept":true,"summary":"The guidance matches the evidence.","feedback":[],"commitMessage":{"subject":"Capture review-loop lessons","rationale":"Preserve verified maintenance knowledge.","changes":["Update repository instructions.","Add a repository skill."]}}'
         $plans = @(
             [pscustomobject]@{ result = "No findings." },
             [pscustomobject]@{ result = $analysis },
@@ -2817,7 +2814,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
                     }
                 )
             },
-            [pscustomobject]@{ result = $verifier }
+            [pscustomobject]@{ result = $assessment }
         )
         $planPath = Join-Path $caseRoot "lessons-workflow.json"
         Set-Content -LiteralPath $planPath `
@@ -2858,11 +2855,11 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         })[0]
         $architectCall.prompt | Should Match "repository_skill"
         $architectCall.prompt | Should Match "Broader reviews extended discovery"
-        $verifierCall = @($records | Where-Object {
+        $assessmentCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "verifier-result-v4.schema.json"
+                "architecture-assessment-v1.schema.json"
         })[0]
-        $verifierCall.prompt | Should Match "Broader reviews extended discovery"
+        $assessmentCall.prompt | Should Match "Broader reviews extended discovery"
         @((Read-ReviewLoopLedger -Path $checkpoint.LedgerPath).Findings).Count |
             Should Be 3
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
@@ -2908,7 +2905,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $analysis = '{"schemaVersion":"2.0","summary":"One durable change.","diagnosis":{"summary":"The existing rule was ineffective.","causes":[{"title":"The invariant was missed","category":"repository_guidance","explanation":"The rule was not actionable.","evidence":["verified loop change 6"]}],"guidanceAssessment":[{"target":"AGENTS.md","assessment":"ineffective","explanation":"The wording did not guide the decision.","evidence":["verified loop change 6"]}]},"changes":[{"title":"Record the invariant","action":"update","surface":"agents_md","targets":["AGENTS.md"],"outcome":"Keep the verified invariant actionable.","rationale":"The run proves the gap.","futureUse":"Applies to future repository work.","evidence":["verified loop change 6"]}]}'
         $architecture = '{"schemaVersion":"2.0","summary":"Record it.","approach":"Update guidance.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Updated guidance.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Record the verified invariant","rationale":"Preserve the lesson.","changes":["Update repository guidance."]}}'
+        $assessment = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Record the verified invariant","rationale":"Preserve the lesson.","changes":["Update repository guidance."]}}'
         $plans = @(
             [pscustomobject]@{ result = "No findings." },
             [pscustomobject]@{ result = $analysis },
@@ -2920,7 +2917,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
                     content = "# Repository instructions`n`nKeep the verified invariant.`n"
                 })
             },
-            [pscustomobject]@{ result = $verifier },
+            [pscustomobject]@{ result = $assessment },
             [pscustomobject]@{ result = "No findings." }
         )
         $planPath = Join-Path $caseRoot "lessons-post-review-workflow.json"
@@ -3044,7 +3041,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $findingReview = "- [P1] restart budget defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
         $fixer = '{"schemaVersion":"3.0","summary":"Handled it.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifier = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the restart budget defect","rationale":"Keep restart budgets independent.","changes":["Preserve the resumed review state."]}}'
+        $assessment = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the restart budget defect","rationale":"Keep restart budgets independent.","changes":["Preserve the resumed review state."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
             [pscustomobject]@{
@@ -3053,7 +3050,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
             },
             [pscustomobject]@{ result = $architecture },
             [pscustomobject]@{ result = $fixer },
-            [pscustomobject]@{ result = $verifier },
+            [pscustomobject]@{ result = $assessment },
             [pscustomobject]@{ result = "No findings." }
         )
         $invocationPlanPath = Join-Path $caseRoot "restart-budget-invocations.json"
@@ -3090,7 +3087,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $findingReview = "- [P1] live reload defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the defect.","approach":"Update the affected behavior.","steps":["Change the implementation."],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Fixed the defect.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"The solution is acceptable.","feedback":[],"commitMessage":{"subject":"Fix the live reload defect","rationale":"Apply live settings at safe boundaries.","changes":["Reload the configured settings."]}}'
+        $resolved = '{"schemaVersion":"1.0","accept":true,"summary":"The solution is acceptable.","feedback":[],"commitMessage":{"subject":"Fix the live reload defect","rationale":"Apply live settings at safe boundaries.","changes":["Reload the configured settings."]}}'
         $clean = "No findings."
         $plans = @(
             [pscustomobject]@{
@@ -3226,7 +3223,7 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         $findingReview = "- [P1] partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
         $fixed = '{"schemaVersion":"3.0","summary":"Completed the partial work.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Complete the interrupted fix","rationale":"Preserve completed work across restart.","changes":["Finish the recovered implementation."]}}'
+        $accepted = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Complete the interrupted fix","rationale":"Preserve completed work across restart.","changes":["Finish the recovered implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
             [pscustomobject]@{ result = $architecture }
@@ -3287,7 +3284,7 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         $findingReview = "- [P1] repeated partial recovery defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Complete the implementation.","steps":[],"considerations":[]}'
         $fixed = '{"schemaVersion":"3.0","summary":"Applied a later clean fix.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Apply the recovered fix","rationale":"Retain the verified recovery result.","changes":["Complete the recovered implementation."]}}'
+        $accepted = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Apply the recovered fix","rationale":"Retain the verified recovery result.","changes":["Complete the recovered implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview }
             [pscustomobject]@{ result = $architecture }
@@ -3366,7 +3363,7 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         } $state $checkpoint.StatePath $ledger $checkpoint.LedgerPath $repo $checkpoint.RunRoot
 
         $fixed = '{"schemaVersion":"3.0","summary":"Finished after restart.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $accepted = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Finish the restarted fix","rationale":"Complete the preserved work after restart.","changes":["Apply the remaining correction."]}}'
+        $accepted = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Finish the restarted fix","rationale":"Complete the preserved work after restart.","changes":["Apply the remaining correction."]}}'
         $plans = @(
             [pscustomobject]@{
                 result = $fixed
@@ -3430,8 +3427,8 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         $findingReview = "- [P1] cache defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address the cache defect.","approach":"Update the affected cache behavior.","steps":[],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Updated the cache.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $stillOpen = '{"schemaVersion":"4.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
-        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"The defect is resolved.","feedback":[],"commitMessage":{"subject":"Fix the cache defect","rationale":"Keep cache behavior consistent.","changes":["Update the affected cache path."]}}'
+        $stillOpen = '{"schemaVersion":"1.0","accept":false,"summary":"The defect remains.","feedback":["Continue the fix."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $resolved = '{"schemaVersion":"1.0","accept":true,"summary":"The defect is resolved.","feedback":[],"commitMessage":{"subject":"Fix the cache defect","rationale":"Keep cache behavior consistent.","changes":["Update the affected cache path."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $findingReview,
             $architecture,
@@ -3452,6 +3449,13 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
             $_.callKind -eq "resume" -and
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
+        $assessmentCalls = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-assessment-v1.schema.json"
+        })
+        $assessmentCalls.Count | Should Be 3
+        @($assessmentCalls | Where-Object { $_.callKind -ne "resume" }).Count | Should Be 0
+        @($assessmentCalls.resumeThreadId | Select-Object -Unique).Count | Should Be 1
         @($records | Where-Object {
             [string]$_.schemaPath -match 'confirm|tie'
         }).Count | Should Be 0
@@ -3459,7 +3463,7 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         $terminal | Should Match "Finding-Cluster"
         $terminal | Should Match "Fixer · call 3 · resuming thread"
         $terminal | Should Match "Fixer: Updated the cache"
-        $terminal | Should Match "Verifier: accepted"
+        $terminal | Should Match "Architect assessment: accepted"
         $terminal | Should Match "Host-Gate: fake gate"
         $terminal | Should Match "Committed"
     }
@@ -3471,8 +3475,8 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         $findingReview = "- [P1] defect at src/A.cs:10"
         $architecture = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the implementation.","steps":[],"considerations":[]}'
         $fixChanged = '{"schemaVersion":"3.0","summary":"Changed the implementation.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $reproduced = '{"schemaVersion":"4.0","accept":false,"summary":"Continue.","feedback":["Try another approach."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
-        $resolved = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the reproduced defect","rationale":"Address the verified failure mode.","changes":["Apply the corrected implementation."]}}'
+        $reproduced = '{"schemaVersion":"1.0","accept":false,"summary":"Continue.","feedback":["Try another approach."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $resolved = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the reproduced defect","rationale":"Address the verified failure mode.","changes":["Apply the corrected implementation."]}}'
         $plans = @(
             [pscustomobject]@{ result = $findingReview },
             [pscustomobject]@{ result = $architecture },
@@ -3578,13 +3582,13 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $ambiguousReview = "The cache lifetime changes when a caller repeats the operation."
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Address it.","approach":"Improve the cache behavior.","steps":[],"considerations":[]}'
         $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifierV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the cache behavior","rationale":"Keep repeated operations consistent.","changes":["Apply the architecture advice."]}}'
+        $assessmentV1 = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix the cache behavior","rationale":"Keep repeated operations consistent.","changes":["Apply the architecture advice."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
             $ambiguousReview,
             '{"schemaVersion":"1.0","hasFindings":true}',
             $architectureV2,
             $fixerV3,
-            $verifierV4,
+            $assessmentV1,
             "No findings."
         )
 
@@ -3700,9 +3704,9 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $nativeReview = "- [P1] first defect at src/A.cs:10`n- [P2] second defect at src/B.cs:20"
         $architectureV2 = '{"schemaVersion":"2.0","summary":"Use one coherent change.","approach":"Change both affected paths together.","steps":["Update A.","Update B."],"considerations":["Keep the public behavior."]}'
         $fixerV3 = '{"schemaVersion":"3.0","summary":"Applied the advice.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
-        $verifierV4 = '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix both affected paths","rationale":"Keep the related behavior coherent.","changes":["Update the first path.","Update the second path."]}}'
+        $assessmentV1 = '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Fix both affected paths","rationale":"Keep the related behavior coherent.","changes":["Update the first path.","Update the second path."]}}'
         Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
-            $nativeReview, $architectureV2, $fixerV3, $verifierV4,
+            $nativeReview, $architectureV2, $fixerV3, $assessmentV1,
             'No findings.', 'No findings.'
         )
 
@@ -3720,6 +3724,13 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         })[0]
         [string]$fixerCall.prompt | Should Match ([regex]::Escape(
             '"approach":"Change both affected paths together."'))
+        $assessmentCall = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "architecture-assessment-v1.schema.json"
+        })[0]
+        $assessmentCall.callKind | Should Be "resume"
+        $assessmentCall.resumeThreadId | Should Be "cluster-thread"
+        [string]$assessmentCall.prompt | Should Match 'not by whether the Fixer followed your earlier advice'
         @($records | Where-Object {
             [string]$_.schemaPath -match 'trigger|critique|veto|tie'
         }).Count | Should Be 0

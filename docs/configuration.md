@@ -67,7 +67,7 @@ host gates pass. With `AutoCommit = $false`, it stages that verified tree and
 stops at a resumable checkpoint. The user may create the prepared commit
 manually, or enable `AutoCommit` and resume the same run.
 
-The Verifier proposes a solution-oriented subject, rationale, and list of
+The Architect assessment proposes a solution-oriented subject, rationale, and list of
 changes for an accepted patch. The orchestrator redacts and normalizes that
 content, prepends `CommitMessagePrefix`, and adds only the targeted-test and
 host-gate evidence that it actually observed passing. Multiple findings are
@@ -229,7 +229,6 @@ New profiles contain these workflow and analysis roles:
 - `LessonsLearned`
 - `Architect`
 - `Fixer`
-- `Verifier`
 
 They also contain `ReviewClassifier`, a mechanical helper used only for
 ambiguous native review text. Its generated setting is `gpt-5.6-luna` with
@@ -251,9 +250,9 @@ the checkpoint. Passing it explicitly changes the speed for subsequent role
 and thread-resume calls while retaining the same checkpoint and ledger.
 
 Existing profiles remain usable during the transition: `PointFixer` supplies
-the `Fixer` configuration when `Fixer` is absent, and `FindingVerifier`
-supplies `Verifier` when `Verifier` is absent. Removed judge, confirmation,
-critic, veto, and tie-break entries are ignored.
+the `Fixer` configuration when `Fixer` is absent. Old `Verifier` and
+`FindingVerifier` entries are ignored alongside removed judge, confirmation,
+critic, veto, and tie-break entries.
 
 Tool, prompt, schema, and execution-affecting profile settings are
 fingerprinted. If they change between invocations, completed model work is

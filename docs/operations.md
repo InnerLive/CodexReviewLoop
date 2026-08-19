@@ -93,8 +93,9 @@ new speed for subsequent calls in the same checkpoint. If the invocation used
 when resuming. Changing or omitting it requalifies existing review and
 clean-pass evidence before the loop can complete.
 
-Architect, Fixer, Verifier, ReviewClassifier, and LessonsLearned each keep a
-separate durable Codex thread across invocations of the same run. Older
+Architect, Fixer, ReviewClassifier, and LessonsLearned each keep a separate
+durable Codex thread across invocations of the same run. Architect advice and
+assessment share the Architect thread. Older
 checkpoints without the role-session map reconstruct it from the latest
 successful recorded call for each role. The native Reviewer always starts a
 fresh review and is excluded from this migration.

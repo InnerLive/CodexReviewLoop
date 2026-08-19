@@ -70,7 +70,6 @@ function New-ReliabilityConfig {
         Reviewer = @{ Model = 'fake'; Thinking = 'high' }
         Architect = @{ Model = 'fake'; Thinking = 'high' }
         Fixer = @{ Model = 'fake'; Thinking = 'high' }
-        Verifier = @{ Model = 'fake'; Thinking = 'low' }
     }
 }
 "@
@@ -212,6 +211,26 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
                 Invoke-ConfiguredCodexRole -Config $profile -Role Architect -RepoPath $repository `
                     -Speed standard -Prompt review -LogRoot $logs -CodexPath $fake `
                     -SchemaName "architecture-advice-v2.schema.json"
+            } $config $repo $logRoot $fakeCodex | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        $message | Should Match "changed the repository worktree"
+        (& git -C $repo status --porcelain=v1) | Should Not BeNullOrEmpty
+    }
+
+    It "rejects worktree changes made by the Architect assessment" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "architecture-assessment-v1.schema.json"
+        $message = ""
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($profile, $repository, $logs, $fake)
+                Invoke-ConfiguredCodexRole -Config $profile -Role Architect -RepoPath $repository `
+                    -Speed standard -Prompt assess -LogRoot $logs -CodexPath $fake `
+                    -SchemaName "architecture-assessment-v1.schema.json"
             } $config $repo $logRoot $fakeCodex | Out-Null
         }
         catch {
@@ -657,7 +676,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $fixer.testExecution.Passed | Should Be $true
     }
 
-    It "includes staged and untracked files in verifier evidence" {
+    It "includes staged and untracked files in assessment evidence" {
         Set-Content -LiteralPath (Join-Path $repo "README.txt") -Value "tracked change"
         Set-Content -LiteralPath (Join-Path $repo "new.txt") -Value "untracked change"
         & git -C $repo add README.txt
@@ -1244,7 +1263,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         $sequence = Join-Path $caseRoot "staged-requalification-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @(
-            '{"schemaVersion":"4.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Resume the verified staged fix","rationale":"The complete patch was requalified.","changes":["Preserve the verified change."]}}',
+            '{"schemaVersion":"1.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Resume the verified staged fix","rationale":"The complete patch was requalified.","changes":["Preserve the verified change."]}}',
             "No actionable findings.",
             "No actionable findings."
         )
@@ -1677,18 +1696,136 @@ Changes:
                 }
             }
         }
-        $result = '{"schemaVersion":"4.0","accept":false,"summary":"Still present.","feedback":["Inspect the current path."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
-        $sequence = Join-Path $caseRoot "large-verifier-results.json"
+        $result = '{"schemaVersion":"1.0","accept":false,"summary":"Still present.","feedback":["Inspect the current path."],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        $sequence = Join-Path $caseRoot "large-assessment-results.json"
         Write-ReliabilityJsonArray -Path $sequence -Values @($result)
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
         $verification = & (Get-Module CodexReviewLoop) {
             param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
-            Invoke-ReviewLoopVerifier -Config $profile -State $loopState -StatePath $loopStatePath `
+            Invoke-ReviewLoopArchitectAssessment -Config $profile -State $loopState -StatePath $loopStatePath `
                 -RepoPath $repository -Speed standard -RunRoot $logs -Findings @($finding) `
                 -FixerCall $fixer -Attempt 1 -CodexPath $fake
         } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
         $verification.Accepted | Should Be $false
         $verification.Result.summary | Should Be "Still present."
+    }
+
+    It "reassesses a matching interrupted legacy Verifier checkpoint with the Architect thread" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config["__ExecutionFingerprint"] = "new-execution"
+        Set-Content -LiteralPath (Join-Path $repo "legacy-fix.txt") -Value "preserved fix"
+        $runRoot = Join-Path $caseRoot "legacy-verifier-transition"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot -ExecutionFingerprint "old-execution"
+        $state.ReviewCycle = 1
+        $state.ActiveClusterId = "C-legacy"
+        $state.ActiveReviewText = "- legacy finding"
+        $state.ActiveStrategy = [pscustomobject]@{
+            schemaVersion = "2.0"; summary = "Fix it."; approach = "Use judgment."
+            steps = @(); considerations = @()
+        }
+        $state.RoleSessions.Architect = "architect-thread"
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.ActiveRoleCall = [pscustomobject]@{
+            CallId = "C-legacy-c1-verify-old"
+            Role = "Verifier"
+            ExecutionFingerprint = "old-execution"
+            RepositoryHead = $snapshot.Head
+            WorktreeFingerprint = $snapshot.Fingerprint
+        }
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $fixerCall = [pscustomobject]@{
+            CallId = "C-legacy-c1-fix-a1-c0"
+            StructuredResult = [pscustomobject]@{
+                schemaVersion = "3.0"
+                summary = "Applied a better solution."
+                targetedTest = [pscustomobject]@{ available = $false; executable = ""; arguments = @() }
+            }
+        }
+        $sequence = Join-Path $caseRoot "legacy-verifier-transition-results.json"
+        Write-ReliabilityJsonArray -Path $sequence -Values @(
+            '{"schemaVersion":"1.0","accept":true,"summary":"Accepted deviation.","feedback":[],"commitMessage":{"subject":"Accept the better fix","rationale":"It resolves the finding.","changes":["Use the improved implementation."]}}'
+        )
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+
+        $assessment = & (Get-Module CodexReviewLoop) {
+            param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
+            Invoke-ReviewLoopArchitectAssessment -Config $profile -State $loopState `
+                -StatePath $loopStatePath -RepoPath $repository -Speed standard `
+                -RunRoot $logs -Findings @($finding) `
+                -FixerCall $fixer -Attempt 1 -CodexPath $fake
+        } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
+
+        $assessment.Accepted | Should Be $true
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "legacy-fix.txt")) | Should Match "preserved fix"
+        $reloaded = Read-ReviewLoopState -Path $statePath
+        $reloaded.ActiveRoleCall | Should BeNullOrEmpty
+        $reloaded.RoleCalls[-1].Role | Should Be "Architect"
+        $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            Select-Object -Last 1 | ConvertFrom-Json
+        $record.callKind | Should Be "resume"
+        $record.resumeThreadId | Should Be "architect-thread"
+    }
+
+    It "keeps a mismatched interrupted legacy Verifier checkpoint blocked" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config["__ExecutionFingerprint"] = "new-execution"
+        Set-Content -LiteralPath (Join-Path $repo "legacy-fix.txt") -Value "original fix"
+        $runRoot = Join-Path $caseRoot "legacy-verifier-mismatch"
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $runRoot -ExecutionFingerprint "old-execution"
+        $state.ReviewCycle = 1
+        $state.ActiveClusterId = "C-legacy"
+        $state.ActiveReviewText = "- legacy finding"
+        $state.ActiveStrategy = [pscustomobject]@{
+            schemaVersion = "2.0"; summary = "Fix it."; approach = "Use judgment."
+            steps = @(); considerations = @()
+        }
+        $state.RoleSessions.Architect = "architect-thread"
+        $snapshot = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $repo
+        $state.ActiveRoleCall = [pscustomobject]@{
+            CallId = "C-legacy-c1-verify-old"
+            Role = "Verifier"
+            ExecutionFingerprint = "old-execution"
+            RepositoryHead = $snapshot.Head
+            WorktreeFingerprint = $snapshot.Fingerprint
+        }
+        Set-Content -LiteralPath (Join-Path $repo "legacy-fix.txt") -Value "concurrent change"
+        $statePath = Join-Path $runRoot "run-v1.json"
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $fixerCall = [pscustomobject]@{
+            CallId = "C-legacy-c1-fix-a1-c0"
+            StructuredResult = [pscustomobject]@{
+                schemaVersion = "3.0"; summary = "Changed."
+                targetedTest = [pscustomobject]@{ available = $false; executable = ""; arguments = @() }
+            }
+        }
+        $message = ""
+        try {
+            & (Get-Module CodexReviewLoop) {
+                param($profile, $loopState, $loopStatePath, $repository, $logs, $finding, $fixer, $fake)
+                Invoke-ReviewLoopArchitectAssessment -Config $profile -State $loopState `
+                    -StatePath $loopStatePath -RepoPath $repository -Speed standard `
+                    -RunRoot $logs -Findings @($finding) `
+                    -FixerCall $fixer -Attempt 1 -CodexPath $fake
+            } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex | Out-Null
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        $message | Should Match "legacy Verifier checkpoint no longer matches"
+        (Read-ReviewLoopState -Path $statePath).ActiveRoleCall.Role | Should Be "Verifier"
+        (Get-Content -Raw -LiteralPath (Join-Path $repo "legacy-fix.txt")) | Should Match "concurrent change"
     }
 
     It "resolves an already-fixed finding without an empty commit" {

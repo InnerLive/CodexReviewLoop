@@ -22,7 +22,7 @@ Inspect the listed commits and their changes. Inspect the existing repository AG
 
 Do not rely on any plugin, installed skill, network access, or user-global Codex configuration. Apply the placement and quality rules below directly.
 
-Analyze causes, not merely outcomes. Explain recurring causes, serial sibling findings, changes in scope, clean reviews followed by later findings on the same HEAD, repeated Fixer or Verifier work, technical failures, and diff growth when the evidence supports them. Distinguish repository-guidance causes, review-loop-process causes, and change-scope causes. A process diagnosis remains visible in `diagnosis` but does not justify a cross-repository guidance change by itself.
+Analyze causes, not merely outcomes. Explain recurring causes, serial sibling findings, changes in scope, clean reviews followed by later findings on the same HEAD, repeated Fixer or Architect-assessment work, technical failures, and diff growth when the evidence supports them. Distinguish repository-guidance causes, review-loop-process causes, and change-scope causes. A process diagnosis remains visible in `diagnosis` but does not justify a cross-repository guidance change by itself.
 
 Assess the effectiveness of relevant existing guidance, not merely whether text exists. Identify guidance that was effective, ineffective, redundant, too specific, or obsolete. Consider whether the guidance was discoverable, actionable, applicable at the decision point, and broad enough to transfer.
 

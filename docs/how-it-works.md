@@ -16,7 +16,7 @@ flowchart LR
     findings -- Yes --> architect[Architect advice]
     architect --> fix[Fixer]
     fix --> test[Optional targeted test]
-    test --> verify[Verifier decision]
+    test --> verify[Architect assessment]
     verify -- Reject --> fix
     verify -- Accept --> gates[Host gates]
     gates --> commit[Commit verified tree]
@@ -73,13 +73,14 @@ without prescribing a point fix, redesign, scope, or decision criteria.
 The Architect keeps one dedicated Codex thread for the durable run, so later
 cycles retain its architectural reasoning in addition to the explicit history.
 
-The structured Architect response is passed unchanged to the Fixer. There is no
-judge, confirmation, critic, veto, or tie-break role.
+The structured Architect response is passed unchanged to the Fixer. After each
+Fixer result, the same Architect thread assesses the resulting repository state.
+There is no judge, confirmation, critic, veto, or tie-break role.
 
 ## 3. Fixing without a blocked finding state
 
 The Fixer receives the current findings, the Architect response, and any
-feedback from the previous Verifier call. It chooses the changes and exploratory tests.
+feedback from the previous Architect assessment. It chooses the changes and exploratory tests.
 Git determines which files actually changed.
 Its dedicated Codex thread is reused across attempts and finding clusters in
 the same durable run.
@@ -106,14 +107,15 @@ are discarded and the exact Fixer worktree is restored before the test result
 is processed. Git identity, index, and special-filesystem mutations remain
 technical failures.
 
-## 4. Direct verification
+## 4. Architect assessment
 
 The orchestrator runs an available targeted test and records the actual result.
-The Verifier receives the current repository, findings text, Architect
-response, Fixer response, and test evidence.
-It keeps a separate dedicated Codex thread for the durable run.
+The Architect receives the current repository, findings text, its earlier
+advice, the Fixer response, and test evidence in its existing durable thread.
+The advice is context, not a conformance requirement: a better Fixer deviation
+may be accepted when the repository state satisfactorily resolves the findings.
 
-The Verifier decides directly:
+The Architect decides directly:
 
 - `accept = true` continues to host gates and commit.
 - `accept = false` sends its feedback back to the Fixer.
@@ -139,7 +141,7 @@ verified worktree, seals that Git tree, and advances `HEAD` only if the expected
 old value still matches.
 
 After the gates pass, the orchestrator builds the final commit message from the
-Verifier proposal and the test and gate results it directly observed. It
+Architect assessment proposal and the test and gate results it directly observed. It
 redacts secrets, records all findings handled by a multi-finding patch, seals
 the complete message in the checkpoint, and verifies the full committed
 message during crash recovery.
@@ -158,8 +160,8 @@ At that clean gate, `LessonsLearnedCommitThreshold` is reloaded. When the run
 has created at least that many verified, non-empty commits and the current
 `HEAD` tracks an exact root `AGENTS.md`, one read-only `LessonsLearned` call
 reviews a compact retrospective of the complete evidenced run. It receives
-per-cycle review results, findings, Architect summaries, Fixer attempts,
-Verifier decisions, resolution commits, technical-failure counts, and diff
+per-cycle review results, findings, Architect summaries and assessments, Fixer attempts,
+resolution commits, technical-failure counts, and diff
 growth alongside the verified loop commit SHAs and subjects. Raw JSONL,
 stderr, internal reasoning, and prior retrospective results are excluded.
 Zero disables the phase.
@@ -174,7 +176,7 @@ or global Codex configuration.
 
 An empty `changes` list completes the phase without another role call.
 Otherwise, each guidance change becomes a normal ledger finding and the full
-diagnosis is passed to the Architect. Architect, Fixer, targeted test, Verifier,
+diagnosis is passed to the Architect. Architect advice, Fixer, targeted test, assessment,
 host gates, and commit behavior remain unchanged. An accepted no-op solution
 completes the phase without increasing the commit count. A real accepted
 commit is recorded as another verified loop commit. By default, the accepted

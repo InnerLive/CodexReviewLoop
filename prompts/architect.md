@@ -14,7 +14,7 @@ Recent history:
 {{HISTORY}}
 
 Workflow:
-Current findings → Architect advice [current role] → Fixer changes → Verifier decision. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
+Current findings → Architect advice [current role] → Fixer changes → Architect assessment. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
 
 Result:
 Return your advice in the supplied structured format.

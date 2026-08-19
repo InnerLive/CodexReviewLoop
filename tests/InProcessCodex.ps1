@@ -113,8 +113,8 @@ function Get-InProcessCodexDefaultResult {
         "fixer-result-v3.schema.json" {
             return '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         }
-        "verifier-result-v4.schema.json" {
-            return '{"schemaVersion":"4.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        "architecture-assessment-v1.schema.json" {
+            return '{"schemaVersion":"1.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
         }
         default { return "No actionable findings." }
     }

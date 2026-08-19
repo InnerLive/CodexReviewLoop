@@ -152,7 +152,6 @@ supported developer-instructions setting.
 | LessonsLearned | `gpt-5.6-sol` | `high` |
 | Architect | `gpt-5.6-sol` | `high` |
 | Fixer | `gpt-5.6-sol` | `high` |
-| Verifier | `gpt-5.6-sol` | `low` |
 | ReviewClassifier | `gpt-5.6-luna` | `low` |
 
 - Analysis roles must leave HEAD, index, tracked files, and untracked files
@@ -160,7 +159,7 @@ supported developer-instructions setting.
 - Fixers own worktree edits but never commits or Git refs.
 - The orchestrator owns authoritative tests, verification, staging, and
   commits. Every accepted commit must represent the exact verified tree.
-- Architect, Fixer, and Verifier make their existing decisions directly. Do
+- Architect and Fixer make their existing decisions directly. Do
   not add approval, critic, judge, veto, tie-break, or fallback roles.
 - Prompts and schemas remain versioned resources, not large inline strings.
 - Structured output is mandatory where a schema exists. A process failure,
@@ -171,9 +170,9 @@ supported developer-instructions setting.
 
 - The current native review is authoritative. History supplies context only
   and never suppresses current findings.
-- Findings remain active until the Verifier accepts a solution or a later
+- Findings remain active until the Architect accepts a solution after the Fixer or a later
   native review reports clean. An edit or commit alone never resolves them.
-- Verifier rejection returns to the Fixer. Exhausting `MaxFixAttempts`
+- Architect rejection returns to the Fixer. Exhausting `MaxFixAttempts`
   preserves the rejected patch, restores the clean checkpoint, and starts a
   new native review; it does not create a blocked finding.
 - Configured host gates run after verification and before every commit. Recheck
@@ -182,7 +181,7 @@ supported developer-instructions setting.
   Every ordinary fix commit resets them.
 - Lessons learned runs once at an eligible clean gate. Its retrospective uses
   the full evidenced loop and sends only justified guidance changes through the
-  normal Architect/Fixer/Verifier/gate/commit path. An accepted result is
+  normal Architect-advice/Fixer/assessment/gate/commit path. An accepted result is
   final unless the captured `ReviewAfterLessonsLearnedCommit` setting requires
   clean reviews after a real lessons commit. Accepted no-ops finish directly.
 - `MaxReviewCycles` limits native reviews per invocation, not the durable run.
@@ -224,7 +223,7 @@ supported developer-instructions setting.
   central authenticated Codex CLI adapter.
 - Flag reviewer positional prompts or schemas; the safe path is native
   `codex review --base` plus optional supported developer instructions.
-- Flag resolution without current Verifier or clean-review evidence.
+- Flag resolution without current Architect assessment or clean-review evidence.
 - Flag commits that can include concurrent/unrelated changes or a tree that was
   not independently gated and identity-checked.
 - Flag mutating retries without a durable recovery checkpoint and complete
