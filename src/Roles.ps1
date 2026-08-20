@@ -13,15 +13,6 @@ function Get-ReviewLoopOperationalInstructions {
         [Parameter(Mandatory = $true)][hashtable]$Config
     )
 
-    $instructions = @"
-Execution context:
-This role is one Codex CLI process in an unattended Windows PowerShell repository workflow.
-The repository root, local tools, and repository instructions are available to the role.
-The orchestrator is deterministic PowerShell code, not an LLM or conversational participant.
-It does not interpret prose as instructions; it reacts to implemented workflow transitions and structured result fields.
-The orchestrator records repository state, owns Git refs and commits, executes configured host gates, and manages the Codex process.
-The role returns its result through the supplied structured format.
-"@
     $hostGateCommands = @($Config.HostGates | ForEach-Object {
         $arguments = @($_.Arguments | ForEach-Object { [string]$_ }) -join " "
         "- $($_.Name): $($_.FilePath) $arguments".TrimEnd()
@@ -32,47 +23,23 @@ The role returns its result through the supplied structured format.
     else {
         $hostGateCommands -join [Environment]::NewLine
     }
-    $testOwnership = @"
-
-Configured host gates:
-$hostGateText
-The orchestrator executes these gates after verification.
-"@
-    if ($Role -eq "ReviewClassifier") {
-        return @"
-$instructions
-The ReviewClassifier's hasFindings field is the classification consumed by the orchestrator.
-This role classifies the supplied review text; the orchestrator compares repository state before and after the call.
-"@
+    $rolePromptName = switch ($Role) {
+        "Architect" { "developer-architect.md" }
+        "Fixer" { "developer-fixer.md" }
+        "ReviewClassifier" { "developer-review-classifier.md" }
+        "LessonsLearned" { "developer-lessons-learned.md" }
+        default { "developer-analysis.md" }
     }
-    if ($Role -eq "LessonsLearned") {
-        return @"
-$instructions$testOwnership
-The changes array is the only part of the retrospective that the orchestrator converts into repository work. An empty array means that no durable repository guidance change is justified.
-The complete diagnosis remains evidence for Architect advice and assessment. Review-loop-process causes are diagnostic only and do not create cross-repository work.
-This role analyzes the supplied run evidence and verified loop commits; the orchestrator compares repository state before and after the call.
-"@
+    $sections = @(
+        Get-ReviewLoopPrompt -Name "developer-common.md" -Values @{}
+    )
+    if ($Role -ne "ReviewClassifier") {
+        $sections += Get-ReviewLoopPrompt `
+            -Name "developer-host-gates.md" -Values @{ HOST_GATES = $hostGateText }
     }
-    $handoff = switch ($Role) {
-        "Architect" {
-            @"
-The first Architect result is passed unchanged to the Fixer as advice. Later calls in the same Architect thread assess the resulting repository state.
-The Fixer acts on described repository changes; the orchestrator does not execute steps from architecture prose.
-During assessment, the accept field selects the implemented workflow transition. Judge the result against the findings and repository state, not by whether it follows the earlier advice. Rejection feedback is passed to the Fixer; an accepted commitMessage proposal is used after configured host gates pass.
-"@
-        }
-        "Fixer" {
-            @"
-The Architect result is advice to this role. This role owns worktree edits but not commits or Git refs.
-The targetedTest fields are the interface for asking the orchestrator to run one targeted test after this role returns; the summary is descriptive.
-The fixer workspace is the worktree observed by the orchestrator.
-"@
-        }
-        default {
-            "This role contributes analysis; the orchestrator compares repository state before and after the call."
-        }
-    }
-    return "$instructions$testOwnership`n$handoff"
+    $sections += Get-ReviewLoopPrompt -Name $rolePromptName -Values @{}
+    return (@($sections | ForEach-Object { $_.Trim() }) -join (
+        [Environment]::NewLine + [Environment]::NewLine))
 }
 
 function Get-ReviewLoopPrompt {
@@ -345,9 +312,8 @@ function Invoke-ConfiguredCodexRole {
         }
         else {
             $effectiveMode = "Resume"
-            $effectivePrompt = @"
-Continue the interrupted $Role work from the current repository state and return the role result in the supplied structured format.
-"@
+            $effectivePrompt = Get-ReviewLoopPrompt `
+                -Name "resume-interrupted-role.md" -Values @{ ROLE = $Role }
         }
     }
 
@@ -760,12 +726,19 @@ function Invoke-ReviewLoopArchitect {
         [string]$CodexPath = ""
     )
 
+    $architectThreadId = Get-ReviewLoopRoleSessionThreadId `
+        -State $State -Role "Architect"
+    $history = if ([string]::IsNullOrWhiteSpace($architectThreadId)) {
+        @(Get-ReviewLoopRecentHistory -Ledger $Ledger -Limit 50)
+    }
+    else {
+        @()
+    }
     $prompt = Get-ReviewLoopPrompt -Name "architect.md" -Values @{
         FINDINGS = [string]$State.ActiveReviewText
         REPOSITORY_CONTEXT = ConvertTo-ReviewLoopJsonCompact (
             Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath)
-        HISTORY = ConvertTo-ReviewLoopJsonCompact @(
-            Get-ReviewLoopRecentHistory -Ledger $Ledger -Limit 50)
+        HISTORY = ConvertTo-ReviewLoopJsonCompact $history
     }
     $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
@@ -798,9 +771,22 @@ function Invoke-ReviewLoopFixer {
         [string]$Feedback = "None."
     )
 
+    $fixerThreadId = Get-ReviewLoopRoleSessionThreadId -State $State -Role "Fixer"
+    $hasNewFeedback = -not [string]::Equals(
+        $Feedback, "None.", [System.StringComparison]::Ordinal)
+    $useDeltaContext = $hasNewFeedback -and
+        -not [string]::IsNullOrWhiteSpace($fixerThreadId)
+    $context = if ($useDeltaContext) {
+        [pscustomobject]@{}
+    }
+    else {
+        [pscustomobject][ordered]@{
+            findings = [string]$State.ActiveReviewText
+            architectAdvice = $Strategy
+        }
+    }
     $prompt = Get-ReviewLoopPrompt -Name "fixer.md" -Values @{
-        FINDINGS = [string]$State.ActiveReviewText
-        ARCHITECT_ADVICE = ConvertTo-ReviewLoopJsonCompact $Strategy
+        CONTEXT = ConvertTo-ReviewLoopJsonCompact $context
         FEEDBACK = $Feedback
     }
     $mode = if ([string]::IsNullOrWhiteSpace($ThreadId)) { "Exec" } else { "Resume" }
@@ -831,9 +817,21 @@ function Invoke-ReviewLoopArchitectAssessment {
         [string]$CodexPath = ""
     )
 
+    $architectThreadId = Get-ReviewLoopRoleSessionThreadId `
+        -State $State -Role "Architect"
+    $context = if ([string]::IsNullOrWhiteSpace($architectThreadId)) {
+        [pscustomobject][ordered]@{
+            findings = [string]$State.ActiveReviewText
+            architectAdvice = $State.ActiveStrategy
+            repositoryContext = Get-ReviewLoopRepositoryContext `
+                -State $State -RepoPath $RepoPath
+        }
+    }
+    else {
+        [pscustomobject]@{}
+    }
     $prompt = Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values @{
-        FINDINGS = [string]$State.ActiveReviewText
-        ARCHITECT_ADVICE = ConvertTo-ReviewLoopJsonCompact $State.ActiveStrategy
+        CONTEXT = ConvertTo-ReviewLoopJsonCompact $context
         FIXER_RESULT = ConvertTo-ReviewLoopJsonCompact $FixerCall.StructuredResult
     }
     $fixerCallId = [string](Get-ReviewLoopObjectProperty `

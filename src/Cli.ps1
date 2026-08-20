@@ -1093,10 +1093,9 @@ function Invoke-CodexCliRole {
         if (-not [string]::IsNullOrWhiteSpace($lastThreadId)) {
             $currentMode = "Resume"
             $currentThreadId = $lastThreadId
-            $currentPrompt = @"
-The previous $Role turn was rejected for a technical reason: $failureReason
-Do not repeat completed investigation or edits. Correct the operational problem, inspect the current worktree, and return a valid final result for the original task.
-"@
+            $currentPrompt = Get-ReviewLoopPrompt `
+                -Name "technical-retry-resume.md" `
+                -Values @{ ROLE = $Role; FAILURE_REASON = $failureReason }
         }
         else {
             $currentMode = $Mode
@@ -1104,13 +1103,13 @@ Do not repeat completed investigation or edits. Correct the operational problem,
                 ""
             }
             else {
-                @"
-The previous $Role process failed before a thread ID was available: $failureReason
-Inspect the current worktree, preserve correct partial work, and complete the original task.
-
-Original task:
-$Prompt
-"@
+                Get-ReviewLoopPrompt `
+                    -Name "technical-retry-fresh.md" `
+                    -Values @{
+                        ROLE = $Role
+                        FAILURE_REASON = $failureReason
+                        ORIGINAL_TASK = $Prompt
+                    }
             }
         }
         Write-ReviewLoopStatus -Message "${Role}: $failureKind; retrying in ${delay}s$(if (-not [string]::IsNullOrWhiteSpace($lastThreadId)) { ' on the same thread' } else { '' })." -Kind Warning

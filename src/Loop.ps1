@@ -2981,11 +2981,10 @@ function Invoke-ReviewLoopFixWorkflow {
             [int](Get-ReviewLoopObjectProperty `
                 -Object $partialRecovery -Name "Correction" -Default 1))
         $retryCurrentAttempt = $true
-        $feedback = @(
-            "The previous Fixer process ended after changing the worktree without producing a resumable thread."
-            "Inspect the current diff, preserve correct partial work, and complete the same finding."
-            "Technical failure: $([string](Get-ReviewLoopObjectProperty -Object $partialRecovery -Name 'FailureReason' -Default 'unknown'))"
-        ) -join [Environment]::NewLine
+        $feedback = Get-ReviewLoopPrompt `
+            -Name "fixer-partial-recovery.md" `
+            -Values @{ FAILURE_REASON = [string](Get-ReviewLoopObjectProperty `
+                -Object $partialRecovery -Name "FailureReason" -Default "unknown") }
     }
     $storedAttempt = [int](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "Attempt" -Default -1)
@@ -3007,7 +3006,8 @@ function Invoke-ReviewLoopFixWorkflow {
             if ([string]$State.Stage -notin @("testing", "test_failed", "gate_failed")) {
                 Stop-ReviewLoopBlocked -Message "The active worktree changed outside the recorded fixer attempt."
             }
-            $feedback = "A test or gate changed the worktree after the previous fixer result. Remove unintended generated changes."
+            $feedback = Get-ReviewLoopPrompt `
+                -Name "fixer-external-worktree-change.md" -Values @{}
             $retryCurrentAttempt = $false
         }
         else {
@@ -3045,7 +3045,8 @@ function Invoke-ReviewLoopFixWorkflow {
             }
         }
         if ($null -eq $partialRecovery) {
-            $feedback = "The previous fixer process was interrupted. Inspect and preserve correct partial work before completing the same attempt."
+            $feedback = Get-ReviewLoopPrompt `
+                -Name "fixer-interrupted-attempt.md" -Values @{}
         }
     }
 
@@ -3122,11 +3123,9 @@ function Invoke-ReviewLoopFixWorkflow {
                     -Correction $technicalCorrections
                 $threadId = ""
                 foreach ($finding in $Findings) { $finding.FixerThreadId = "" }
-                $feedback = @(
-                    "The previous Fixer process ended after changing the worktree without producing a resumable thread."
-                    "Inspect the current diff, preserve correct partial work, and complete the same finding."
-                    "Technical failure: $($fixer.FailureReason)"
-                ) -join [Environment]::NewLine
+                $feedback = Get-ReviewLoopPrompt `
+                    -Name "fixer-partial-recovery.md" `
+                    -Values @{ FAILURE_REASON = [string]$fixer.FailureReason }
                 $retryCurrentAttempt = $true
                 continue
             }

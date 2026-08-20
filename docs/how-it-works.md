@@ -68,10 +68,23 @@ advances the clean-pass counter.
 The Architect receives the current findings text, repository context, and up
 to 50 recent history entries. The findings text is unchanged native review
 output during ordinary cycles and the complete structured analysis during the
-lessons-learned phase. Its prompt describes the role and response format
-without prescribing a point fix, redesign, scope, or decision criteria.
+lessons-learned phase. Its developer instructions define the role and decision
+contract without prescribing a point fix, redesign, or scope.
 The Architect keeps one dedicated Codex thread for the durable run, so later
 cycles retain its architectural reasoning in addition to the explicit history.
+The first call supplies recent ledger history. Later calls send only the new
+findings and current repository context; if no Architect thread is available,
+the complete bootstrap context is supplied again.
+
+Role context has three distinct owners. Developer instructions sent on every
+call define the durable role, goal, workflow, decision criteria, and ownership
+boundaries. The prompt identifies the current phase and carries new evidence.
+The JSON schema defines only the shape and required fields of the result. This
+keeps the quality contract current even in long or compacted threads while
+avoiding repeated findings, history, advice, and results.
+All fixed developer-instruction, phase, and technical-recovery prompt text is
+versioned as Markdown under `prompts/`; PowerShell only selects templates and
+supplies dynamic values.
 
 The structured Architect response is passed unchanged to the Fixer. After each
 Fixer result, the same Architect thread assesses the resulting repository state.
@@ -84,6 +97,9 @@ feedback from the previous Architect assessment. It chooses the changes and expl
 Git determines which files actually changed.
 Its dedicated Codex thread is reused across attempts and finding clusters in
 the same durable run.
+The first call for each cluster supplies the findings and Architect advice.
+Corrections in the same thread send only new feedback. A fresh recovery thread
+receives the complete context again.
 
 `MaxFixAttempts` is the number of Fixer calls allowed in one review round. When
 the value is reached without acceptance, the loop preserves the rejected patch
@@ -110,10 +126,14 @@ technical failures.
 ## 4. Architect assessment
 
 The orchestrator runs an available targeted test and records the actual result.
-The Architect receives the current repository, findings text, its earlier
-advice, the Fixer response, and test evidence in its existing durable thread.
+The Architect inspects the current repository and receives the Fixer response
+and test evidence in its existing durable thread, where the findings and
+earlier advice are already available.
 The advice is context, not a conformance requirement: a better Fixer deviation
 may be accepted when the repository state satisfactorily resolves the findings.
+Normal assessment resumes send only the Fixer and test result. Without a
+durable Architect thread, recovery repeats the findings, advice, and current
+repository context so the assessment remains self-contained.
 
 The Architect decides directly:
 

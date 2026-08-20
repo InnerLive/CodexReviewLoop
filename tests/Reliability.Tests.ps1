@@ -1708,6 +1708,14 @@ Changes:
         } $config $state $statePath $repo $runRoot (New-ReliabilityFinding) $fixerCall $fakeCodex
         $verification.Accepted | Should Be $false
         $verification.Result.summary | Should Be "Still present."
+        $record = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            Select-Object -Last 1 | ConvertFrom-Json
+        $record.prompt | Should Match "large patch finding"
+        $record.prompt | Should Match "Review the current worktree"
+        $record.prompt | Should Match "Changed the implementation"
+        $record.prompt | Should Match '"repositoryContext"'
+        $record.prompt | Should Match '"reviewBase"'
+        $record.prompt | Should Match '"changedPaths"'
     }
 
     It "reassesses a matching interrupted legacy Verifier checkpoint with the Architect thread" {
@@ -1770,6 +1778,10 @@ Changes:
             Select-Object -Last 1 | ConvertFrom-Json
         $record.callKind | Should Be "resume"
         $record.resumeThreadId | Should Be "architect-thread"
+        $record.prompt | Should Match 'Recovery context.+\{\}'
+        $record.prompt | Should Match "Applied a better solution"
+        $record.prompt | Should Not Match "legacy finding"
+        $record.prompt | Should Not Match "Use judgment"
     }
 
     It "keeps a mismatched interrupted legacy Verifier checkpoint blocked" {

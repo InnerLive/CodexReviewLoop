@@ -99,6 +99,12 @@ assessment share the Architect thread. Older
 checkpoints without the role-session map reconstruct it from the latest
 successful recorded call for each role. The native Reviewer always starts a
 fresh review and is excluded from this migration.
+Resume prompts carry only the new findings, result, or feedback needed for the
+next decision. When no valid role session exists, the role receives complete
+standalone context instead.
+The stable role, goal, workflow, and safety contract is not a session delta:
+it is supplied as developer instructions on every role call. Prompts carry the
+current phase and evidence, while schemas constrain only the result shape.
 
 Interrupted fixer work resumes from its recorded thread when possible. If a
 Fixer changed files before a resumable thread ID was available, the loop first

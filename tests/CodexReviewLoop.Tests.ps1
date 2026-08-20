@@ -1479,10 +1479,105 @@ Describe "Fake Codex integration" -Tags @("Process") {
         $records[1].resumeThreadId | Should Be "architect-thread"
         $records[2].resumeThreadId | Should Be "architect-thread"
         $records[3].resumeThreadId | Should Be "architect-thread"
+        foreach ($record in @($records[0], $records[1], $records[2], $records[3])) {
+            ($record.arguments -join " ") |
+                Should Match 'coherence and integrity of this software system as a whole'
+            ($record.arguments -join " ") |
+                Should Match 'current findings -> Architect advice -> Fixer changes'
+        }
         $reloaded = Read-ReviewLoopState -Path $statePath
         $reloaded.RoleSessions.Architect | Should Be "architect-thread"
         @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Verifier").Count | Should Be 0
         @($reloaded.RoleSessions.PSObject.Properties.Name -eq "Reviewer").Count | Should Be 0
+    }
+
+    It "sends the complete Fixer contract on exec and resume" {
+        $repoPath = New-TestRepo $repo.FullName
+        $configPath = New-TestConfig `
+            -Path (Join-Path $TestDrive "fixer-contract.psd1") `
+            -LogRoot $logRoot
+        $statePath = Join-Path $logRoot "fixer-contract-state.json"
+
+        & (Get-Module CodexReviewLoop) {
+            param($profilePath, $repository, $runRoot, $checkpointPath, $fakePath)
+            $config = Import-PowerShellDataFile -LiteralPath $profilePath
+            $state = New-ReviewLoopState `
+                -RepoPath $repository -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+            Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
+
+            foreach ($id in @("fixer-contract-exec", "fixer-contract-resume")) {
+                Invoke-ConfiguredCodexRole `
+                    -Config $config -Role "Fixer" -RepoPath $repository -Speed standard `
+                    -Prompt "current task" -LogRoot $runRoot `
+                    -SchemaName "fixer-result-v3.schema.json" `
+                    -CodexPath $fakePath -CallId $id -State $state -StatePath $checkpointPath |
+                    Out-Null
+            }
+        } $configPath $repoPath $logRoot $statePath $fakeCodex
+
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        @($records.callKind) | Should Be @("exec", "resume")
+        foreach ($record in $records) {
+            ($record.arguments -join " ") | Should Match 'Fixer for the current findings'
+            ($record.arguments -join " ") | Should Match 'preserve correct existing or partial work'
+            ($record.arguments -join " ") | Should Match 'targetedTest\.executable'
+        }
+    }
+
+    It "sends Architect history once and uses finding deltas on resume" {
+        $repoPath = New-TestRepo $repo.FullName
+        $configPath = New-TestConfig `
+            -Path (Join-Path $TestDrive "architect-deltas.psd1") `
+            -LogRoot $logRoot
+        $statePath = Join-Path $logRoot "architect-deltas-state.json"
+        $ledger = New-ReviewLoopLedger -RepoPath $repoPath
+        Merge-ReviewLoopFindings `
+            -Ledger $ledger `
+            -Findings @((New-TestFinding -Component "historic-context-marker")) `
+            -ReviewId "historic-review" `
+            -Head (& git -C $repoPath rev-parse HEAD) | Out-Null
+
+        & (Get-Module CodexReviewLoop) {
+            param($profilePath, $repository, $runRoot, $checkpointPath, $history, $fakePath)
+            $config = Import-PowerShellDataFile -LiteralPath $profilePath
+            $state = New-ReviewLoopState `
+                -RepoPath $repository -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+            $state.ActiveClusterId = "C-first"
+            $state.ReviewCycle = 1
+            $state.ActiveReviewText = "first-current-finding"
+            Write-ReviewLoopState -Path $checkpointPath -State $state | Out-Null
+
+            Invoke-ReviewLoopArchitect `
+                -Config $config -State $state -StatePath $checkpointPath -Ledger $history `
+                -RepoPath $repository -Speed standard -RunRoot $runRoot `
+                -Findings @($history.Findings[0]) -CodexPath $fakePath | Out-Null
+            $state.ActiveClusterId = "C-second"
+            $state.ReviewCycle = 2
+            $state.ActiveReviewText = "second-current-finding"
+            Invoke-ReviewLoopArchitect `
+                -Config $config -State $state -StatePath $checkpointPath -Ledger $history `
+                -RepoPath $repository -Speed standard -RunRoot $runRoot `
+                -Findings @($history.Findings[0]) -CodexPath $fakePath | Out-Null
+        } $configPath $repoPath $logRoot $statePath $ledger $fakeCodex
+
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $records.Count | Should Be 2
+        $records[0].callKind | Should Be "exec"
+        $records[0].prompt | Should Match "first-current-finding"
+        $records[0].prompt | Should Match "historic-context-marker"
+        $records[1].callKind | Should Be "resume"
+        $records[1].prompt | Should Match "second-current-finding"
+        $records[1].prompt | Should Match 'Additional history.+\[\]'
+        $records[1].prompt | Should Not Match "historic-context-marker"
+        $records[1].prompt | Should Match 'changedPaths'
+        foreach ($record in $records) {
+            ($record.arguments -join " ") |
+                Should Match 'coherence and integrity of this software system as a whole'
+            ($record.arguments -join " ") |
+                Should Match 'current findings -> Architect advice -> Fixer changes'
+        }
     }
 
     It "captures usage" {
@@ -1982,8 +2077,35 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
     }
 
     It "contains every production prompt" {
-        @("architect.md", "architect-assessment.md", "fixer.md", "lessons-learned.md") |
-            ForEach-Object { Test-Path (Join-Path $root "prompts\$_") | Should Be $true }
+        $expected = @(
+            "architect-assessment.md",
+            "architect.md",
+            "developer-analysis.md",
+            "developer-architect.md",
+            "developer-common.md",
+            "developer-fixer.md",
+            "developer-host-gates.md",
+            "developer-lessons-learned.md",
+            "developer-review-classifier.md",
+            "fixer.md",
+            "fixer-external-worktree-change.md",
+            "fixer-interrupted-attempt.md",
+            "fixer-partial-recovery.md",
+            "lessons-learned.md",
+            "resume-interrupted-role.md",
+            "review-classifier.md",
+            "technical-retry-fresh.md",
+            "technical-retry-resume.md"
+        )
+        @(Get-ChildItem -LiteralPath (Join-Path $root "prompts") -Filter "*.md" |
+            Sort-Object Name | Select-Object -ExpandProperty Name) | Should Be $expected
+    }
+
+    It "keeps production prompt text out of PowerShell source" {
+        $source = @("src\Roles.ps1", "src\Cli.ps1") | ForEach-Object {
+            Get-Content -Raw -LiteralPath (Join-Path $root $_)
+        }
+        ($source -join "`n") | Should Not Match '(?m)=\s*@"|=\s*@'''
     }
 
     It "accepts free architecture advice and an unavailable targeted test" {
@@ -2032,78 +2154,34 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
     It "keeps the complete free-role prompts stable" {
         $expected = @{
             "architect.md" = @'
-Role:
-You are the architect responsible for the coherence and integrity of this software system as a whole. You maintain a system-wide perspective across the current findings, repository context, and recent history, and understand individual findings as evidence about the system's design and invariants.
-
-Goal:
-Decide how the current findings should be handled so the resulting repository state is coherent, complete, durable, and unlikely to reveal further defects arising from the same changes or underlying concerns. Correctness, security, maintainability, and appropriate scope take precedence. Use your independent judgment to choose the solution.
+Provide advice for the current finding cluster.
 
 Current findings:
 {{FINDINGS}}
 
-Repository context:
+Current repository context:
 {{REPOSITORY_CONTEXT}}
 
-Recent history:
+Additional history (`[]` when already established in this thread):
 {{HISTORY}}
-
-Workflow:
-Current findings → Architect advice [current role] → Fixer changes → Architect assessment. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
-
-Result:
-Return your advice in the supplied structured format.
 '@
             "fixer.md" = @'
-Role:
-You are the fixer for the current findings.
+Work on the current finding cluster.
 
-Goal:
-Use your judgment to improve the repository in response to the findings and architectural advice.
+Context for a new finding or threadless recovery (`{}` when already established in this thread):
+{{CONTEXT}}
 
-Current findings:
-{{FINDINGS}}
-
-Architectural advice:
-{{ARCHITECT_ADVICE}}
-
-Previous feedback:
+New feedback:
 {{FEEDBACK}}
-
-Workflow:
-Current findings → Architect advice → Fixer changes [current role] → Architect assessment. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
-
-Targeted test:
-`targetedTest.executable` is the program started by the orchestrator, for example `dotnet`, `pwsh`, or a repository wrapper. Project, script, test, and filter values belong in `targetedTest.arguments`; for `dotnet test`, `dotnet` is the executable and `test` is the first argument.
-
-Result:
-Return your work summary and targeted-test information in the supplied structured format.
 '@
             "architect-assessment.md" = @'
-Role:
-You are the architect assessing the current solution in the same thread that produced the architectural advice.
+Inspect the current repository state and assess the latest Fixer result.
 
-Goal:
-Decide whether the current repository state is a satisfactory, coherent response to the findings. Assess the result against the findings and repository state, not by whether the Fixer followed your earlier advice. A better deviation may be accepted.
+Recovery context (`{}` when the findings, repository context, and advice are already established in this thread):
+{{CONTEXT}}
 
-Current findings:
-{{FINDINGS}}
-
-Earlier architectural advice:
-{{ARCHITECT_ADVICE}}
-
-Fixer result and targeted-test execution:
+Fixer result and targeted-test evidence:
 {{FIXER_RESULT}}
-
-Workflow:
-Current findings → Architect advice → Fixer changes → Architect assessment [current role]. Rejections return to the Fixer; the orchestrator runs tests and host gates and commits accepted changes.
-
-Commit message:
-When accepting, propose a solution-oriented subject, a brief rationale, and the key changes. Keep the subject concise, ideally within 72 characters before the configured prefix, and follow the repository's established language and style when clear. Leave test and host-gate evidence, Git trailers, and authorship out; the orchestrator adds verified evidence.
-
-When requesting changes, return an empty subject, an empty rationale, and an empty changes list.
-
-Result:
-Return your decision, feedback, and commit-message proposal in the supplied structured format.
 '@
         }
         foreach ($name in $expected.Keys) {
@@ -2115,8 +2193,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
 
     It "replaces only placeholders from the original prompt template" {
         $values = @{
-            FINDINGS = 'Finding contains {{DIFF}}.'
-            ARCHITECT_ADVICE = 'Advice contains {{ROOT}}.'
+            CONTEXT = 'Context contains {{DIFF}} and {{ROOT}}.'
             FIXER_RESULT = 'Generated code contains {{heading}}.'
         }
         $rendered = & (Get-Module CodexReviewLoop) {
@@ -2124,7 +2201,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
             Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values $promptValues
         } $values
 
-        $rendered | Should Match ([regex]::Escape("Finding contains {{DIFF}}."))
+        $rendered | Should Match ([regex]::Escape("Context contains {{DIFF}} and {{ROOT}}."))
         $rendered | Should Match ([regex]::Escape("Generated code contains {{heading}}."))
     }
 
@@ -2133,8 +2210,7 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         try {
             & (Get-Module CodexReviewLoop) {
                 Get-ReviewLoopPrompt -Name "architect-assessment.md" -Values @{
-                    FINDINGS = "findings"
-                    ARCHITECT_ADVICE = "advice"
+                    CONTEXT = "context"
                 }
             } | Out-Null
         }
@@ -2152,14 +2228,18 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         }
         $prompts = $prompts -join "`n"
         $prompts | Should Not Match '(?i)\bmust\b|\bnever\b|fail closed|\bprefer\b|\bonly\b|smallest|bounded'
-        $prompts | Should Match 'Use your judgment'
     }
 
     It "gives the Architect assessment the fixer result without requiring advice conformance" {
         $assessment = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\architect-assessment.md")
-        $assessment | Should Match 'Fixer result and targeted-test execution'
-        $assessment | Should Match 'not by whether the Fixer followed your earlier advice'
-        $assessment | Should Match 'A better deviation may be accepted'
+        $assessment | Should Match 'Fixer result and targeted-test evidence'
+        $assessment | Should Match 'Inspect the current repository state'
+        $instructions = & (Get-Module CodexReviewLoop) {
+            Get-ReviewLoopOperationalInstructions `
+                -Role Architect -Config @{ HostGates = @() }
+        }
+        $instructions | Should Match 'not by whether it follows the earlier advice'
+        $instructions | Should Match 'A better deviation may be accepted'
     }
 
     It "keeps the lessons-learned prompt self-contained and read-only" {
@@ -2192,15 +2272,14 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
         }
     }
 
-    It "gives each free role the shared workflow and marks its current position" {
+    It "keeps workflow instructions out of the compact dynamic prompts" {
         foreach ($name in @("architect.md", "architect-assessment.md", "fixer.md")) {
             $prompt = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$name")
-            $prompt | Should Match 'Current findings.+Architect advice.+Fixer changes.+Architect assessment'
-            $prompt | Should Match '\[current role\]'
-            $prompt | Should Match 'orchestrator runs tests and host gates and commits accepted changes'
+            $prompt | Should Not Match '(?m)^Role:|^Workflow:|^Result:'
+            $prompt | Should Not Match 'orchestrator runs tests and host gates'
         }
         $fixer = Get-Content -Raw -LiteralPath (Join-Path $root "prompts\fixer.md")
-        $fixer | Should Match 'targetedTest\.executable'
+        $fixer | Should Not Match 'targetedTest\.executable'
     }
 
     It "describes the deterministic orchestrator and each structured role handoff" {
@@ -2224,11 +2303,27 @@ Return your decision, feedback, and commit-message proposal in the supplied stru
             $instructions.$role | Should Match 'structured result fields'
         }
         $instructions.Architect | Should Match 'passed unchanged to the Fixer as advice'
+        $instructions.Architect | Should Match 'coherence and integrity of this software system as a whole'
+        $instructions.Architect | Should Match "system's design and invariants"
+        $instructions.Architect | Should Match 'Correctness, security, maintainability, and appropriate scope take precedence'
+        $instructions.Architect | Should Match 'read-only role'
+        $instructions.Architect | Should Match 'actual relevant code, current diff, and repository state'
+        $instructions.Architect | Should Match 'Fixer summaries and targeted-test results are evidence, not substitutes'
+        $instructions.Architect | Should Match 'current findings -> Architect advice -> Fixer changes -> Architect assessment -> configured host gates -> commit'
         $instructions.Architect | Should Match 'orchestrator does not execute steps from architecture prose'
         $instructions.Architect | Should Match 'accept field selects the implemented workflow transition'
         $instructions.Architect | Should Match 'Rejection feedback is passed to the Fixer'
+        $instructions.Architect | Should Match 'ideally within 72 characters'
+        $instructions.Architect | Should Match "repository's established language and style"
+        $instructions.Architect | Should Match 'return an empty subject, an empty rationale, and an empty changes list'
+        $instructions.Fixer | Should Match 'Fixer for the current findings'
+        $instructions.Fixer | Should Match 'Use your judgment to improve the repository'
+        $instructions.Fixer | Should Match 'advice, not a requirement to follow a prescribed plan'
+        $instructions.Fixer | Should Match 'preserve correct existing or partial work'
         $instructions.Fixer | Should Match 'owns worktree edits but not commits or Git refs'
         $instructions.Fixer | Should Match 'targetedTest fields are the interface'
+        $instructions.Fixer | Should Match 'targetedTest\.executable is the program started by the orchestrator'
+        $instructions.Fixer | Should Match 'Project, script, test, and filter values belong in targetedTest\.arguments'
         $instructions.ReviewClassifier | Should Match 'hasFindings field is the classification consumed by the orchestrator'
         $instructions.LessonsLearned | Should Match 'changes array is the only part of the retrospective'
         $instructions.LessonsLearned | Should Match 'complete diagnosis remains evidence for Architect advice and assessment'
@@ -2859,7 +2954,8 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "architecture-assessment-v1.schema.json"
         })[0]
-        $assessmentCall.prompt | Should Match "Broader reviews extended discovery"
+        $assessmentCall.prompt | Should Match "(?m)^\{\}$"
+        $assessmentCall.prompt | Should Not Match "Broader reviews extended discovery"
         @((Read-ReviewLoopLedger -Path $checkpoint.LedgerPath).Findings).Count |
             Should Be 3
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
@@ -3272,6 +3368,8 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         $fixerRecords.Count | Should Be 2
         $fixerRecords[1].callKind | Should Be "exec"
         $fixerRecords[1].prompt | Should Match "previous Fixer process ended"
+        $fixerRecords[1].prompt | Should Match ([regex]::Escape($findingReview))
+        $fixerRecords[1].prompt | Should Match "Complete the implementation"
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
             Should Match "Partial Fixer work was preserved"
     }
@@ -3393,6 +3491,8 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
             ForEach-Object { $_ | ConvertFrom-Json })
         $records[0].callKind | Should Be "exec"
         $records[0].prompt | Should Match "previous Fixer process ended"
+        $records[0].prompt | Should Match "restart recovery defect"
+        $records[0].prompt | Should Match "Inspect and finish the current worktree"
     }
 
 }
@@ -3449,6 +3549,18 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
             $_.callKind -eq "resume" -and
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "fixer-result-v3.schema.json"
         }).Count | Should Be 2
+        $fixerCalls = @($records | Where-Object {
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
+                "fixer-result-v3.schema.json"
+        })
+        $fixerCalls[0].prompt | Should Match ([regex]::Escape($findingReview))
+        $fixerCalls[0].prompt | Should Match "Update the affected cache behavior"
+        foreach ($call in @($fixerCalls[1], $fixerCalls[2])) {
+            $call.prompt | Should Match "Continue the fix"
+            $call.prompt | Should Match 'Context for a new finding or threadless recovery.+\{\}'
+            $call.prompt | Should Not Match ([regex]::Escape($findingReview))
+            $call.prompt | Should Not Match "Update the affected cache behavior"
+        }
         $assessmentCalls = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "architecture-assessment-v1.schema.json"
@@ -3456,6 +3568,12 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         $assessmentCalls.Count | Should Be 3
         @($assessmentCalls | Where-Object { $_.callKind -ne "resume" }).Count | Should Be 0
         @($assessmentCalls.resumeThreadId | Select-Object -Unique).Count | Should Be 1
+        foreach ($call in $assessmentCalls) {
+            $call.prompt | Should Match 'Recovery context.+\{\}'
+            $call.prompt | Should Match 'Updated the cache'
+            $call.prompt | Should Not Match ([regex]::Escape($findingReview))
+            $call.prompt | Should Not Match "Update the affected cache behavior"
+        }
         @($records | Where-Object {
             [string]$_.schemaPath -match 'confirm|tie'
         }).Count | Should Be 0
@@ -3730,7 +3848,10 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         })[0]
         $assessmentCall.callKind | Should Be "resume"
         $assessmentCall.resumeThreadId | Should Be "cluster-thread"
-        [string]$assessmentCall.prompt | Should Match 'not by whether the Fixer followed your earlier advice'
+        [string]$assessmentCall.prompt | Should Match 'Inspect the current repository state'
+        [string]$assessmentCall.prompt | Should Match 'Recovery context.+\{\}'
+        [string]$assessmentCall.prompt | Should Not Match ([regex]::Escape($nativeReview))
+        [string]$assessmentCall.prompt | Should Not Match "Change both affected paths together"
         @($records | Where-Object {
             [string]$_.schemaPath -match 'trigger|critique|veto|tie'
         }).Count | Should Be 0
