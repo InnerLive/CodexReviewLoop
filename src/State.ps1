@@ -399,17 +399,22 @@ function New-ReviewLoopState {
         [Parameter(Mandatory = $true)][string]$ReviewBase,
         [Parameter(Mandatory = $true)][string]$Speed,
         [Parameter(Mandatory = $true)][string]$RunRoot,
+        [string]$ReviewBaseSetting = "",
         [string]$ReviewBaseCommit = "",
         [string]$ExecutionFingerprint = ""
     )
 
     $repo = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
+    if ([string]::IsNullOrWhiteSpace($ReviewBaseSetting)) {
+        $ReviewBaseSetting = $ReviewBase
+    }
     return [pscustomobject][ordered]@{
         SchemaVersion = "1.0"
         RunId = Split-Path -Leaf $RunRoot
         RunRoot = Resolve-ReviewLoopPath -Path $RunRoot
         RepoPath = $repo
         Branch = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("branch", "--show-current")
+        ReviewBaseSetting = $ReviewBaseSetting
         ReviewBase = $ReviewBase
         ReviewBaseCommit = $ReviewBaseCommit
         ExecutionFingerprint = $ExecutionFingerprint
@@ -483,6 +488,10 @@ function Read-ReviewLoopState {
     if ($state.PSObject.Properties.Name -notcontains "ReviewCyclesThisInvocation") {
         $state | Add-Member -NotePropertyName ReviewCyclesThisInvocation `
             -NotePropertyValue ([int]$state.ReviewCycle)
+    }
+    if ($state.PSObject.Properties.Name -notcontains "ReviewBaseSetting") {
+        $state | Add-Member -NotePropertyName ReviewBaseSetting `
+            -NotePropertyValue ([string]$state.ReviewBase)
     }
     if ($state.PSObject.Properties.Name -notcontains "LoopCommits") {
         $state | Add-Member -NotePropertyName LoopCommits -NotePropertyValue @()

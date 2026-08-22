@@ -335,6 +335,7 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
             Get-ReviewLoopRepositoryRoot -RepoPath $repository
         } $repo
         $profile.RepositoryPath | Should Be $canonicalRepo
+        $profile.ReviewBase | Should Be "Auto"
         $profile.LogRoot | Should Be ".\runs"
         $profile.ReviewerInstructions | Should Be ""
         $profile.InactivityTimeoutMinutes | Should Be 30
@@ -793,6 +794,7 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
 
         $exitCode | Should Be 0
         ($output -join "`n") | Should Match "ConfigPath"
+        ($output -join "`n") | Should Match "ReviewBase"
         ($output -join "`n") | Should Match "ReviewerInstructions"
         ($output -join "`n") | Should Match "empty string"
         ($output -join "`n") | Should Match "automatically"
@@ -830,6 +832,132 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $result.ExitCode | Should Be 1
         ($result.NextSteps -join "`n") | Should Match "-RepoPath"
         $text | Should Not Match "\[X\]|Recommended|Alternative"
+    }
+}
+
+Describe "Automatic review-base selection" -Tags @("Fast", "FullLocal") {
+    It "uses direct branch-creation reflog evidence even after the parent advances" {
+        $repo = New-TestRepo (Join-Path $TestDrive "reflog-direct-parent")
+        & git -C $repo switch -q -c parent
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo branch child parent
+        & git -C $repo switch -q child
+        Set-Content -LiteralPath (Join-Path $repo "child.txt") -Value "child"
+        & git -C $repo add child.txt
+        & git -C $repo commit -q -m "child"
+        & git -C $repo switch -q parent
+        Set-Content -LiteralPath (Join-Path $repo "parent-later.txt") -Value "later"
+        & git -C $repo add parent-later.txt
+        & git -C $repo commit -q -m "parent later"
+        & git -C $repo switch -q child
+
+        $selected = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopReflogReviewBase -RepoPath $repository -Branch child
+        } $repo
+        $selected | Should Be "parent"
+    }
+
+    It "correlates Created from HEAD with the matching checkout" {
+        $repo = New-TestRepo (Join-Path $TestDrive "reflog-head-parent")
+        & git -C $repo switch -q -c parent
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo switch -q -c child
+
+        $selected = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Get-ReviewLoopReflogReviewBase -RepoPath $repository -Branch child
+        } $repo
+        $selected | Should Be "parent"
+    }
+
+    It "uses the unique nearest ancestor and groups its tracking ref" {
+        $repo = New-TestRepo (Join-Path $TestDrive "graph-parent")
+        & git -C $repo switch -q -c parent
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo push -q -u origin parent
+        & git -C $repo switch -q -c child
+        Set-Content -LiteralPath (Join-Path $repo "child.txt") -Value "child"
+        & git -C $repo add child.txt
+        & git -C $repo commit -q -m "child"
+        $gitDirectory = & git -C $repo rev-parse --git-dir
+        Remove-Item -LiteralPath (Join-Path $repo "$gitDirectory\logs\refs\heads\child") -Force
+
+        $selected = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            Resolve-ReviewLoopAutomaticReviewBase -RepoPath $repository
+        } $repo
+        $selected | Should Be "parent"
+    }
+
+    It "falls back when distinct branch families are equally near" {
+        $repo = New-TestRepo (Join-Path $TestDrive "graph-ambiguous")
+        & git -C $repo switch -q -c parent-a
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo branch parent-b
+        & git -C $repo switch -q -c child
+        Set-Content -LiteralPath (Join-Path $repo "child.txt") -Value "child"
+        & git -C $repo add child.txt
+        & git -C $repo commit -q -m "child"
+        $gitDirectory = & git -C $repo rev-parse --git-dir
+        Remove-Item -LiteralPath (Join-Path $repo "$gitDirectory\logs\refs\heads\child") -Force
+
+        $values = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            [pscustomobject]@{
+                Fallback = Get-ReviewLoopFallbackReviewBase -RepoPath $repository
+                Selected = Resolve-ReviewLoopAutomaticReviewBase -RepoPath $repository
+            }
+        } $repo
+        $values.Selected | Should Be $values.Fallback
+    }
+
+    It "keeps the normal fallback on the integration branch itself" {
+        $repo = New-TestRepo (Join-Path $TestDrive "graph-integration-branch")
+        $defaultBranch = & git -C $repo branch --show-current
+        & git -C $repo switch -q -c merged-feature
+        Set-Content -LiteralPath (Join-Path $repo "merged.txt") -Value "merged"
+        & git -C $repo add merged.txt
+        & git -C $repo commit -q -m "merged feature"
+        & git -C $repo switch -q $defaultBranch
+        & git -C $repo merge -q --ff-only merged-feature
+
+        $values = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            [pscustomobject]@{
+                Fallback = Get-ReviewLoopFallbackReviewBase -RepoPath $repository
+                Selected = Resolve-ReviewLoopAutomaticReviewBase -RepoPath $repository
+            }
+        } $repo
+        $values.Selected | Should Be $values.Fallback
+    }
+
+    It "does not use deleted reflog parents and keeps the default branch fallback" {
+        $repo = New-TestRepo (Join-Path $TestDrive "reflog-deleted-parent")
+        $defaultBranch = & git -C $repo branch --show-current
+        & git -C $repo switch -q -c parent
+        & git -C $repo switch -q -c child
+        & git -C $repo branch -D parent | Out-Null
+
+        $values = & (Get-Module CodexReviewLoop) {
+            param($repository)
+            [pscustomobject]@{
+                Reflog = Get-ReviewLoopReflogReviewBase -RepoPath $repository -Branch child
+                Fallback = Get-ReviewLoopFallbackReviewBase -RepoPath $repository
+                Selected = Resolve-ReviewLoopAutomaticReviewBase -RepoPath $repository
+            }
+        } $repo
+        $values.Reflog | Should Be ""
+        $values.Selected | Should Be $values.Fallback
+        $values.Selected | Should Match ([regex]::Escape($defaultBranch))
     }
 }
 
@@ -1128,6 +1256,14 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
     It "pins the review base and execution fingerprint" {
         $state.ReviewBaseCommit | Should Be $reviewBaseCommit
         $state.ExecutionFingerprint | Should Be "test-execution-fingerprint"
+    }
+
+    It "defaults legacy state review-base settings to the resolved base" {
+        $legacyPath = Join-Path $runRoot "legacy-review-base-state.json"
+        $state.PSObject.Properties.Remove("ReviewBaseSetting")
+        Write-ReviewLoopState -Path $legacyPath -State $state | Out-Null
+
+        (Read-ReviewLoopState -Path $legacyPath).ReviewBaseSetting | Should Be "HEAD"
     }
 
     It "fingerprints execution settings but excludes live profile settings" {
@@ -3127,6 +3263,119 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $state = Read-ReviewLoopState -Path $completed.StatePath
         $state.ReviewCyclesThisInvocation | Should Be 1
         $state.CleanPasses | Should Be 2
+    }
+
+    It "inherits a CLI review-base override when the checkpoint resumes without it" {
+        & git -C $repo switch -q -c parent
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo switch -q -c child
+        Set-Content -LiteralPath (Join-Path $repo "child.txt") -Value "child"
+        & git -C $repo add child.txt
+        & git -C $repo commit -q -m "child"
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 1", "CleanPassesRequired = 2").
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            "No findings."
+        )
+
+        $limited = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -ReviewBase parent `
+            -Speed standard -CodexPath $fakeCodex -NewRun `
+            -HeartbeatSeconds 0 -ColorMode Never
+        $completed = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -Speed standard `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+
+        $limited.Status | Should Be "limit_reached"
+        $completed.Status | Should Be "completed"
+        $completed.StatePath | Should Be $limited.StatePath
+        $state = Read-ReviewLoopState -Path $completed.StatePath
+        $state.ReviewBaseSetting | Should Be "parent"
+        $state.ReviewBase | Should Be "parent"
+        $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { [string]$_.callKind -eq "review" })
+        $records.Count | Should Be 2
+        foreach ($record in $records) {
+            @($record.arguments | Select-Object -Last 3) |
+                Should Be @("review", "--base", "parent")
+        }
+    }
+
+    It "uses Auto from the command line instead of the concrete profile base" {
+        & git -C $repo switch -q -c parent
+        Set-Content -LiteralPath (Join-Path $repo "parent.txt") -Value "parent"
+        & git -C $repo add parent.txt
+        & git -C $repo commit -q -m "parent"
+        & git -C $repo switch -q -c child
+        Set-Content -LiteralPath (Join-Path $repo "child.txt") -Value "child"
+        & git -C $repo add child.txt
+        & git -C $repo commit -q -m "child"
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings."
+        )
+
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -ReviewBase Auto `
+            -Speed standard -CodexPath $fakeCodex -NewRun `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "completed"
+        $state = Read-ReviewLoopState -Path $result.StatePath
+        $state.ReviewBaseSetting | Should Be "Auto"
+        $state.ReviewBase | Should Be "parent"
+        $record = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { [string]$_.callKind -eq "review" })[0]
+        @($record.arguments | Select-Object -Last 3) |
+            Should Be @("review", "--base", "parent")
+    }
+
+    It "does not resume a checkpoint when an explicit override selects another base" {
+        Set-Content -LiteralPath (Join-Path $repo "second.txt") -Value "second"
+        & git -C $repo add second.txt
+        & git -C $repo commit -q -m "second"
+        $content = (Get-Content -Raw -LiteralPath $configPath).
+            Replace("CleanPassesRequired = 1", "CleanPassesRequired = 2").
+            Replace("MaxReviewCycles = 6", "MaxReviewCycles = 1")
+        Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
+        Write-FakeResultSequence -Path $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE -Results @(
+            "No findings.",
+            "No findings."
+        )
+
+        $first = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -ReviewBase 'HEAD^' `
+            -Speed standard -CodexPath $fakeCodex -NewRun `
+            -HeartbeatSeconds 0 -ColorMode Never
+        $second = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath -ReviewBase HEAD `
+            -Speed standard -CodexPath $fakeCodex `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $first.Status | Should Be "limit_reached"
+        $second.Status | Should Be "limit_reached"
+        $second.StatePath | Should Not Be $first.StatePath
+        (Read-ReviewLoopState -Path $first.StatePath).ReviewBaseSetting | Should Be "HEAD^"
+        (Read-ReviewLoopState -Path $second.StatePath).ReviewBaseSetting | Should Be "HEAD"
+    }
+
+    It "reports an actionable startup failure for an invalid CLI review base" {
+        $result = Invoke-CodexReviewLoop `
+            -RepoPath $repo -ConfigPath $configPath `
+            -ReviewBase refs/heads/does-not-exist `
+            -Speed standard -CodexPath $fakeCodex -NewRun `
+            -HeartbeatSeconds 0 -ColorMode Never
+
+        $result.Status | Should Be "failed"
+        $result.Reason | Should Match "selected by -ReviewBase does not resolve"
+        ($result.NextSteps -join "`n") | Should Match "choose another ReviewBase"
+        (Test-Path -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Be $false
     }
 
     It "resets the MaxReviewCycles counter after any script restart" {

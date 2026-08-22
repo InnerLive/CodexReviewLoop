@@ -5,6 +5,12 @@
 The loop reviews and improves the complete branch diff between a pinned
 `ReviewBase` commit and the current `HEAD`.
 
+`ReviewBase = 'Auto'` resolves only when a new durable run starts. It first
+uses branch-creation reflog evidence, then a unique nearest ancestor branch,
+and otherwise falls back to the normal `origin/HEAD`, main/master, `HEAD^`, or
+`HEAD` selection. A resumed run keeps the symbolic base and commit recorded in
+its checkpoint.
+
 ## The cycle
 
 ```mermaid

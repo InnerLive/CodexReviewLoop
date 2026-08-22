@@ -49,6 +49,89 @@ function Get-ReviewLoopLatestActiveStatePath {
     return [string]$runs[0].Path
 }
 
+function Get-ReviewLoopSafeBranchName {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Branch)
+
+    $safeBranch = [regex]::Replace($Branch, "[^A-Za-z0-9._-]+", "-").Trim("-", ".", "_")
+    if ([string]::IsNullOrWhiteSpace($safeBranch)) {
+        $safeBranch = "detached"
+    }
+    if ($safeBranch.Length -gt 40) {
+        $safeBranch = $safeBranch.Substring(0, 40).TrimEnd("-", ".", "_")
+    }
+    return $safeBranch
+}
+
+function Get-ReviewLoopRunProfilePrefix {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Branch
+    )
+
+    $repositoryKey = (Get-ReviewLoopSha256 (
+        ConvertTo-ReviewLoopCanonicalText (Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath)
+    )).Substring(0, 8)
+    return "$($Config.Name)-$repositoryKey-$(Get-ReviewLoopSafeBranchName -Branch $Branch)-"
+}
+
+function Get-ReviewLoopLatestBranchStatePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Branch,
+        [string]$ReviewBaseSetting = ""
+    )
+
+    $logRoot = Resolve-ReviewLoopPath -Path ([string]$Config.LogRoot)
+    if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
+        return ""
+    }
+    $prefix = Get-ReviewLoopRunProfilePrefix `
+        -Config $Config -RepoPath $RepoPath -Branch $Branch
+    $filterBySetting = $PSBoundParameters.ContainsKey("ReviewBaseSetting")
+    $runs = @(Get-ChildItem -LiteralPath $logRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name.StartsWith($prefix, [StringComparison]::Ordinal) } |
+        ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue
+        } | ForEach-Object {
+            $path = Join-Path $_.FullName "run-v1.json"
+            $profileRootName = Split-Path -Leaf (Split-Path -Parent $_.FullName)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                return
+            }
+            try {
+                $state = Read-ReviewLoopState -Path $path
+            }
+            catch {
+                return
+            }
+            $expectedBaseKey = (Get-ReviewLoopSha256 (
+                ConvertTo-ReviewLoopCanonicalText ([string]$state.ReviewBase)
+            )).Substring(0, 8)
+            if ($profileRootName -ne "$prefix$expectedBaseKey" -or
+                -not (Test-ReviewLoopSamePath -Left ([string]$state.RepoPath) -Right $RepoPath) -or
+                [string]$state.Branch -ne $Branch -or
+                -not (Test-ReviewLoopStateCanResume -State $state) -or
+                ($filterBySetting -and
+                    [string]$state.ReviewBaseSetting -ne $ReviewBaseSetting)) {
+                return
+            }
+            $createdAt = [DateTimeOffset]::MinValue
+            [DateTimeOffset]::TryParse(
+                [string]$state.CreatedAt,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None,
+                [ref]$createdAt) | Out-Null
+            [pscustomobject]@{ Path = $path; CreatedAt = $createdAt }
+        } | Sort-Object CreatedAt, Path -Descending)
+    if ($runs.Count -eq 0) {
+        return ""
+    }
+    return [string]$runs[0].Path
+}
+
 function New-ReviewLoopRunPaths {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -69,26 +152,18 @@ function New-ReviewLoopRunPaths {
             "rev-parse", "--verify", "$($Config.ReviewBase)^{commit}"
         )
     }
-    $safeBranch = [regex]::Replace($Branch, "[^A-Za-z0-9._-]+", "-").Trim("-", ".", "_")
-    if ([string]::IsNullOrWhiteSpace($safeBranch)) {
-        $safeBranch = "detached"
-    }
-    if ($safeBranch.Length -gt 40) {
-        $safeBranch = $safeBranch.Substring(0, 40).TrimEnd("-", ".", "_")
-    }
-    $repositoryKey = (Get-ReviewLoopSha256 (
-        ConvertTo-ReviewLoopCanonicalText $canonicalRepo
-    )).Substring(0, 8)
+    $profilePrefix = Get-ReviewLoopRunProfilePrefix `
+        -Config $Config -RepoPath $canonicalRepo -Branch $Branch
     $baseKey = (Get-ReviewLoopSha256 (
         ConvertTo-ReviewLoopCanonicalText ([string]$Config.ReviewBase)
     )).Substring(0, 8)
-    $profileRoot = Join-Path $logRoot "$($Config.Name)-$repositoryKey-$safeBranch-$baseKey"
+    $profileRoot = Join-Path $logRoot "$profilePrefix$baseKey"
     [System.IO.Directory]::CreateDirectory($profileRoot) | Out-Null
     $legacyRoots = @(
         Get-ChildItem -LiteralPath $logRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.FullName -ne $profileRoot -and
-                $_.Name.StartsWith("$($Config.Name)-$repositoryKey-$safeBranch-")
+                $_.Name.StartsWith($profilePrefix, [StringComparison]::Ordinal)
             } |
             Sort-Object LastWriteTime -Descending |
             ForEach-Object { $_.FullName }
@@ -394,10 +469,11 @@ function Clear-ReviewLoopReviewerRecoveryLocator {
 }
 
 function Get-ReviewLoopReviewerRecoveryStatePath {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$LogRoot,
-        [Parameter(Mandatory = $true)][string]$ReviewBase
+        [string]$ReviewBaseSetting = ""
     )
 
     $locatorPath = Get-ReviewLoopReviewerRecoveryLocatorPath -RepoPath $RepoPath
@@ -439,7 +515,8 @@ function Get-ReviewLoopReviewerRecoveryStatePath {
     $state = Read-ReviewLoopState -Path $resolvedStatePath
     $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
     if (-not (Test-ReviewLoopSamePath -Left ([string]$state.RepoPath) -Right $RepoPath) -or
-        [string]$state.ReviewBase -ne $ReviewBase) {
+        ($PSBoundParameters.ContainsKey("ReviewBaseSetting") -and
+            [string]$state.ReviewBaseSetting -ne $ReviewBaseSetting)) {
         throw "Reviewer recovery checkpoint does not match this repository invocation."
     }
     if ($null -eq $active -or [string]$active.Role -ne "Reviewer" -or
@@ -3839,6 +3916,7 @@ function Invoke-ReviewLoopCore {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$ConfigPath = "",
+        [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",
@@ -3850,6 +3928,7 @@ function Invoke-ReviewLoopCore {
     )
 
     $speedExplicitlyBound = $PSBoundParameters.ContainsKey("Speed")
+    $reviewBaseOverrideBound = $PSBoundParameters.ContainsKey("ReviewBase")
     $previousSpeed = ""
     Initialize-ReviewLoopConsole `
         -OutputMode $OutputMode `
@@ -3882,55 +3961,114 @@ function Invoke-ReviewLoopCore {
                 "Run the same command again, or select another profile with -ConfigPath."
             ))
     }
-    try {
-        $resolvedReviewBase = Get-ReviewLoopGitValue `
-            -RepoPath $repo -Arguments @("rev-parse", "--verify", "$($config.ReviewBase)^{commit}")
-    }
-    catch {
+    $branch = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
+        "branch", "--show-current"
+    )
+    $statePath = ""
+    $state = $null
+    $resumed = $false
+    $resumedFromFailure = $false
+    $resumedWithFreshReviewBudget = $false
+    if ($reviewBaseOverrideBound -and
+        ([string]::IsNullOrWhiteSpace($ReviewBase) -or $ReviewBase -match "[`r`n]")) {
         throw (New-ReviewLoopFailureException `
-            -Message "ReviewBase '$($config.ReviewBase)' from profile '$resolvedConfigPath' does not resolve to a commit: $($_.Exception.Message)" `
+            -Message "-ReviewBase must be one non-empty line." `
             -NextSteps @(
-                "Fetch or create the configured review-base ref, or correct ReviewBase in the profile."
-                "Confirm git rev-parse --verify `"$($config.ReviewBase)^{commit}`" succeeds in the repository, then run the same command again."
+                "Pass a Git revision such as origin/main or use -ReviewBase Auto."
+                "Run the same command again."
             ))
     }
-    $fingerprintArguments = @{ ConfigPath = $resolvedConfigPath }
+    $reviewBaseSetting = if ($reviewBaseOverrideBound) {
+        $ReviewBase
+    }
+    else {
+        [string]$config.ReviewBase
+    }
+    if ($reviewBaseSetting.Equals("Auto", [StringComparison]::OrdinalIgnoreCase)) {
+        $reviewBaseSetting = "Auto"
+    }
+
+    if (-not $NewRun) {
+        $recoveryArguments = @{
+            RepoPath = $repo
+            LogRoot = [string]$config.LogRoot
+        }
+        if ($reviewBaseOverrideBound) {
+            $recoveryArguments.ReviewBaseSetting = $reviewBaseSetting
+        }
+        $active = Get-ReviewLoopReviewerRecoveryStatePath @recoveryArguments
+        if ([string]::IsNullOrWhiteSpace($active)) {
+            $activeArguments = @{
+                Config = $config
+                RepoPath = $repo
+                Branch = $branch
+            }
+            if ($reviewBaseOverrideBound) {
+                $activeArguments.ReviewBaseSetting = $reviewBaseSetting
+            }
+            $active = Get-ReviewLoopLatestBranchStatePath @activeArguments
+        }
+        if (-not [string]::IsNullOrWhiteSpace($active)) {
+            $statePath = $active
+            $state = Read-ReviewLoopState -Path $statePath
+            $reviewBaseSetting = [string]$state.ReviewBaseSetting
+            $resumed = $true
+        }
+    }
+
+    $effectiveReviewBase = if ($null -ne $state) {
+        [string]$state.ReviewBase
+    }
+    elseif ($reviewBaseSetting -eq "Auto") {
+        Resolve-ReviewLoopAutomaticReviewBase -RepoPath $repo
+    }
+    else {
+        $reviewBaseSetting
+    }
+    $config.ReviewBase = $effectiveReviewBase
+    try {
+        $currentResolvedReviewBase = Get-ReviewLoopGitValue `
+            -RepoPath $repo -Arguments @("rev-parse", "--verify", "$effectiveReviewBase^{commit}")
+    }
+    catch {
+        $source = if ($null -ne $state) {
+            "the resumable checkpoint"
+        }
+        elseif ($reviewBaseOverrideBound) {
+            "-ReviewBase"
+        }
+        else {
+            "profile '$resolvedConfigPath'"
+        }
+        throw (New-ReviewLoopFailureException `
+            -Message "ReviewBase '$effectiveReviewBase' selected by $source does not resolve to a commit: $($_.Exception.Message)" `
+            -NextSteps @(
+                "Fetch or create the selected review-base ref, or choose another ReviewBase."
+                "Confirm git rev-parse --verify `"$effectiveReviewBase^{commit}`" succeeds in the repository, then run the same command again."
+            ))
+    }
+    $resolvedReviewBase = if ($null -ne $state -and
+        -not [string]::IsNullOrWhiteSpace([string]$state.ReviewBaseCommit)) {
+        [string]$state.ReviewBaseCommit
+    }
+    else {
+        $currentResolvedReviewBase
+    }
+    $fingerprintArguments = @{
+        ConfigPath = $resolvedConfigPath
+        ReviewBase = $reviewBaseSetting
+    }
     if ($reviewerInstructionsOverrideBound) {
         $fingerprintArguments.ReviewerInstructions = [string]$config.ReviewerInstructions
     }
     $executionFingerprint = Get-ReviewLoopExecutionFingerprint @fingerprintArguments
     $config["__ConfigPath"] = $resolvedConfigPath
     $config["__ExecutionFingerprint"] = $executionFingerprint
-    $branch = Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
-        "branch", "--show-current"
-    )
+    $config["__ReviewBaseSetting"] = $reviewBaseSetting
     $paths = New-ReviewLoopRunPaths -Config $config -RepoPath $repo `
         -Branch $branch -ReviewBaseCommit $resolvedReviewBase
-    $statePath = ""
-    $state = $null
-    $resumed = $false
-    $resumedFromFailure = $false
-    $resumedWithFreshReviewBudget = $false
-    if (-not $NewRun) {
-        $active = Get-ReviewLoopReviewerRecoveryStatePath `
-            -RepoPath $repo `
-            -LogRoot ([string]$config.LogRoot) `
-            -ReviewBase ([string]$config.ReviewBase)
-        if ([string]::IsNullOrWhiteSpace($active)) {
-            $active = Get-ReviewLoopLatestActiveStatePath `
-                -ProfileRoot $paths.StableProfileRoot
-        }
-        if (-not [string]::IsNullOrWhiteSpace($active)) {
-            $statePath = $active
-            $state = Read-ReviewLoopState -Path $statePath
-            $paths = New-ReviewLoopRunPaths `
-                -Config $config `
-                -RepoPath $repo `
-                -Branch ([string]$state.Branch) `
-                -ReviewBaseCommit $resolvedReviewBase
-            $paths.RunRoot = Split-Path -Parent $statePath
-            $resumed = $true
-        }
+    if ($null -ne $state) {
+        $paths.RunRoot = Split-Path -Parent $statePath
     }
 
     if ($null -eq $state) {
@@ -3947,6 +4085,7 @@ function Invoke-ReviewLoopCore {
         $state = New-ReviewLoopState `
             -RepoPath $repo `
             -ReviewBase ([string]$config.ReviewBase) `
+            -ReviewBaseSetting $reviewBaseSetting `
             -ReviewBaseCommit $resolvedReviewBase `
             -ExecutionFingerprint $executionFingerprint `
             -Speed $Speed `
@@ -4145,7 +4284,7 @@ function Invoke-ReviewLoopCore {
     }
     else {
         Write-ReviewLoopStatus `
-            -Message "$($config.Name) · $($state.Branch) · $runMode · $Speed · HEAD $shortHead" `
+            -Message "$($config.Name) · $($state.Branch) · $runMode · $Speed · base $($state.ReviewBase) · HEAD $shortHead" `
             -Kind Progress
     }
     if (-not [string]::IsNullOrWhiteSpace($previousSpeed)) {
@@ -4511,6 +4650,7 @@ function Invoke-CodexReviewLoop {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$ConfigPath = "",
+        [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",

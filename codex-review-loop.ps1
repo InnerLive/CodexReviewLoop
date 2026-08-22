@@ -26,6 +26,12 @@ Optional path to a PSD1 profile. If the explicitly requested path does not
 exist, a commented profile bound to the canonical RepositoryPath is created
 there automatically.
 
+.PARAMETER ReviewBase
+Optional Git revision against which the branch is reviewed. It overrides the
+profile for this invocation. Auto conservatively detects an evidenced parent
+branch and otherwise uses the normal main/master fallback. When omitted while
+resuming, the checkpoint keeps its recorded review base.
+
 .PARAMETER ReviewerInstructions
 Optional supplemental developer instructions for the native Reviewer. An
 explicit command-line value wins over the profile, including an empty string
@@ -87,6 +93,17 @@ Uses an explicit profile and enables fast mode for every role.
 
 .EXAMPLE
 C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
+    -ReviewBase origin/feature-parent
+
+Overrides the profile review base for this run.
+
+.EXAMPLE
+C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project -ReviewBase Auto
+
+Uses conservative parent-branch detection for this run.
+
+.EXAMPLE
+C:\dev\CodexReviewLoop\codex-review-loop.ps1 C:\dev\Project `
     -OutputMode balanced `
     -HeartbeatSeconds 15 `
     -ColorMode Host
@@ -118,6 +135,8 @@ param(
     [string]$RepoPath = "",
 
     [string]$ConfigPath = "",
+
+    [string]$ReviewBase = "",
 
     [AllowEmptyString()]
     [string]$ReviewerInstructions = "",
@@ -194,6 +213,9 @@ if ($PSBoundParameters.ContainsKey("Speed")) {
 }
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $arguments.ConfigPath = $ConfigPath
+}
+if ($PSBoundParameters.ContainsKey("ReviewBase")) {
+    $arguments.ReviewBase = $ReviewBase
 }
 if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
     $arguments.ReviewerInstructions = $ReviewerInstructions

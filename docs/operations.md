@@ -24,6 +24,7 @@ pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
 |---|---|---|
 | `-RepoPath` | Required | Repository to review and fix; may be positional |
 | `-ConfigPath` | Auto-discovered | Select or create a specific profile |
+| `-ReviewBase` | Profile or checkpoint value | Override with a Git revision or use conservative `Auto` detection |
 | `-ReviewerInstructions` | Profile value or empty | Override supplemental native Reviewer developer instructions; an explicit empty string disables the profile value |
 | `-Speed` | `standard` (default), `fast` | Global Codex service tier |
 | `-CodexPath` | Auto-detected | Use a specific Codex CLI executable |
@@ -85,11 +86,15 @@ should never be placed in model-visible command output.
 ## Resume and `-NewRun`
 
 Running the same command resumes the latest compatible checkpoint by default.
-Resume requires the same repository, branch, symbolic review base, and `HEAD`.
-The base commit recorded at run start remains pinned and must still exist. The
-recorded speed is inherited unless an explicit `-Speed standard|fast` selects a
-new speed for subsequent calls in the same checkpoint. If the invocation used
-`-ReviewerInstructions`, pass the same value again
+Resume requires the same repository, branch, recorded symbolic review base,
+and `HEAD`. When `-ReviewBase` is omitted, the newest resumable checkpoint for
+that repository, profile, and branch supplies its saved base even if the
+profile currently contains another value. An explicit `-ReviewBase` resumes
+only a checkpoint with that same setting; `-NewRun` always resolves a fresh
+base. The base commit recorded at run start remains pinned and must still
+exist. The recorded speed is inherited unless an explicit `-Speed
+standard|fast` selects a new speed for subsequent calls in the same checkpoint.
+If the invocation used `-ReviewerInstructions`, pass the same value again
 when resuming. Changing or omitting it requalifies existing review and
 clean-pass evidence before the loop can complete.
 

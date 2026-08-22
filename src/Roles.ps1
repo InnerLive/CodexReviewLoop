@@ -74,6 +74,9 @@ function Assert-ReviewLoopExecutionUnchanged {
     if ($Config.ContainsKey("__ExecutionFingerprint") -and
         $Config.ContainsKey("__ConfigPath")) {
         $fingerprintArguments = @{ ConfigPath = [string]$Config.__ConfigPath }
+        if ($Config.ContainsKey("__ReviewBaseSetting")) {
+            $fingerprintArguments.ReviewBase = [string]$Config.__ReviewBaseSetting
+        }
         if ($Config.ContainsKey("__ReviewerInstructionsOverrideBound") -and
             [bool]$Config.__ReviewerInstructionsOverrideBound) {
             $fingerprintArguments.ReviewerInstructions = [string]$Config.ReviewerInstructions

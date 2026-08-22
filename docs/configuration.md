@@ -27,7 +27,7 @@ a `RepositoryPath` cannot be used for another repository.
 |---|---:|---|
 | `Name` | Repository name | Profile and run-directory name |
 | `RepositoryPath` | Canonical Git root | Prevents profile collisions |
-| `ReviewBase` | Detected Git revision | Revision reviewed against |
+| `ReviewBase` | `Auto` | Revision or conservative automatic parent-branch selection |
 | `ReviewerInstructions` | Empty string | Optional supplemental native Reviewer developer instructions |
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
@@ -105,9 +105,10 @@ These settings are excluded from the execution fingerprint because changing
 them does not invalidate review, test, or verification evidence.
 
 Other settings remain fixed for an active invocation. In particular, changing
-`Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes run identity. The
-loop preserves its checkpoint and requires the same command to be run again so
-that the change is applied with the normal resume checks.
+`Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes new-run identity.
+An existing checkpoint retains its recorded review-base setting and resolved
+revision when `-ReviewBase` is omitted; use `-NewRun` to apply a changed profile
+base immediately.
 
 `ReviewerInstructions` is also fixed for the invocation and participates in
 the execution fingerprint. `-ReviewerInstructions <text>` overrides the profile
@@ -214,9 +215,34 @@ do not run. Required unattended checks belong in `HostGates`.
 
 ## Review base
 
-The generated profile tries `origin/HEAD`, common `main` or `master` references,
-then `HEAD^` and `HEAD`. The selected symbolic revision is resolved to a commit
-when the run starts and remains pinned for that run.
+New profiles use `ReviewBase = 'Auto'`. Auto first accepts a still-resolvable
+parent branch recorded by the current branch's creation reflog. Without that
+evidence, it accepts a unique nearest branch tip on the current `HEAD` ancestry;
+a local branch and its configured remote-tracking branch count as one branch.
+The graph candidate must belong to the normal integration history. Deleted,
+divergent, or equally near candidates are not guessed.
+
+When Auto cannot choose conservatively, it uses the previous default order:
+`origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`, `HEAD^`, then
+`HEAD`. Missing reflogs are normal, for example in a fresh clone, and do not
+cause a failure. The selected symbolic revision is resolved to a commit when a
+new run starts and remains pinned in that run's checkpoint.
+
+Set a concrete Git revision to disable automatic detection:
+
+```powershell
+ReviewBase = 'origin/feature-parent'
+```
+
+The command line can override either form without editing the profile:
+
+```powershell
+.\codex-review-loop.ps1 C:\dev\Project -ReviewBase origin/feature-parent
+.\codex-review-loop.ps1 C:\dev\Project -ReviewBase Auto
+```
+
+`Auto` is case-insensitive and reserved. A branch literally named `Auto` can
+still be selected as `refs/heads/Auto`.
 
 Change `ReviewBase` when the branch should be compared with a different
 integration point.

@@ -376,7 +376,7 @@ function Get-ReviewLoopNextProfilePath {
     return $path
 }
 
-function Get-ReviewLoopDefaultReviewBase {
+function Get-ReviewLoopFallbackReviewBase {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     $originHead = (& git -C $RepoPath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null | Out-String).Trim()
@@ -394,6 +394,247 @@ function Get-ReviewLoopDefaultReviewBase {
     return "HEAD"
 }
 
+function Get-ReviewLoopOptionalGitLines {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $output = @(& git -C $RepoPath @Arguments 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return @()
+    }
+    return @($output | ForEach-Object { [string]$_ })
+}
+
+function Resolve-ReviewLoopBranchReference {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Reference
+    )
+
+    $candidates = if ($Reference.StartsWith("refs/heads/") -or
+        $Reference.StartsWith("refs/remotes/")) {
+        @($Reference)
+    }
+    else {
+        @("refs/heads/$Reference", "refs/remotes/$Reference")
+    }
+    foreach ($candidate in $candidates) {
+        & git -C $RepoPath show-ref --verify --quiet $candidate 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            return [pscustomobject]@{
+                FullName = $candidate
+                ShortName = $candidate -replace '^refs/heads/', '' -replace '^refs/remotes/', ''
+            }
+        }
+    }
+    return $null
+}
+
+function Get-ReviewLoopReflogReviewBase {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Branch
+    )
+
+    $entries = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+        "reflog", "show", "--date=unix", "--format=%H%x09%gd%x09%gs", "refs/heads/$Branch"
+    ) | ForEach-Object {
+        $parts = $_ -split "`t", 3
+        if ($parts.Count -eq 3) {
+            [pscustomobject]@{ Commit = $parts[0]; Selector = $parts[1]; Subject = $parts[2] }
+        }
+    })
+    $creation = @($entries | Where-Object {
+        [string]$_.Subject -match '^branch: Created from (.+)$'
+    })
+    if ($creation.Count -ne 1) {
+        return ""
+    }
+
+    $source = ([regex]::Match([string]$creation[0].Subject,
+        '^branch: Created from (.+)$')).Groups[1].Value
+    if ($source -eq "HEAD") {
+        $selectorMatch = [regex]::Match(
+            [string]$creation[0].Selector, '@\{(\d+)(?: [+-]\d{4})?\}$')
+        if (-not $selectorMatch.Success) {
+            return ""
+        }
+        $createdAt = $selectorMatch.Groups[1].Value
+        $escapedBranch = [regex]::Escape($Branch)
+        $sources = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+            "reflog", "show", "--date=unix", "--format=%H%x09%gd%x09%gs", "HEAD"
+        ) | ForEach-Object {
+            $parts = $_ -split "`t", 3
+            if ($parts.Count -ne 3 -or $parts[0] -ne [string]$creation[0].Commit -or
+                $parts[1] -notmatch "@\{${createdAt}(?: [+-]\d{4})?\}$" -or
+                $parts[2] -notmatch "^checkout: moving from (.+) to $escapedBranch$") {
+                return
+            }
+            ([regex]::Match($parts[2],
+                "^checkout: moving from (.+) to $escapedBranch$")).Groups[1].Value
+        } | Sort-Object -Unique)
+        if ($sources.Count -ne 1) {
+            return ""
+        }
+        $source = $sources[0]
+    }
+
+    $resolved = Resolve-ReviewLoopBranchReference -RepoPath $RepoPath -Reference $source
+    if ($null -eq $resolved -or [string]$resolved.ShortName -eq $Branch) {
+        return ""
+    }
+    return [string]$resolved.ShortName
+}
+
+function Get-ReviewLoopGraphReviewBase {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [Parameter(Mandatory = $true)][string]$Fallback
+    )
+
+    $fallbackCommit = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+        "rev-parse", "--verify", "$Fallback^{commit}"
+    ))
+    if ($fallbackCommit.Count -ne 1) {
+        return ""
+    }
+
+    $locals = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+        "for-each-ref", "--format=%(refname)%09%(refname:short)%09%(objectname)%09%(upstream)",
+        "refs/heads"
+    ) | ForEach-Object {
+        $parts = $_ -split "`t", 4
+        if ($parts.Count -ge 3) {
+            [pscustomobject]@{
+                FullName = $parts[0]
+                ShortName = $parts[1]
+                Commit = $parts[2]
+                Upstream = if ($parts.Count -eq 4) { $parts[3] } else { "" }
+            }
+        }
+    })
+    $current = @($locals | Where-Object { [string]$_.ShortName -eq $Branch } |
+        Select-Object -First 1)
+    if ($current.Count -ne 1) {
+        return ""
+    }
+
+    $trackedRemotes = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($local in $locals) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$local.Upstream)) {
+            [void]$trackedRemotes.Add([string]$local.Upstream)
+        }
+    }
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    foreach ($local in $locals) {
+        if ([string]$local.ShortName -ne $Branch) {
+            [void]$candidates.Add($local)
+        }
+    }
+    foreach ($remote in @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+        "for-each-ref", "--format=%(refname)%09%(refname:short)%09%(objectname)",
+        "refs/remotes"
+    ) | ForEach-Object {
+        $parts = $_ -split "`t", 3
+        if ($parts.Count -eq 3) {
+            [pscustomobject]@{
+                FullName = $parts[0]
+                ShortName = $parts[1]
+                Commit = $parts[2]
+                Upstream = ""
+            }
+        }
+    })) {
+        if ([string]$remote.FullName -match '^refs/remotes/[^/]+/HEAD$' -or
+            $trackedRemotes.Contains([string]$remote.FullName) -or
+            [string]$remote.FullName -eq [string]$current[0].Upstream) {
+            continue
+        }
+        [void]$candidates.Add($remote)
+    }
+
+    $eligible = foreach ($candidate in $candidates) {
+        & git -C $RepoPath merge-base --is-ancestor $candidate.FullName HEAD 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            continue
+        }
+        & git -C $RepoPath merge-base --is-ancestor $fallbackCommit[0] $candidate.FullName 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            continue
+        }
+        $distance = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+            "rev-list", "--count", "$($candidate.FullName)..HEAD"
+        ))
+        if ($distance.Count -eq 1 -and $distance[0] -match '^\d+$') {
+            [pscustomobject]@{
+                FullName = [string]$candidate.FullName
+                ShortName = [string]$candidate.ShortName
+                Commit = [string]$candidate.Commit
+                Distance = [int]$distance[0]
+            }
+        }
+    }
+    if (@($eligible).Count -eq 0) {
+        return ""
+    }
+    $minimum = [int](($eligible | Measure-Object Distance -Minimum).Minimum)
+    $nearest = @($eligible | Where-Object { [int]$_.Distance -eq $minimum })
+    if ($nearest.Count -ne 1) {
+        return ""
+    }
+    if ([string]$nearest[0].Commit -eq [string]$fallbackCommit[0]) {
+        return $Fallback
+    }
+    return [string]$nearest[0].ShortName
+}
+
+function Resolve-ReviewLoopAutomaticReviewBase {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $fallback = Get-ReviewLoopFallbackReviewBase -RepoPath $RepoPath
+    $branch = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+        "branch", "--show-current"
+    ))
+    if ($branch.Count -ne 1 -or [string]::IsNullOrWhiteSpace($branch[0])) {
+        return $fallback
+    }
+    $fallbackReference = Resolve-ReviewLoopBranchReference `
+        -RepoPath $RepoPath -Reference $fallback
+    if ($null -ne $fallbackReference) {
+        $fallbackFullName = [string]$fallbackReference.FullName
+        $symbolicTarget = @(Get-ReviewLoopOptionalGitLines `
+            -RepoPath $RepoPath -Arguments @(
+                "symbolic-ref", "--quiet", $fallbackFullName
+            ))
+        if ($symbolicTarget.Count -eq 1) {
+            $fallbackFullName = [string]$symbolicTarget[0]
+        }
+        $upstream = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
+            "for-each-ref", "--format=%(upstream)", "refs/heads/$($branch[0])"
+        ))
+        if ($fallbackFullName -eq "refs/heads/$($branch[0])" -or
+            ($upstream.Count -eq 1 -and [string]$upstream[0] -eq $fallbackFullName) -or
+            ($fallbackFullName -match '^refs/remotes/[^/]+/(.+)$' -and
+                $Matches[1] -eq [string]$branch[0])) {
+            return $fallback
+        }
+    }
+    $reflog = Get-ReviewLoopReflogReviewBase -RepoPath $RepoPath -Branch $branch[0]
+    if (-not [string]::IsNullOrWhiteSpace($reflog)) {
+        return $reflog
+    }
+    $graph = Get-ReviewLoopGraphReviewBase `
+        -RepoPath $RepoPath -Branch $branch[0] -Fallback $fallback
+    if (-not [string]::IsNullOrWhiteSpace($graph)) {
+        return $graph
+    }
+    return $fallback
+}
+
 function New-ReviewLoopProfile {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -403,7 +644,7 @@ function New-ReviewLoopProfile {
     $repo = Get-ReviewLoopRepositoryRoot -RepoPath $RepoPath
     $absolute = Resolve-ReviewLoopPath -Path $Path
     $name = Split-Path -Leaf $repo
-    $reviewBase = Get-ReviewLoopDefaultReviewBase -RepoPath $repo
+    $reviewBase = "Auto"
     $logRoot = ".\runs"
     $solution = @(Get-ChildItem -LiteralPath $repo -File | Where-Object {
         $_.Extension -in @(".sln", ".slnx")
@@ -436,7 +677,8 @@ function New-ReviewLoopProfile {
     # Canonical Git root bound to this profile. It prevents collisions between equally named repositories.
     RepositoryPath = $(ConvertTo-ReviewLoopPowerShellLiteral $repo)
 
-    # Git revision against which Codex reviews the branch, for example origin/main, origin/master, or main.
+    # Git revision against which Codex reviews the branch. Auto conservatively
+    # detects an evidenced parent branch and otherwise uses the normal main/master fallback.
     ReviewBase = $(ConvertTo-ReviewLoopPowerShellLiteral $reviewBase)
 
     # Optional supplemental developer instructions for the native Reviewer.
@@ -828,6 +1070,7 @@ function Get-ReviewLoopExecutionProfileText {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = ""
     )
 
@@ -847,6 +1090,9 @@ function Get-ReviewLoopExecutionProfileText {
         if ([string]$key -notin $script:ReviewLoopLiveConfigKeys) {
             $executionSettings[$key] = $profile[$key]
         }
+    }
+    if ($PSBoundParameters.ContainsKey("ReviewBase")) {
+        $executionSettings["ReviewBase"] = $ReviewBase
     }
     $executionSettings["ReviewerInstructions"] = $effectiveReviewerInstructions
     return ConvertTo-ReviewLoopFingerprintData -Value $executionSettings
@@ -1061,6 +1307,7 @@ function Get-ReviewLoopExecutionFingerprint {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = ""
     )
 
@@ -1089,6 +1336,9 @@ function Get-ReviewLoopExecutionFingerprint {
         $script:ModuleRoot,
         $profilePath).Replace("\", "/")
     $profileTextArguments = @{ ConfigPath = $profilePath }
+    if ($PSBoundParameters.ContainsKey("ReviewBase")) {
+        $profileTextArguments.ReviewBase = $ReviewBase
+    }
     if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
         $profileTextArguments.ReviewerInstructions = $ReviewerInstructions
     }
