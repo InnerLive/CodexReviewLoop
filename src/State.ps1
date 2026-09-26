@@ -17,6 +17,23 @@ function Get-ReviewLoopSessionRoleNames {
     )
 }
 
+function Get-ReviewLoopCompletedReviewCount {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    return @($State.RoleCalls | Where-Object {
+        $_.Role -eq "Reviewer" -and $_.Success -and $_.CallId -match '^review-[0-9]+$'
+    } | Select-Object -ExpandProperty CallId -Unique).Count
+}
+
+function Get-ReviewLoopLatestCritique {
+    param([AllowNull()][object]$State)
+
+    if ($null -eq $State) { return $null }
+    return $State.RoleCalls | Where-Object {
+        $_.Role -eq "Critic" -and $_.Success
+    } | Select-Object -Last 1
+}
+
 function New-ReviewLoopRoleSessions {
     $sessions = [ordered]@{}
     foreach ($role in @(Get-ReviewLoopSessionRoleNames)) {
@@ -444,6 +461,7 @@ function New-ReviewLoopState {
         }
         RoleSessions = New-ReviewLoopRoleSessions
         ActiveRoleCall = $null
+        ActiveCriticCall = $null
         ActiveStrategy = $null
         LastFixerResult = $null
         PartialFixRecovery = $null
@@ -480,7 +498,7 @@ function Read-ReviewLoopState {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $state = Read-ReviewLoopJson -Path $Path
-    foreach ($name in @("ActiveRoleCall", "PartialFixRecovery", "ActiveHostGateRecovery")) {
+    foreach ($name in @("ActiveRoleCall", "ActiveCriticCall", "PartialFixRecovery", "ActiveHostGateRecovery")) {
         if ($state.PSObject.Properties.Name -notcontains $name) {
             $state | Add-Member -NotePropertyName $name -NotePropertyValue $null
         }
@@ -574,6 +592,8 @@ function Add-ReviewLoopRoleCall {
         FinishedAt = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "FinishedAt" -Default "")
         ExecutionFingerprint = [string](Get-ReviewLoopObjectProperty `
             -Object $Call -Name "ExecutionFingerprint" -Default "")
+        CriticId = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "CriticId" -Default "")
+        CoveredReviewCount = [int](Get-ReviewLoopObjectProperty -Object $Call -Name "CoveredReviewCount" -Default 0)
         RepositoryHead = [string](Get-ReviewLoopObjectProperty `
             -Object $Call -Name "RepositoryHead" -Default "")
         WorktreeFingerprint = [string](Get-ReviewLoopObjectProperty `

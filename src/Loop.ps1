@@ -3760,6 +3760,76 @@ function Get-ReviewLoopRetrospectiveEvidence {
     }
 }
 
+function Invoke-ReviewLoopCriticGate {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Ledger,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$Speed,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [string]$CodexPath = ""
+    )
+
+    Update-ReviewLoopLiveConfig -Config $Config
+    $completedCount = Get-ReviewLoopCompletedReviewCount -State $State
+    $previous = Get-ReviewLoopLatestCritique -State $State
+    $covered = [int](Get-ReviewLoopObjectProperty -Object $previous -Name "CoveredReviewCount" -Default 0)
+    $pending = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveCriticCall"
+    $interval = if ($Config.ContainsKey("CriticInterval")) { [int]$Config.CriticInterval } else { 10 }
+    if ($null -eq $pending -and ($interval -eq 0 -or $completedCount - $covered -lt $interval)) {
+        return
+    }
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    $finished = Get-ReviewLoopLessonsLearnedFinalCompletion -State $State
+    if ($null -eq $pending -and ($finished.CompletionAllowed -or (
+        [int]$State.CleanPasses -ge [int]$Config.CleanPassesRequired -and
+        [string]$State.CleanHead -eq [string]$snapshot.Head -and
+        (Test-ReviewLoopGitClean -RepoPath $RepoPath)))) {
+        return
+    }
+    Assert-ReviewLoopResumeInvariant -State $State -RepoPath $RepoPath -ReviewBase ([string]$Config.ReviewBase)
+    $unfinished = -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)
+    if ($unfinished) {
+        $active = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+        $recorded = Get-ReviewLoopObjectProperty -Object $State -Name "LastFixerResult"
+        $owned = @($State.ActiveFindingIds).Count -gt 0 -and (
+            ($null -ne $active -and $active.RepositoryHead -eq $snapshot.Head -and (
+                $active.Role -eq "Fixer" -or $active.WorktreeFingerprint -eq $snapshot.Fingerprint)) -or
+            ($null -ne $recorded -and
+                (Get-ReviewLoopObjectProperty -Object $recorded -Name "WorktreeHead") -eq $snapshot.Head -and
+                (Get-ReviewLoopObjectProperty -Object $recorded -Name "WorktreeFingerprint") -eq $snapshot.Fingerprint))
+        if (-not $owned) {
+            throw "Critic cannot inspect uncommitted changes outside a resumable Fixer checkpoint."
+        }
+    }
+    $callId = if ($null -ne $pending) { [string]$pending.CallId } else { "critic-{0:d4}" -f $completedCount }
+    $context = Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath
+    $context | Add-Member -NotePropertyName UnfinishedFixerWork -NotePropertyValue $unfinished
+    $context | Add-Member -NotePropertyName Stage -NotePropertyValue ([string]$State.Stage)
+    $retrospective = Get-ReviewLoopRetrospectiveEvidence `
+        -State $State -Ledger $Ledger -RepoPath $RepoPath -CurrentHead $snapshot.Head
+    $prompt = Get-ReviewLoopPrompt -Name "critic.md" -Values @{
+        CONTEXT = ConvertTo-ReviewLoopJsonCompact $context
+        REVIEWER_INSTRUCTIONS = [string]$Config.ReviewerInstructions
+        RETROSPECTIVE = ConvertTo-ReviewLoopJsonCompact $retrospective
+        COMMITS = Get-ReviewLoopLessonsLearnedCommitText -State $State -RepoPath $RepoPath
+        ROLE_CALLS = ConvertTo-ReviewLoopJsonCompact @($State.RoleCalls | Select-Object `
+            CallId, Role, Success, StartedAt, FinishedAt, Usage, ResultPath, CriticId)
+        CRITIQUES = ConvertTo-ReviewLoopJsonCompact @($State.RoleCalls | Where-Object {
+            $_.Role -eq "Critic" -and $_.Success
+        } | Select-Object CallId, CoveredReviewCount, StructuredResult)
+    }
+    Write-ReviewLoopStatus -Message "Critic due after $completedCount completed native reviews (previously covered: $covered)." -Kind Review
+    $call = Invoke-ReviewLoopRoleCall -Config $Config -Role "Critic" -RepoPath $RepoPath `
+        -Speed $Speed -Prompt $prompt -LogRoot $RunRoot -SchemaName "critic-v1.schema.json" `
+        -CodexPath $CodexPath -CallId $callId -State $State -StatePath $StatePath
+    Assert-ReviewLoopRoleSuccess $call
+    Write-ReviewLoopStatus -Message "Critic to Reviewer: $($call.StructuredResult.reviewerFeedback)" -Kind Review
+    Write-ReviewLoopStatus -Message "Critic to Architect: $($call.StructuredResult.architectFeedback)" -Kind Review
+}
+
 function Invoke-ReviewLoopLessonsLearnedGate {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -4321,6 +4391,10 @@ function Invoke-ReviewLoopCore {
         Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
             "rev-parse", "--verify", "$($state.ReviewBaseCommit)^{commit}"
         ) | Out-Null
+        if ($resumed) {
+            Invoke-ReviewLoopCriticGate -Config $config -State $state -StatePath $statePath `
+                -Ledger $ledger -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+        }
         $resumedCluster = Resume-ReviewLoopInterruptedFix `
             -Config $config -State $state -StatePath $statePath `
             -Ledger $ledger -LedgerPath $paths.LedgerPath `
@@ -4431,6 +4505,9 @@ function Invoke-ReviewLoopCore {
                         "If the changes are intentional, commit or otherwise preserve them, make the worktree clean, and start with -NewRun."
                     ))
             }
+
+            Invoke-ReviewLoopCriticGate -Config $config -State $state -StatePath $statePath `
+                -Ledger $ledger -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
 
             if ([string]$state.Stage -ne "reviewing") {
                 $state.ReviewCycle = [int]$state.ReviewCycle + 1

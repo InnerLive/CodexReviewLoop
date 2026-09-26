@@ -698,6 +698,10 @@ function New-ReviewLoopProfile {
     # resumes the checkpoint with a fresh cycle counter.
     MaxReviewCycles = 12
 
+    # Independent feedback after this many completed native reviews across the
+    # durable run. Zero disables new critiques; overdue resumes run it first.
+    CriticInterval = 10
+
     # Run one repository lessons-learned analysis before completion after this
     # many verified loop commits. Zero disables the additional analysis.
     # This value is reloaded when the clean-pass gate is reached.
@@ -753,6 +757,7 @@ $($hostGates -join "`n")
         Reviewer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         ReviewClassifier = @{ Model = 'gpt-5.6-luna'; Thinking = 'low' }
         LessonsLearned = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
+        Critic = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Architect = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
         Fixer = @{ Model = 'gpt-5.6-sol'; Thinking = 'high' }
     }
@@ -836,6 +841,7 @@ function Import-ReviewLoopConfig {
     $defaults = @{
         CleanPassesRequired = 2
         MaxReviewCycles = 12
+        CriticInterval = 10
         LessonsLearnedCommitThreshold = 6
         ReviewAfterLessonsLearnedCommit = $false
         MaxFixAttempts = 2
@@ -912,8 +918,12 @@ function Assert-ReviewLoopConfigValues {
         }
         $Config[$name] = $value
     }
+    if ($Config.CriticInterval -isnot [int] -and $Config.CriticInterval -isnot [long] -or
+        $Config.CriticInterval -lt 0 -or $Config.CriticInterval -gt [int]::MaxValue) {
+        throw "Configuration value 'CriticInterval' must be a non-negative integer."
+    }
     $roles = @(
-        "Reviewer", "ReviewClassifier", "LessonsLearned",
+        "Reviewer", "ReviewClassifier", "LessonsLearned", "Critic",
         "Architect", "Fixer"
     )
     foreach ($role in $roles) {
@@ -1012,6 +1022,7 @@ function Get-ReviewLoopHostGateRepositoryChanges {
 $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
+    "CriticInterval",
     "LessonsLearnedCommitThreshold",
     "ReviewAfterLessonsLearnedCommit",
     "MaxFixAttempts",
@@ -1362,6 +1373,9 @@ function Get-ReviewLoopRoleConfig {
             "LessonsLearned" {
                 @{ Model = "gpt-5.6-sol"; Thinking = "high" }
             }
+            "Critic" {
+                @{ Model = "gpt-5.6-sol"; Thinking = "high" }
+            }
             default { $null }
         }
         if ($null -ne $defaultRole) {
@@ -1400,6 +1414,7 @@ function Get-ReviewLoopGitValue {
         $startInfo.FileName = "git"
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
         foreach ($argument in @("-C", $RepoPath) + $Arguments) {
@@ -1412,6 +1427,8 @@ function Get-ReviewLoopGitValue {
             if (-not $process.Start()) {
                 throw "Git could not start."
             }
+            # Git must not inherit a background job's remoting input pipe.
+            $process.StandardInput.Close()
             $stdoutTask = $process.StandardOutput.ReadToEndAsync()
             $stderrTask = $process.StandardError.ReadToEndAsync()
             $process.WaitForExit()

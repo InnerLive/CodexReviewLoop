@@ -92,6 +92,7 @@ function New-TestConfig {
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
     CleanPassesRequired = $CleanPassesRequired
     MaxReviewCycles = 6
+    CriticInterval = 10
     LessonsLearnedCommitThreshold = 6
     ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
@@ -274,9 +275,63 @@ Describe "Codex Review Loop module" -Tags @("Fast", "FullLocal") {
         $profile = Import-PowerShellDataFile -LiteralPath $generated
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.CriticInterval | Should Be 10
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
-            "Architect", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer")
+            "Architect", "Critic", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer")
+    }
+}
+
+Describe "Critic configuration and contract" -Tags @("Fast", "FullLocal") {
+    It "accepts two free feedback texts and rejects missing blank or extra fields" {
+        $schemaPath = Join-Path $root 'schemas/critic-v1.schema.json'
+        '{"schemaVersion":"1.0","reviewerFeedback":"The review was justified.","architectFeedback":"Use your judgment."}' |
+            Test-Json -SchemaFile $schemaPath | Should Be $true
+        foreach ($invalid in @(
+            '{"schemaVersion":"1.0","reviewerFeedback":"Review only."}',
+            '{"schemaVersion":"1.0","reviewerFeedback":" ","architectFeedback":"Advice."}',
+            '{"schemaVersion":"1.0","reviewerFeedback":"Advice.","architectFeedback":""}',
+            '{"schemaVersion":"1.0","reviewerFeedback":"Advice.","architectFeedback":"Advice.","accept":true}'
+        )) {
+            (Test-Throws { $invalid | Test-Json -SchemaFile $schemaPath -ErrorAction Stop }) | Should Be $true
+        }
+    }
+
+    It "validates nonnegative integer intervals and keeps them outside the execution fingerprint" {
+        $repo = New-TestRepo (Join-Path $TestDrive 'critic-config-repo')
+        $profilePath = New-TestConfig -Path (Join-Path $TestDrive 'critic-profile.psd1') `
+            -LogRoot (Join-Path $TestDrive 'critic-logs')
+        & (Get-Module CodexReviewLoop) {
+            param($path, $r)
+            $c = Import-ReviewLoopConfig -ConfigPath $path -RepoPath $r
+            $c.CriticInterval | Should Be 10
+            (Get-ReviewLoopRoleConfig -Config $c -Role Critic).Model | Should Be 'gpt-5.6-sol'
+            foreach ($valid in @(0, 1, 10, 20)) {
+                $c.CriticInterval = $valid
+                Assert-ReviewLoopConfigValues -Config $c
+            }
+            foreach ($invalid in @(-1, 1.5, '10', $true, $null)) {
+                $c.CriticInterval = $invalid
+                $threw = $false
+                try { Assert-ReviewLoopConfigValues -Config $c } catch { $threw = $true }
+                $threw | Should Be $true
+            }
+            $before = Get-ReviewLoopExecutionFingerprint -ConfigPath $path
+            $text = (Get-Content -Raw $path).Replace('CriticInterval = 10', 'CriticInterval = 3')
+            Set-Content $path $text
+            (Get-ReviewLoopExecutionFingerprint -ConfigPath $path) | Should Be $before
+            $c = Import-ReviewLoopConfig -ConfigPath $path -RepoPath $r
+            $c['__ConfigPath'] = $path
+            Set-Content $path ($text.Replace('CriticInterval = 3', 'CriticInterval = 7'))
+            Update-ReviewLoopLiveConfig -Config $c
+            $c.CriticInterval | Should Be 7
+        } $profilePath $repo
+    }
+
+    It "keeps the Critic out of durable shared role sessions" {
+        & (Get-Module CodexReviewLoop) {
+            (@(Get-ReviewLoopSessionRoleNames) -contains 'Critic') | Should Be $false
+        }
     }
 }
 
@@ -342,7 +397,7 @@ Describe "Optional profiles and command help" -Tags @("Static", "FullLocal") {
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
         $profile.TargetedTestRepositoryChanges.Mode | Should Be "Fail"
-        $profile.Roles.Keys.Count | Should Be 5
+        $profile.Roles.Keys.Count | Should Be 6
         @($profile.HostGates).Count | Should Be 1
         $imported = & $module {
             param($path)
@@ -2216,9 +2271,12 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
         $expected = @(
             "architect-assessment.md",
             "architect.md",
+            "critic-feedback.md",
+            "critic.md",
             "developer-analysis.md",
             "developer-architect.md",
             "developer-common.md",
+            "developer-critic.md",
             "developer-fixer.md",
             "developer-host-gates.md",
             "developer-lessons-learned.md",
@@ -2467,14 +2525,14 @@ Fixer result and targeted-test evidence:
 
     It "has no direct HTTP model invocation in active code" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'Invoke-WebRequest|Invoke-RestMethod|/v1/responses'
     }
 
     It "has no direct API credential dependency in active code" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $credentialName = "OPENAI" + "_API_KEY"
         $text | Should Not Match $credentialName
@@ -2482,14 +2540,14 @@ Fixer result and targeted-test evidence:
 
     It "does not retain legacy architecture switches" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'ArchitectureAutoApplyAll|InteractiveArchitectureGate|ArchitectureHotspot'
     }
 
     It "has no active PKonf-specific coupling" {
         $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match '(?i)\bPKonf\b'
     }

@@ -11,6 +11,35 @@ and otherwise falls back to the normal `origin/HEAD`, main/master, `HEAD^`, or
 `HEAD` selection. A resumed run keeps the symbolic base and commit recorded in
 its checkpoint.
 
+## Periodic Critic
+
+After every ten successfully completed, distinct native reviews by default,
+an independent Critic examines the evidenced run and returns separate free-form
+feedback to the Reviewer and Architect. It receives the retrospective, role
+timings and reported token usage, result artifact paths, loop commits, available
+task guidance, and both sides of previous critiques. Each critique starts a
+fresh thread; only an interrupted critique resumes its own thread.
+
+The Critic is an impatient, technically grounded adviser. It receives no
+diagnostic checklist or prescribed investigation method. It cannot edit the
+repository, resolve findings, accept patches, or veto either recipient's
+decisions. Each recipient receives only its own latest feedback. Existing
+Reviewer instructions remain in force, and the Fixer receives resulting
+decisions through normal Architect advice.
+
+Critiques run between review/fix rounds, before the next review. Completion
+takes precedence, and an exhausted invocation budget leaves overdue criticism
+for resume. The durable count ignores failed calls and repeated attempts of
+the same native review. Feedback does not reset clean passes or consume the
+review budget. `CriticInterval = 0` disables new critiques; saved feedback remains
+available and an interrupted critique is still recovered.
+
+Critic output and its covered review count are saved atomically with the role
+result. Its own active-call checkpoint preserves an interrupted work role.
+Both addressed feedback texts appear in the terminal, without internal model
+reasoning. Lessons Learned remains the separate completion-time analysis for
+durable repository guidance.
+
 ## The cycle
 
 ```mermaid
@@ -94,7 +123,8 @@ supplies dynamic values.
 
 The structured Architect response is passed unchanged to the Fixer. After each
 Fixer result, the same Architect thread assesses the resulting repository state.
-There is no judge, confirmation, critic, veto, or tie-break role.
+The periodic Critic supplies advice only; there is no judge, confirmation,
+veto, or tie-break role in the acceptance path.
 
 ## 3. Fixing without a blocked finding state
 

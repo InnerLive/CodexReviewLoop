@@ -85,6 +85,25 @@ should never be placed in model-visible command output.
 
 ## Resume and `-NewRun`
 
+Overdue Critic feedback runs as the first new model call on resume, after
+repository validation and necessary technical recovery. Old profiles and runs
+need no manual conversion: a run with 41 completed native reviews and no prior
+critique receives one critique of the whole run immediately, then another after
+ten further completed reviews. Missed intervals are not replayed individually,
+and immediately resuming again does not repeat successful criticism.
+
+An interrupted Fixer with a resumable thread keeps its unfinished patch after a
+tool update. Its resumed result must pass the current Architect assessment,
+tests, and commit gates before it can be accepted.
+
+Use the same resume command and existing Reviewer-instruction override as
+before. No special Critic switch or `-NewRun` is needed. A resumable unfinished
+Fixer patch is identified as incomplete evidence and preserved while the Critic
+runs. Unknown changes and violated repository invariants still prevent unsafe
+resume. Critic failures retain both checkpoints and never discard Fixer work;
+after the existing technical retries, the run stops with diagnostics rather
+than silently skipping the due critique.
+
 Running the same command resumes the latest compatible checkpoint by default.
 Resume requires the same repository, branch, recorded symbolic review base,
 and `HEAD`. When `-ReviewBase` is omitted, the newest resumable checkpoint for

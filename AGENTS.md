@@ -150,6 +150,7 @@ supported developer-instructions setting.
 |---|---|---|
 | Reviewer | `gpt-5.6-sol` | `high` |
 | LessonsLearned | `gpt-5.6-sol` | `high` |
+| Critic | `gpt-5.6-sol` | `high` |
 | Architect | `gpt-5.6-sol` | `high` |
 | Fixer | `gpt-5.6-sol` | `high` |
 | ReviewClassifier | `gpt-5.6-luna` | `low` |
@@ -159,8 +160,9 @@ supported developer-instructions setting.
 - Fixers own worktree edits but never commits or Git refs.
 - The orchestrator owns authoritative tests, verification, staging, and
   commits. Every accepted commit must represent the exact verified tree.
-- Architect and Fixer make their existing decisions directly. Do
-  not add approval, critic, judge, veto, tie-break, or fallback roles.
+- Architect and Fixer make their existing decisions directly. The periodic
+  Critic provides separate advisory feedback to Reviewer and Architect only.
+  Do not add approval, judge, veto, tie-break, or fallback roles.
 - Prompts and schemas remain versioned resources, not large inline strings.
 - Structured output is mandatory where a schema exists. A process failure,
   `turn.failed`, invalid structured result, or unsafe mutation is technical

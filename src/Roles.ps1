@@ -28,12 +28,13 @@ function Get-ReviewLoopOperationalInstructions {
         "Fixer" { "developer-fixer.md" }
         "ReviewClassifier" { "developer-review-classifier.md" }
         "LessonsLearned" { "developer-lessons-learned.md" }
+        "Critic" { "developer-critic.md" }
         default { "developer-analysis.md" }
     }
     $sections = @(
         Get-ReviewLoopPrompt -Name "developer-common.md" -Values @{}
     )
-    if ($Role -ne "ReviewClassifier") {
+    if ($Role -notin @("ReviewClassifier", "Critic")) {
         $sections += Get-ReviewLoopPrompt `
             -Name "developer-host-gates.md" -Values @{ HOST_GATES = $hostGateText }
     }
@@ -189,13 +190,22 @@ function Invoke-ConfiguredCodexRole {
     else {
         ""
     }
+    $critic = if ($Role -in @("Reviewer", "Architect")) {
+        Get-ReviewLoopLatestCritique -State $State
+    } else { $null }
+    $criticId = if ($null -ne $critic) { [string]$critic.CallId } else { "" }
+    $activeCallProperty = if ($Role -eq "Critic") { "ActiveCriticCall" } else { "ActiveRoleCall" }
     if ($null -ne $State) {
+        if ($State.PSObject.Properties.Name -notcontains $activeCallProperty) {
+            $State | Add-Member -NotePropertyName $activeCallProperty -NotePropertyValue $null
+        }
         $completed = @($State.RoleCalls | Where-Object {
             [bool](Get-ReviewLoopObjectProperty -Object $_ -Name "Success" -Default $false) -and
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -eq $CallId -and
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq $Role -and
             [string](Get-ReviewLoopObjectProperty `
-                -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint
+                -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint -and
+            [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CriticId" -Default "") -eq $criticId
         } | Select-Object -Last 1)
         if ($completed.Count -gt 0) {
             $record = $completed[0]
@@ -220,7 +230,7 @@ function Invoke-ConfiguredCodexRole {
 
     $mayEditRepository = $Role -eq "Fixer"
     $pending = if ($null -ne $State) {
-        Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+        Get-ReviewLoopObjectProperty -Object $State -Name $activeCallProperty
     }
     else {
         $null
@@ -240,6 +250,15 @@ function Invoke-ConfiguredCodexRole {
                 -Object $pending -Name "WorktreeFingerprint" -Default "")
         }
         $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        if ($Role -eq "Critic" -and (
+            [string]$pending.RepositoryBranch -ne [string]$currentSnapshot.Branch -or
+            [string]$pending.RepositoryHeadRef -ne [string]$currentSnapshot.HeadRef -or
+            [string]$pending.RefsFingerprint -ne [string]$currentSnapshot.RefsFingerprint -or
+            [string]$pending.IndexFingerprint -ne [string]$currentSnapshot.IndexFingerprint -or
+            [string]$pendingSnapshot.Head -ne [string]$currentSnapshot.Head -or
+            [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint)) {
+            throw "Interrupted Critic checkpoint no longer matches the repository state."
+        }
         $pendingExecution = [string](Get-ReviewLoopObjectProperty `
             -Object $pending -Name "ExecutionFingerprint" -Default "")
         $legacyVerifierTransition = (
@@ -255,13 +274,19 @@ function Invoke-ConfiguredCodexRole {
                 [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint) {
                 Stop-ReviewLoopBlocked -Message "Interrupted legacy Verifier checkpoint no longer matches the saved repository state."
             }
-            $State.ActiveRoleCall = $null
+            $State.$activeCallProperty = $null
             Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
             $pending = $null
         }
         elseif ($pendingExecution -ne $executionFingerprint) {
-            if (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
-                $State.ActiveRoleCall = $null
+            if ($Role -eq "Fixer" -and [string]$pending.Role -eq "Fixer" -and
+                [string]$pending.CallId -eq $CallId -and
+                [string]$pendingSnapshot.Head -eq [string]$currentSnapshot.Head -and
+                -not [string]::IsNullOrWhiteSpace([string]$pending.ThreadId)) {
+                Write-ReviewLoopStatus -Message "Resuming interrupted Fixer work under the current execution configuration; the result requires current assessment and gates." -Kind Info
+            }
+            elseif ($Role -eq "Critic" -or (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+                $State.$activeCallProperty = $null
                 Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
                 $pending = $null
             }
@@ -309,7 +334,7 @@ function Invoke-ConfiguredCodexRole {
                         -Object $State -Name "PartialFixRecovery"))) {
                 Stop-ReviewLoopBlocked -Message "Interrupted mutating role '$Role' has no resumable thread."
             }
-            $State.ActiveRoleCall = $null
+            $State.$activeCallProperty = $null
             Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
             $pending = $null
         }
@@ -321,8 +346,12 @@ function Invoke-ConfiguredCodexRole {
     }
 
     $roleStartSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ($null -ne $pending -and $Role -in @("Reviewer", "Architect")) {
+        $pending | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
     if ($null -ne $State -and $null -eq $pending) {
-        $State.ActiveRoleCall = [pscustomobject][ordered]@{
+        $State.$activeCallProperty = [pscustomobject][ordered]@{
             CallId = $CallId
             Role = $Role
             Model = [string]$roleConfig.Model
@@ -332,11 +361,17 @@ function Invoke-ConfiguredCodexRole {
             Mode = $effectiveMode
             ThreadId = $effectiveThreadId
             ExecutionFingerprint = $executionFingerprint
+            CriticId = $criticId
+            CoveredReviewCount = if ($Role -eq "Critic") {
+                Get-ReviewLoopCompletedReviewCount -State $State
+            } else { 0 }
             CheckpointStage = [string]$State.Stage
             RepositoryHead = [string]$roleStartSnapshot.Head
             WorktreeFingerprint = [string]$roleStartSnapshot.Fingerprint
             RepositoryBranch = [string]$roleStartSnapshot.Branch
             RepositoryHeadRef = [string]$roleStartSnapshot.HeadRef
+            RefsFingerprint = [string]$roleStartSnapshot.RefsFingerprint
+            IndexFingerprint = [string]$roleStartSnapshot.IndexFingerprint
             StartedAt = [DateTimeOffset]::UtcNow.ToString("O")
             ThreadStartedAt = ""
         }
@@ -371,6 +406,15 @@ function Invoke-ConfiguredCodexRole {
     else {
         Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
     }
+    if ($null -ne $critic) {
+        $field = if ($Role -eq "Reviewer") { "reviewerFeedback" } else { "architectFeedback" }
+        $feedback = Get-ReviewLoopPrompt -Name "critic-feedback.md" -Values @{
+            CRITIC_ID = $criticId
+            FEEDBACK = [string]$critic.StructuredResult.$field
+        }
+        $developerInstructions = (@($developerInstructions, $feedback) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n"
+    }
     $arguments.DeveloperInstructions = $developerInstructions
     $worktreeBefore = if ($mayEditRepository) {
         ""
@@ -382,7 +426,7 @@ function Invoke-ConfiguredCodexRole {
         $onThreadStarted = {
             param([string]$ObservedThreadId)
 
-            $active = $State.ActiveRoleCall
+            $active = $State.$activeCallProperty
             if ($null -eq $active -or [string]$active.CallId -ne $CallId) {
                 throw "Role thread '$ObservedThreadId' does not match the active role checkpoint."
             }
@@ -429,8 +473,19 @@ function Invoke-ConfiguredCodexRole {
     }
     if ($null -ne $State) {
         $roleEndSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        if ($Role -eq "Critic" -and (
+            $roleStartSnapshot.Head -ne $roleEndSnapshot.Head -or
+            $roleStartSnapshot.Branch -ne $roleEndSnapshot.Branch -or
+            $roleStartSnapshot.HeadRef -ne $roleEndSnapshot.HeadRef -or
+            $roleStartSnapshot.RefsFingerprint -ne $roleEndSnapshot.RefsFingerprint -or
+            $roleStartSnapshot.IndexFingerprint -ne $roleEndSnapshot.IndexFingerprint)) {
+            throw "Read-only role 'Critic' changed the repository identity."
+        }
         $call | Add-Member -Force -NotePropertyName ExecutionFingerprint `
             -NotePropertyValue $executionFingerprint
+        $call | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
+        $call | Add-Member -Force -NotePropertyName CoveredReviewCount -NotePropertyValue (
+            [int](Get-ReviewLoopObjectProperty -Object $State.$activeCallProperty -Name "CoveredReviewCount" -Default 0))
         $call | Add-Member -Force -NotePropertyName RepositoryHead `
             -NotePropertyValue ([string]$roleEndSnapshot.Head)
         $call | Add-Member -Force -NotePropertyName WorktreeFingerprint `
@@ -440,7 +495,7 @@ function Invoke-ConfiguredCodexRole {
                 -State $State -Role $Role -ThreadId ([string]$call.ThreadId)
         }
         Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
-        $State.ActiveRoleCall = $null
+        $State.$activeCallProperty = $null
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         if ($Role -eq "Reviewer") {
             Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath

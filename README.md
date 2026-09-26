@@ -7,6 +7,9 @@ Codex Review Loop uses Codex's native review function on the complete branch
 diff, lets free Architect and Fixer roles choose the solution, asks the same
 Architect to accept or reject the result, runs the repository's quality gates, and commits only
 accepted work. It repeats unattended until the branch is demonstrably clean.
+Every ten completed reviews by default, an independent Critic gives the
+Reviewer and Architect separate feedback on the run. Overdue criticism runs
+first when resuming a long run, after technical recovery and validation.
 After enough verified loop commits, it can also extract evidence-backed lessons
 into repository guidance before declaring the run complete.
 

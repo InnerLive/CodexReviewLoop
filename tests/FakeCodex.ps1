@@ -211,6 +211,9 @@ if ($exitCode -eq 0 -and
     else {
         $schemaName = [System.IO.Path]::GetFileName($schemaPath)
         $result = switch ($schemaName) {
+            "critic-v1.schema.json" {
+                '{"schemaVersion":"1.0","reviewerFeedback":"Reviewer: examine the current work independently.","architectFeedback":"Architect: make coherent decisions."}'
+            }
             "architecture-advice-v2.schema.json" {
                 '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'
             }

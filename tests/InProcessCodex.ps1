@@ -101,6 +101,9 @@ function Get-InProcessCodexDefaultResult {
     param([string]$SchemaName)
 
     switch ($SchemaName) {
+        "critic-v1.schema.json" {
+            return '{"schemaVersion":"1.0","reviewerFeedback":"Reviewer: examine the current work independently.","architectFeedback":"Architect: make coherent decisions."}'
+        }
         "architecture-advice-v2.schema.json" {
             return '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'
         }
@@ -331,13 +334,17 @@ function Invoke-InProcessCodexRole {
         } else { "" }
         RepositoryHead = ""
         WorktreeFingerprint = ""
+        CoveredReviewCount = if ($Role -eq "Critic") {
+            Get-ReviewLoopCompletedReviewCount -State $State
+        } else { 0 }
     }
     if ($null -ne $State) {
         if ($call.Success) {
             Set-ReviewLoopRoleSessionThreadId -State $State -Role $Role -ThreadId $returnedThread
         }
         Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
-        $State.ActiveRoleCall = $null
+        if ($Role -eq "Critic") { $State.ActiveCriticCall = $null }
+        else { $State.ActiveRoleCall = $null }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     }
     return $call

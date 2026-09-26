@@ -32,6 +32,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
+| `CriticInterval` | `10` | Completed native reviews between critiques across the durable run; `0` disables new critiques |
 | `LessonsLearnedCommitThreshold` | `6` | Verified loop commits required for the conditional completion analysis; `0` disables it |
 | `ReviewAfterLessonsLearnedCommit` | `$false` | Require normal clean native reviews after a real lessons-learned commit |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
@@ -81,6 +82,9 @@ fix, and commit boundaries:
 
 - `CleanPassesRequired`
 - `MaxReviewCycles` applies before the next native review call.
+- `CriticInterval` applies at the next safe boundary, including resume. It must
+  be a non-negative integer. Old profiles default to `10` and use
+  `gpt-5.6-sol/high` for `Roles.Critic` unless explicitly configured otherwise.
 - `LessonsLearnedCommitThreshold` applies when the clean-pass completion gate
   is reached.
 - `ReviewAfterLessonsLearnedCommit` is captured when an eligible
@@ -103,6 +107,11 @@ fix, and commit boundaries:
 
 These settings are excluded from the execution fingerprint because changing
 them does not invalidate review, test, or verification evidence.
+
+Critic feedback is durable run context, not a replacement for
+`ReviewerInstructions`. Each Reviewer or Architect call records the critique
+it received, preventing reuse of a cached decision predating new feedback.
+Critiques do not consume `MaxReviewCycles` or reset clean passes.
 
 Other settings remain fixed for an active invocation. In particular, changing
 `Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes new-run identity.
@@ -253,6 +262,7 @@ New profiles contain these workflow and analysis roles:
 
 - `Reviewer`
 - `LessonsLearned`
+- `Critic`
 - `Architect`
 - `Fixer`
 
@@ -278,7 +288,7 @@ and thread-resume calls while retaining the same checkpoint and ledger.
 Existing profiles remain usable during the transition: `PointFixer` supplies
 the `Fixer` configuration when `Fixer` is absent. Old `Verifier` and
 `FindingVerifier` entries are ignored alongside removed judge, confirmation,
-critic, veto, and tie-break entries.
+veto, and tie-break entries. The periodic advisory `Critic` is an active role.
 
 Tool, prompt, schema, and execution-affecting profile settings are
 fingerprinted. If they change between invocations, completed model work is
