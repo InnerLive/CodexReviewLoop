@@ -335,14 +335,23 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         } $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
         $calls.Count | Should Be 5
+        ($calls[1].arguments -join ' ') | Should Match 'every subsequent call to its recipient'
+        $calls[1].prompt | Should Match '"CriticInterval":10'
         foreach ($index in @(2, 3)) {
+            ($calls[$index].arguments -join ' ') | Should Match 'after 10 completed native reviews'
+            ($calls[$index].arguments -join ' ') | Should Match 'may already have addressed specific points'
             ($calls[$index].arguments -join ' ') | Should Match 'Architect: make'
             ($calls[$index].arguments -join ' ') | Should Not Match 'Reviewer: examine'
         }
         ($calls[4].arguments -join ' ') | Should Match 'Keep my original review context'
         ($calls[4].arguments -join ' ') | Should Match 'Reviewer: examine'
+        ($calls[4].arguments -join ' ') | Should Match 'after 10 completed native reviews'
         ($calls[4].arguments -join ' ') | Should Not Match 'Architect: make'
         $state.RoleCalls[-1].CriticId | Should Be 'critic-0010'
+        $saved = Read-ReviewLoopState $statePath
+        $savedCritique = @($saved.RoleCalls | Where-Object Role -eq Critic)[0]
+        $savedCritique.StructuredResult.reviewerFeedback | Should Be 'Reviewer: examine the current work independently.'
+        $savedCritique.StructuredResult.architectFeedback | Should Be 'Architect: make coherent decisions.'
     }
 
     It "preserves and resumes an interrupted Architect with its new feedback" {
@@ -360,6 +369,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $last.callKind | Should Be 'resume'
         $last.resumeThreadId | Should Be 'interrupted-thread'
         ($last.arguments -join ' ') | Should Match 'Architect: make'
+        ($last.arguments -join ' ') | Should Match 'after 10 completed native reviews'
         ($last.arguments -join ' ') | Should Not Match 'Reviewer: examine'
     }
 

@@ -3148,7 +3148,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "architecture-assessment-v1.schema.json"
         })[0]
-        $assessmentCall.prompt | Should Match "(?m)^\{\}$"
+        $assessmentCall.prompt | Should Match "(?m)^\{\}\r?$"
         $assessmentCall.prompt | Should Not Match "Broader reviews extended discovery"
         @((Read-ReviewLoopLedger -Path $checkpoint.LedgerPath).Findings).Count |
             Should Be 3

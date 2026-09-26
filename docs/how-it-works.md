@@ -27,6 +27,12 @@ decisions. Each recipient receives only its own latest feedback. Existing
 Reviewer instructions remain in force, and the Fixer receives resulting
 decisions through normal Architect advice.
 
+The Critic knows that its feedback persists across subsequent recipient calls
+until replaced. Delivery identifies the completed-review count on which the
+critique was based and notes that later work may already have addressed specific
+points. This context also accompanies critiques saved before the tool update;
+their original text remains unchanged.
+
 Critiques run between review/fix rounds, before the next review. Completion
 takes precedence, and an exhausted invocation budget leaves overdue criticism
 for resume. The durable count ignores failed calls and repeated attempts of

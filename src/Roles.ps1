@@ -410,6 +410,7 @@ function Invoke-ConfiguredCodexRole {
         $field = if ($Role -eq "Reviewer") { "reviewerFeedback" } else { "architectFeedback" }
         $feedback = Get-ReviewLoopPrompt -Name "critic-feedback.md" -Values @{
             CRITIC_ID = $criticId
+            COVERED_REVIEWS = [string]$critic.CoveredReviewCount
             FEEDBACK = [string]$critic.StructuredResult.$field
         }
         $developerInstructions = (@($developerInstructions, $feedback) |

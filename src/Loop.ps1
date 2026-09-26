@@ -3807,6 +3807,7 @@ function Invoke-ReviewLoopCriticGate {
     $callId = if ($null -ne $pending) { [string]$pending.CallId } else { "critic-{0:d4}" -f $completedCount }
     $context = Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath
     $context | Add-Member -NotePropertyName UnfinishedFixerWork -NotePropertyValue $unfinished
+    $context | Add-Member -NotePropertyName CriticInterval -NotePropertyValue $interval
     $context | Add-Member -NotePropertyName Stage -NotePropertyValue ([string]$State.Stage)
     $retrospective = Get-ReviewLoopRetrospectiveEvidence `
         -State $State -Ledger $Ledger -RepoPath $RepoPath -CurrentHead $snapshot.Head
