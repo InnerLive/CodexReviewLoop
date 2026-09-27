@@ -101,8 +101,8 @@ function Get-InProcessCodexDefaultResult {
     param([string]$SchemaName)
 
     switch ($SchemaName) {
-        "critic-v1.schema.json" {
-            return '{"schemaVersion":"1.0","reviewerFeedback":"Reviewer: examine the current work independently.","architectFeedback":"Architect: make coherent decisions."}'
+        "critic-v2.schema.json" {
+            return '{"schemaVersion":"2.0","reviewerFeedback":"Reviewer: examine the current work independently.","architectFeedback":"Architect: make coherent decisions.","fixerFeedback":"Fixer: implement the agreed solution coherently."}'
         }
         "architecture-advice-v2.schema.json" {
             return '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'

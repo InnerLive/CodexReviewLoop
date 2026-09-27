@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "2.0" },
+    "reviewerFeedback": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "architectFeedback": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "fixerFeedback": { "type": "string", "minLength": 1, "pattern": "\\S" }
+  },
+  "required": ["schemaVersion", "reviewerFeedback", "architectFeedback", "fixerFeedback"]
+}

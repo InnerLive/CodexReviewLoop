@@ -25,6 +25,14 @@ function Get-ReviewLoopCompletedReviewCount {
     } | Select-Object -ExpandProperty CallId -Unique).Count
 }
 
+function Test-ReviewLoopCycleBoundary {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    return $null -eq $State.ActiveRoleCall -and [string]$State.Stage -in @(
+        "initialized", "clean_review", "fix_committed", "review_round_requested", "limit_reached"
+    )
+}
+
 function Get-ReviewLoopLatestCritique {
     param([AllowNull()][object]$State)
 

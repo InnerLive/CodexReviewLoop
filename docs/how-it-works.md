@@ -13,19 +13,22 @@ its checkpoint.
 
 ## Periodic Critic
 
-After every ten successfully completed, distinct native reviews by default,
-an independent Critic examines the evidenced run and returns separate free-form
-feedback to the Reviewer and Architect. It receives the retrospective, role
-timings and reported token usage, result artifact paths, loop commits, available
-task guidance, and both sides of previous critiques. Each critique starts a
+Starting after five successfully completed, distinct native reviews by default,
+an independent Critic examines the evidenced run after every finished review/fix
+round and returns separate free-form feedback to the Reviewer, Architect, and
+Fixer. It receives the retrospective, role timings and reported token usage,
+result artifact paths, loop commits, available
+task guidance, and all recipients' previous critiques. Each critique starts a
 fresh thread; only an interrupted critique resumes its own thread.
 
 The Critic is an impatient, technically grounded adviser. It receives no
-diagnostic checklist or prescribed investigation method. It cannot edit the
-repository, resolve findings, accept patches, or veto either recipient's
-decisions. Each recipient receives only its own latest feedback. Existing
-Reviewer instructions remain in force, and the Fixer receives resulting
-decisions through normal Architect advice.
+diagnostic checklist or prescribed investigation method. It judges working
+practices and collaboration, not code as an additional Reviewer. It cannot edit
+the repository, create or resolve findings, accept patches, or veto decisions.
+Each recipient receives only its own latest
+feedback. Existing role instructions and Architect advice remain in force.
+Evidence-backed praise is valid feedback. The Critic need not recommend changes
+when the current approach works well and must not demand optimization for its own sake.
 
 The Critic knows that its feedback persists across subsequent recipient calls
 until replaced. Delivery identifies the completed-review count on which the
@@ -37,14 +40,20 @@ Critiques run between review/fix rounds, before the next review. Completion
 takes precedence, and an exhausted invocation budget leaves overdue criticism
 for resume. The durable count ignores failed calls and repeated attempts of
 the same native review. Feedback does not reset clean passes or consume the
-review budget. `CriticInterval = 0` disables new critiques; saved feedback remains
-available and an interrupted critique is still recovered.
+review budget. New criticism never interrupts a Fixer attempt, Architect
+assessment, gate, or commit, including on resume. `CriticStartAfterReviews = 0`
+disables new critiques; saved feedback remains available and an interrupted
+critique is still recovered.
 
 Critic output and its covered review count are saved atomically with the role
 result. Its own active-call checkpoint preserves an interrupted work role.
-Both addressed feedback texts appear in the terminal, without internal model
+All three addressed feedback texts appear in the terminal, without internal model
 reasoning. Lessons Learned remains the separate completion-time analysis for
-durable repository guidance.
+durable repository guidance. Historical schema 1.0 critiques retain their two
+original texts; they supply no Fixer feedback. New schema 2.0 critiques require
+all three texts and replace the feedback delivered on subsequent role calls.
+Existing session history is not rewritten. Each recipient call records the
+critique ID actually delivered; old results are not relabeled as new decisions.
 
 ## The cycle
 

@@ -698,9 +698,9 @@ function New-ReviewLoopProfile {
     # resumes the checkpoint with a fresh cycle counter.
     MaxReviewCycles = 12
 
-    # Independent feedback after this many completed native reviews across the
-    # durable run. Zero disables new critiques; overdue resumes run it first.
-    CriticInterval = 10
+    # Start independent feedback after this many completed native reviews, then
+    # after every finished review/fix round. Zero disables new critiques.
+    CriticStartAfterReviews = 5
 
     # Run one repository lessons-learned analysis before completion after this
     # many verified loop commits. Zero disables the additional analysis.
@@ -841,7 +841,7 @@ function Import-ReviewLoopConfig {
     $defaults = @{
         CleanPassesRequired = 2
         MaxReviewCycles = 12
-        CriticInterval = 10
+        CriticStartAfterReviews = 5
         LessonsLearnedCommitThreshold = 6
         ReviewAfterLessonsLearnedCommit = $false
         MaxFixAttempts = 2
@@ -850,6 +850,17 @@ function Import-ReviewLoopConfig {
         AutoCommit = $true
         CommitMessagePrefix = "Review-Loop"
         ReviewerInstructions = ""
+    }
+    if ($config.ContainsKey("CriticInterval")) {
+        $legacy = $config.CriticInterval
+        if (($legacy -isnot [int] -and $legacy -isnot [long]) -or
+            $legacy -lt 0 -or $legacy -gt [int]::MaxValue) {
+            throw "Configuration value 'CriticInterval' must be a non-negative integer."
+        }
+        if (-not $config.ContainsKey("CriticStartAfterReviews") -and $legacy -eq 0) {
+            $config.CriticStartAfterReviews = 0
+        }
+        $config.Remove("CriticInterval")
     }
     foreach ($entry in $defaults.GetEnumerator()) {
         if (-not $config.ContainsKey($entry.Key)) {
@@ -918,9 +929,9 @@ function Assert-ReviewLoopConfigValues {
         }
         $Config[$name] = $value
     }
-    if ($Config.CriticInterval -isnot [int] -and $Config.CriticInterval -isnot [long] -or
-        $Config.CriticInterval -lt 0 -or $Config.CriticInterval -gt [int]::MaxValue) {
-        throw "Configuration value 'CriticInterval' must be a non-negative integer."
+    if ($Config.CriticStartAfterReviews -isnot [int] -and $Config.CriticStartAfterReviews -isnot [long] -or
+        $Config.CriticStartAfterReviews -lt 0 -or $Config.CriticStartAfterReviews -gt [int]::MaxValue) {
+        throw "Configuration value 'CriticStartAfterReviews' must be a non-negative integer."
     }
     $roles = @(
         "Reviewer", "ReviewClassifier", "LessonsLearned", "Critic",
@@ -1022,7 +1033,7 @@ function Get-ReviewLoopHostGateRepositoryChanges {
 $script:ReviewLoopLiveConfigKeys = @(
     "CleanPassesRequired",
     "MaxReviewCycles",
-    "CriticInterval",
+    "CriticStartAfterReviews",
     "LessonsLearnedCommitThreshold",
     "ReviewAfterLessonsLearnedCommit",
     "MaxFixAttempts",
@@ -1098,7 +1109,7 @@ function Get-ReviewLoopExecutionProfileText {
     }
     $executionSettings = @{}
     foreach ($key in $profile.Keys) {
-        if ([string]$key -notin $script:ReviewLoopLiveConfigKeys) {
+        if ([string]$key -notin $script:ReviewLoopLiveConfigKeys -and $key -ne "CriticInterval") {
             $executionSettings[$key] = $profile[$key]
         }
     }

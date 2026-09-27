@@ -190,9 +190,19 @@ function Invoke-ConfiguredCodexRole {
     else {
         ""
     }
-    $critic = if ($Role -in @("Reviewer", "Architect")) {
+    $critic = if ($Role -in @("Reviewer", "Architect", "Fixer")) {
         Get-ReviewLoopLatestCritique -State $State
     } else { $null }
+    $feedbackField = switch ($Role) {
+        "Reviewer" { "reviewerFeedback" }
+        "Architect" { "architectFeedback" }
+        "Fixer" { "fixerFeedback" }
+        default { "" }
+    }
+    if ($null -ne $critic -and [string]::IsNullOrWhiteSpace([string](
+        Get-ReviewLoopObjectProperty -Object $critic.StructuredResult -Name $feedbackField -Default ""))) {
+        $critic = $null
+    }
     $criticId = if ($null -ne $critic) { [string]$critic.CallId } else { "" }
     $activeCallProperty = if ($Role -eq "Critic") { "ActiveCriticCall" } else { "ActiveRoleCall" }
     if ($null -ne $State) {
@@ -346,7 +356,7 @@ function Invoke-ConfiguredCodexRole {
     }
 
     $roleStartSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-    if ($null -ne $pending -and $Role -in @("Reviewer", "Architect")) {
+    if ($null -ne $pending -and $Role -in @("Reviewer", "Architect", "Fixer")) {
         $pending | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     }
@@ -407,11 +417,10 @@ function Invoke-ConfiguredCodexRole {
         Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
     }
     if ($null -ne $critic) {
-        $field = if ($Role -eq "Reviewer") { "reviewerFeedback" } else { "architectFeedback" }
         $feedback = Get-ReviewLoopPrompt -Name "critic-feedback.md" -Values @{
             CRITIC_ID = $criticId
             COVERED_REVIEWS = [string]$critic.CoveredReviewCount
-            FEEDBACK = [string]$critic.StructuredResult.$field
+            FEEDBACK = [string]$critic.StructuredResult.$feedbackField
         }
         $developerInstructions = (@($developerInstructions, $feedback) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n"
@@ -496,7 +505,9 @@ function Invoke-ConfiguredCodexRole {
                 -State $State -Role $Role -ThreadId ([string]$call.ThreadId)
         }
         Add-ReviewLoopRoleCall -State $State -Call $call | Out-Null
-        $State.$activeCallProperty = $null
+        if ($Role -ne "Critic" -or [bool]$call.Success) {
+            $State.$activeCallProperty = $null
+        }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         if ($Role -eq "Reviewer") {
             Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath

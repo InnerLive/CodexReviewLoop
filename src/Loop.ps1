@@ -3777,9 +3777,16 @@ function Invoke-ReviewLoopCriticGate {
     $previous = Get-ReviewLoopLatestCritique -State $State
     $covered = [int](Get-ReviewLoopObjectProperty -Object $previous -Name "CoveredReviewCount" -Default 0)
     $pending = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveCriticCall"
-    $interval = if ($Config.ContainsKey("CriticInterval")) { [int]$Config.CriticInterval } else { 10 }
-    if ($null -eq $pending -and ($interval -eq 0 -or $completedCount - $covered -lt $interval)) {
-        return
+    $startAfter = [int]$Config.CriticStartAfterReviews
+    if ($null -eq $pending) {
+        if ($startAfter -eq 0 -or $completedCount -lt $startAfter -or $completedCount -le $covered) {
+            return
+        }
+        # New critiques belong only to the boundary before the next native review.
+        # A saved Critic call is recovered independently, including legacy mid-round calls.
+        if (-not (Test-ReviewLoopCycleBoundary -State $State)) {
+            return
+        }
     }
     $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
     $finished = Get-ReviewLoopLessonsLearnedFinalCompletion -State $State
@@ -3807,7 +3814,7 @@ function Invoke-ReviewLoopCriticGate {
     $callId = if ($null -ne $pending) { [string]$pending.CallId } else { "critic-{0:d4}" -f $completedCount }
     $context = Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath
     $context | Add-Member -NotePropertyName UnfinishedFixerWork -NotePropertyValue $unfinished
-    $context | Add-Member -NotePropertyName CriticInterval -NotePropertyValue $interval
+    $context | Add-Member -NotePropertyName CriticStartAfterReviews -NotePropertyValue $startAfter
     $context | Add-Member -NotePropertyName Stage -NotePropertyValue ([string]$State.Stage)
     $retrospective = Get-ReviewLoopRetrospectiveEvidence `
         -State $State -Ledger $Ledger -RepoPath $RepoPath -CurrentHead $snapshot.Head
@@ -3824,11 +3831,12 @@ function Invoke-ReviewLoopCriticGate {
     }
     Write-ReviewLoopStatus -Message "Critic due after $completedCount completed native reviews (previously covered: $covered)." -Kind Review
     $call = Invoke-ReviewLoopRoleCall -Config $Config -Role "Critic" -RepoPath $RepoPath `
-        -Speed $Speed -Prompt $prompt -LogRoot $RunRoot -SchemaName "critic-v1.schema.json" `
+        -Speed $Speed -Prompt $prompt -LogRoot $RunRoot -SchemaName "critic-v2.schema.json" `
         -CodexPath $CodexPath -CallId $callId -State $State -StatePath $StatePath
     Assert-ReviewLoopRoleSuccess $call
     Write-ReviewLoopStatus -Message "Critic to Reviewer: $($call.StructuredResult.reviewerFeedback)" -Kind Review
     Write-ReviewLoopStatus -Message "Critic to Architect: $($call.StructuredResult.architectFeedback)" -Kind Review
+    Write-ReviewLoopStatus -Message "Critic to Fixer: $($call.StructuredResult.fixerFeedback)" -Kind Review
 }
 
 function Invoke-ReviewLoopLessonsLearnedGate {
@@ -4210,7 +4218,8 @@ function Invoke-ReviewLoopCore {
             if ([string]$state.LessonsLearned.Status -eq "analyzing") {
                 $state.LessonsLearned.Status = "pending"
             }
-            if (Test-ReviewLoopGitClean -RepoPath $repo) {
+            if ((Test-ReviewLoopGitClean -RepoPath $repo) -and
+                (Test-ReviewLoopCycleBoundary -State $state)) {
                 $state.ActiveRoleCall = $null
                 $state.ActiveClusterId = ""
                 $state.ActiveFindingIds = @()
@@ -4392,7 +4401,7 @@ function Invoke-ReviewLoopCore {
         Get-ReviewLoopGitValue -RepoPath $repo -Arguments @(
             "rev-parse", "--verify", "$($state.ReviewBaseCommit)^{commit}"
         ) | Out-Null
-        if ($resumed) {
+        if ($resumed -and $null -ne $state.ActiveCriticCall) {
             Invoke-ReviewLoopCriticGate -Config $config -State $state -StatePath $statePath `
                 -Ledger $ledger -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         }

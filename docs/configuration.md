@@ -32,7 +32,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
-| `CriticInterval` | `10` | Completed native reviews between critiques across the durable run; `0` disables new critiques |
+| `CriticStartAfterReviews` | `5` | Start critiques at this many completed native reviews, then after every finished review/fix round; `0` disables new critiques |
 | `LessonsLearnedCommitThreshold` | `6` | Verified loop commits required for the conditional completion analysis; `0` disables it |
 | `ReviewAfterLessonsLearnedCommit` | `$false` | Require normal clean native reviews after a real lessons-learned commit |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
@@ -82,9 +82,14 @@ fix, and commit boundaries:
 
 - `CleanPassesRequired`
 - `MaxReviewCycles` applies before the next native review call.
-- `CriticInterval` applies at the next safe boundary, including resume. It must
-  be a non-negative integer. Old profiles default to `10` and use
-  `gpt-5.6-sol/high` for `Roles.Critic` unless explicitly configured otherwise.
+- `CriticStartAfterReviews` applies at the next cycle boundary. It must be a
+  non-negative integer and does not invalidate execution evidence. Old profiles
+  are normalized in memory without rewriting the file: an explicit new setting
+  wins; otherwise legacy `CriticInterval = 0` stays disabled and any positive or
+  missing legacy interval adopts `5`. Invalid legacy values remain errors.
+  The old interval is no longer a scheduling setting. New profiles emit only
+  `CriticStartAfterReviews`. `Roles.Critic` continues to default to
+  `gpt-5.6-sol/high` and inherits the run speed.
 - `LessonsLearnedCommitThreshold` applies when the clean-pass completion gate
   is reached.
 - `ReviewAfterLessonsLearnedCommit` is captured when an eligible

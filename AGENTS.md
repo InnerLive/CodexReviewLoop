@@ -161,7 +161,8 @@ supported developer-instructions setting.
 - The orchestrator owns authoritative tests, verification, staging, and
   commits. Every accepted commit must represent the exact verified tree.
 - Architect and Fixer make their existing decisions directly. The periodic
-  Critic provides separate advisory feedback to Reviewer and Architect only.
+  Critic advises Reviewer, Architect, and Fixer on their working practices at
+  cycle boundaries. It is not an additional code reviewer.
   Do not add approval, judge, veto, tie-break, or fallback roles.
 - Prompts and schemas remain versioned resources, not large inline strings.
 - Structured output is mandatory where a schema exists. A process failure,

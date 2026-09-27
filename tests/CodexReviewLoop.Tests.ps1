@@ -92,7 +92,7 @@ function New-TestConfig {
     LogRoot = "$($LogRoot.Replace("\", "\\"))"
     CleanPassesRequired = $CleanPassesRequired
     MaxReviewCycles = 6
-    CriticInterval = 10
+    CriticStartAfterReviews = 5
     LessonsLearnedCommitThreshold = 6
     ReviewAfterLessonsLearnedCommit = `$false
     MaxFixAttempts = 2
@@ -275,7 +275,8 @@ Describe "Codex Review Loop module" -Tags @("Fast", "FullLocal") {
         $profile = Import-PowerShellDataFile -LiteralPath $generated
         $profile.LessonsLearnedCommitThreshold | Should Be 6
         $profile.ReviewAfterLessonsLearnedCommit | Should Be $false
-        $profile.CriticInterval | Should Be 10
+        $profile.CriticStartAfterReviews | Should Be 5
+        $profile.ContainsKey('CriticInterval') | Should Be $false
         $profile.Roles.Keys.Count | Should Be 6
         @($profile.Roles.Keys | Sort-Object) | Should Be @(
             "Architect", "Critic", "Fixer", "LessonsLearned", "ReviewClassifier", "Reviewer")
@@ -283,49 +284,93 @@ Describe "Codex Review Loop module" -Tags @("Fast", "FullLocal") {
 }
 
 Describe "Critic configuration and contract" -Tags @("Fast", "FullLocal") {
-    It "accepts two free feedback texts and rejects missing blank or extra fields" {
-        $schemaPath = Join-Path $root 'schemas/critic-v1.schema.json'
-        '{"schemaVersion":"1.0","reviewerFeedback":"The review was justified.","architectFeedback":"Use your judgment."}' |
+    It "requires three free feedback texts and rejects missing blank extra or old-version fields" {
+        $schemaPath = Join-Path $root 'schemas/critic-v2.schema.json'
+        '{"schemaVersion":"2.0","reviewerFeedback":"The review was justified.","architectFeedback":"Use your judgment.","fixerFeedback":"Keep it focused."}' |
             Test-Json -SchemaFile $schemaPath | Should Be $true
-        foreach ($invalid in @(
-            '{"schemaVersion":"1.0","reviewerFeedback":"Review only."}',
-            '{"schemaVersion":"1.0","reviewerFeedback":" ","architectFeedback":"Advice."}',
-            '{"schemaVersion":"1.0","reviewerFeedback":"Advice.","architectFeedback":""}',
-            '{"schemaVersion":"1.0","reviewerFeedback":"Advice.","architectFeedback":"Advice.","accept":true}'
-        )) {
-            (Test-Throws { $invalid | Test-Json -SchemaFile $schemaPath -ErrorAction Stop }) | Should Be $true
+        foreach ($field in @('reviewerFeedback', 'architectFeedback', 'fixerFeedback')) {
+            foreach ($value in @($null, '', '   ')) {
+                $result = @{ schemaVersion = '2.0'; reviewerFeedback = 'Review.'; architectFeedback = 'Advice.'; fixerFeedback = 'Fix.' }
+                if ($null -eq $value) { $result.Remove($field) } else { $result[$field] = $value }
+                (Test-Throws { $result | ConvertTo-Json | Test-Json -SchemaFile $schemaPath -ErrorAction Stop }) | Should Be $true
+            }
+        }
+        foreach ($extra in @(@{ schemaVersion = '1.0' }, @{ accept = $true })) {
+            $result = @{ schemaVersion = '2.0'; reviewerFeedback = 'Review.'; architectFeedback = 'Advice.'; fixerFeedback = 'Fix.' }
+            foreach ($key in $extra.Keys) { $result[$key] = $extra[$key] }
+            (Test-Throws { $result | ConvertTo-Json | Test-Json -SchemaFile $schemaPath -ErrorAction Stop }) | Should Be $true
         }
     }
 
-    It "validates nonnegative integer intervals and keeps them outside the execution fingerprint" {
+    It "validates nonnegative integer starting thresholds and keeps them outside the execution fingerprint" {
         $repo = New-TestRepo (Join-Path $TestDrive 'critic-config-repo')
         $profilePath = New-TestConfig -Path (Join-Path $TestDrive 'critic-profile.psd1') `
             -LogRoot (Join-Path $TestDrive 'critic-logs')
         & (Get-Module CodexReviewLoop) {
             param($path, $r)
             $c = Import-ReviewLoopConfig -ConfigPath $path -RepoPath $r
-            $c.CriticInterval | Should Be 10
+            $c.CriticStartAfterReviews | Should Be 5
             (Get-ReviewLoopRoleConfig -Config $c -Role Critic).Model | Should Be 'gpt-5.6-sol'
             foreach ($valid in @(0, 1, 10, 20)) {
-                $c.CriticInterval = $valid
+                $c.CriticStartAfterReviews = $valid
                 Assert-ReviewLoopConfigValues -Config $c
             }
             foreach ($invalid in @(-1, 1.5, '10', $true, $null)) {
-                $c.CriticInterval = $invalid
+                $c.CriticStartAfterReviews = $invalid
                 $threw = $false
                 try { Assert-ReviewLoopConfigValues -Config $c } catch { $threw = $true }
                 $threw | Should Be $true
             }
             $before = Get-ReviewLoopExecutionFingerprint -ConfigPath $path
-            $text = (Get-Content -Raw $path).Replace('CriticInterval = 10', 'CriticInterval = 3')
+            $text = (Get-Content -Raw $path).Replace('CriticStartAfterReviews = 5', 'CriticStartAfterReviews = 3')
             Set-Content $path $text
             (Get-ReviewLoopExecutionFingerprint -ConfigPath $path) | Should Be $before
             $c = Import-ReviewLoopConfig -ConfigPath $path -RepoPath $r
             $c['__ConfigPath'] = $path
-            Set-Content $path ($text.Replace('CriticInterval = 3', 'CriticInterval = 7'))
+            Set-Content $path ($text.Replace('CriticStartAfterReviews = 3', 'CriticStartAfterReviews = 7'))
             Update-ReviewLoopLiveConfig -Config $c
-            $c.CriticInterval | Should Be 7
+            $c.CriticStartAfterReviews | Should Be 7
         } $profilePath $repo
+    }
+
+    It "migrates old enabled profiles without rewriting them and preserves explicit settings" {
+        $repo = New-TestRepo (Join-Path $TestDrive 'critic-migration-repo')
+        $path = New-TestConfig -Path (Join-Path $TestDrive 'critic-migration.psd1') `
+            -LogRoot (Join-Path $TestDrive 'critic-migration-logs')
+        $template = (Get-Content -Raw $path).Replace('CriticStartAfterReviews = 5', '{{SETTING}}')
+        & (Get-Module CodexReviewLoop) {
+            param($r, $p, $text)
+            $fingerprint = Get-ReviewLoopExecutionFingerprint -ConfigPath $p
+            foreach ($case in @(
+                @{ Text = ''; Expected = 5 },
+                @{ Text = 'CriticInterval = 0'; Expected = 0 },
+                @{ Text = 'CriticInterval = 10'; Expected = 5 },
+                @{ Text = 'CriticInterval = 27'; Expected = 5 },
+                @{ Text = "CriticInterval = 0; CriticStartAfterReviews = 7"; Expected = 7 },
+                @{ Text = "CriticInterval = 10; CriticStartAfterReviews = 0"; Expected = 0 }
+            )) {
+                Set-Content $p ($text.Replace('{{SETTING}}', $case.Text))
+                $before = Get-Content -Raw $p
+                $c = Import-ReviewLoopConfig -ConfigPath $p -RepoPath $r
+                Assert-ReviewLoopConfigValues $c
+                $c.CriticStartAfterReviews | Should Be $case.Expected
+                $c.ContainsKey('CriticInterval') | Should Be $false
+                (Get-Content -Raw $p) | Should Be $before
+                (Get-ReviewLoopExecutionFingerprint -ConfigPath $p) | Should Be $fingerprint
+            }
+            foreach ($invalid in @('-1', '1.5', "'10'", '$true', '$null', '2147483648')) {
+                Set-Content $p ($text.Replace('{{SETTING}}', "CriticInterval = $invalid; CriticStartAfterReviews = 5"))
+                $threw = $false
+                try { Import-ReviewLoopConfig -ConfigPath $p -RepoPath $r | Out-Null } catch { $threw = $true }
+                $threw | Should Be $true
+            }
+            Set-Content $p ($text.Replace('{{SETTING}}', 'CriticInterval = 0'))
+            $c = Import-ReviewLoopConfig -ConfigPath $p -RepoPath $r
+            $c['__ConfigPath'] = $p
+            Set-Content $p ($text.Replace('{{SETTING}}', 'CriticInterval = 10'))
+            Update-ReviewLoopLiveConfig $c
+            $c.CriticStartAfterReviews | Should Be 5
+        } $repo $path $template
     }
 
     It "keeps the Critic out of durable shared role sessions" {

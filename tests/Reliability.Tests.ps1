@@ -229,19 +229,20 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
     }
 
     It "defaults old profiles and resumes 41 reviews with one critique before any other model call" {
-        $config.CriticInterval | Should Be 10
+        $config.CriticStartAfterReviews | Should Be 5
         Add-CriticTestReviews -State $state -From 11 -To 41
         $state.PSObject.Properties.Remove('ActiveCriticCall')
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $result.Status | Should Be 'completed'
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
-        [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'critic-v1.schema.json'
-        @($calls | Where-Object schemaPath -match 'critic-v1').Count | Should Be 1
+        [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'critic-v2.schema.json'
+        @($calls | Where-Object schemaPath -match 'critic-v2').Count | Should Be 2
         $saved = Read-ReviewLoopState $statePath
         $critics = @($saved.RoleCalls | Where-Object Role -eq 'Critic')
-        $critics.Count | Should Be 1
+        $critics.Count | Should Be 2
         $critics[0].CoveredReviewCount | Should Be 41
+        $critics[1].CoveredReviewCount | Should Be 42
         $critics[0].Model | Should Be 'gpt-5.6-sol'
         $critics[0].Thinking | Should Be 'high'
         $saved.ReviewCycle | Should Be 43
@@ -251,30 +252,33 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
     }
 
     It "counts unique successful reviews and starts fresh critiques only when due" {
-        $state.RoleCalls[-1].Success = $false
+        $state.RoleCalls = @()
+        Add-CriticTestReviews -State $state -From 1 -To 4
         Add-CriticTestReviews -State $state -From 1 -To 1
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
-        Add-CriticTestReviews -State $state -From 10 -To 10
+        Add-CriticTestReviews -State $state -From 5 -To 6
+        $state.RoleCalls[-1].Success = $false
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
-        Add-CriticTestReviews -State $state -From 11 -To 19
+        Add-CriticTestReviews -State $state -From 6 -To 6
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
-        Add-CriticTestReviews -State $state -From 20 -To 20
+        Add-CriticTestReviews -State $state -From 7 -To 7
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
-        $calls.Count | Should Be 2
-        @($calls | Where-Object callKind -eq 'exec').Count | Should Be 2
+        $calls.Count | Should Be 3
+        @($calls | Where-Object callKind -eq 'exec').Count | Should Be 3
         $calls[1].prompt | Should Match 'Reviewer: examine'
         $calls[1].prompt | Should Match 'Architect: make'
+        $calls[1].prompt | Should Match 'Fixer: implement'
         @($state.RoleCalls | Where-Object Role -eq 'Critic' | Select-Object -ExpandProperty CoveredReviewCount) |
-            Should Be @(10, 20)
+            Should Be @(5, 6, 7)
     }
 
     It "defers newly due criticism at the invocation limit and runs it first on resume" {
         Set-Content $configPath ((Get-Content -Raw $configPath).Replace('MaxReviewCycles = 6', 'MaxReviewCycles = 1'))
-        $state.RoleCalls = @($state.RoleCalls | Where-Object CallId -ne 'review-10')
-        $state.ReviewCycle = 9
+        $state.RoleCalls = @()
+        Add-CriticTestReviews -State $state -From 1 -To 4
         Write-ReviewLoopState $statePath $state | Out-Null
         $first = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $first.Status | Should Be 'limit_reached'
@@ -284,21 +288,21 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $second = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $second.Status | Should Be 'completed'
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
-        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'critic-v1.schema.json'
+        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'critic-v2.schema.json'
         $calls[2].callKind | Should Be 'review'
         (Read-ReviewLoopState $statePath).CleanPasses | Should Be 2
     }
 
-    It "honors disabled and changed intervals without invalidating clean evidence" {
+    It "honors disabled and changed thresholds without invalidating clean evidence" {
         $state.CleanPasses = 1
         $state.CleanHead = $state.CurrentHead
-        $config.CriticInterval = 0
+        $config.CriticStartAfterReviews = 0
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
-        $config.CriticInterval = 11
+        $config.CriticStartAfterReviews = 11
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
-        $config.CriticInterval = 10
+        $config.CriticStartAfterReviews = 10
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         $state.CleanPasses | Should Be 1
         $state.CleanHead | Should Be $state.CurrentHead
@@ -336,7 +340,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
         $calls.Count | Should Be 5
         ($calls[1].arguments -join ' ') | Should Match 'every subsequent call to its recipient'
-        $calls[1].prompt | Should Match '"CriticInterval":10'
+        $calls[1].prompt | Should Match '"CriticStartAfterReviews":5'
         foreach ($index in @(2, 3)) {
             ($calls[$index].arguments -join ' ') | Should Match 'after 10 completed native reviews'
             ($calls[$index].arguments -join ' ') | Should Match 'may already have addressed specific points'
@@ -354,7 +358,79 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $savedCritique.StructuredResult.architectFeedback | Should Be 'Architect: make coherent decisions.'
     }
 
+    It "delivers only Fixer feedback on resumed calls and requalifies cached Fixer results" {
+        $invokeFixer = {
+            param($c, $s, $p, $r, $logs, $cli)
+            Invoke-ConfiguredCodexRole -Config $c -Role Fixer -RepoPath $r -Speed standard `
+                -Prompt 'Current fix' -LogRoot $logs -SchemaName fixer-result-v3.schema.json `
+                -CallId fix -State $s -StatePath $p -CodexPath $cli
+        }
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fix fixer-thread
+        & (Get-Module CodexReviewLoop) $invokeFixer $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
+        $state.RoleCalls[-1].CriticId | Should Be 'critic-0010'
+        & (Get-Module CodexReviewLoop) $invokeFixer $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
+        Add-CriticTestReviews -State $state -From 11 -To 11
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        & (Get-Module CodexReviewLoop) $invokeFixer $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $calls.Count | Should Be 4
+        $calls[1].callKind | Should Be 'resume'
+        $calls[1].resumeThreadId | Should Be 'fixer-thread'
+        foreach ($i in @(1, 3)) {
+            ($calls[$i].arguments -join ' ') | Should Match 'Fixer: implement'
+            ($calls[$i].arguments -join ' ') | Should Not Match 'Reviewer: examine|Architect: make'
+            ($calls[$i].arguments -join ' ') | Should Match 'may already have addressed specific points'
+        }
+        $calls[2].prompt | Should Match 'Fixer: implement'
+        $calls[2].prompt | Should Match 'Reviewer: examine'
+        $calls[2].prompt | Should Match 'Architect: make'
+        @($state.RoleCalls | Where-Object Role -eq Fixer | Select-Object -ExpandProperty CriticId) |
+            Should Be @('critic-0010', 'critic-0011')
+    }
+
+    It "retains old two-recipient criticism without inventing Fixer feedback" {
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        $legacy = $state.RoleCalls[-1]
+        $legacy.StructuredResult.PSObject.Properties.Remove('fixerFeedback')
+        $legacy.StructuredResult.schemaVersion = '1.0'
+        $before = $legacy.StructuredResult | ConvertTo-Json -Compress
+        Write-ReviewLoopState $statePath $state | Out-Null
+        $state = Read-ReviewLoopState $statePath
+        & (Get-Module CodexReviewLoop) {
+            param($c, $s, $p, $r, $logs, $cli)
+            Invoke-ConfiguredCodexRole -Config $c -Role Fixer -RepoPath $r -Speed standard `
+                -Prompt 'Fix' -LogRoot $logs -SchemaName fixer-result-v3.schema.json `
+                -CallId legacy-fix -State $s -StatePath $p -CodexPath $cli | Out-Null
+            Invoke-ConfiguredCodexRole -Config $c -Role Architect -RepoPath $r -Speed standard `
+                -Prompt 'Advice' -LogRoot $logs -SchemaName architecture-advice-v2.schema.json `
+                -CallId legacy-advice -State $s -StatePath $p -CodexPath $cli | Out-Null
+        } $config $state $statePath $repo $runRoot $fakeCodex
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        ($calls[1].arguments -join ' ') | Should Not Match 'Latest Critic feedback|Reviewer: examine|Architect: make'
+        ($calls[2].arguments -join ' ') | Should Match 'Architect: make'
+        @($state.RoleCalls | Where-Object Role -eq Fixer)[0].CriticId | Should Be ''
+        @($state.RoleCalls | Where-Object Role -eq Critic)[0].StructuredResult |
+            ConvertTo-Json -Compress | Should Be $before
+    }
+
+    It "waits through unfinished phases and repeated assessments until the cycle boundary" {
+        foreach ($stage in @('reviewing', 'reviewed', 'cluster_selected', 'strategy_ready', 'fixing',
+            'fix_attempted', 'testing', 'tested', 'test_failed', 'verified', 'gate_failed',
+            'commit_preparing', 'commit_pending', 'lessons_learned_analyzing')) {
+            $state.Stage = $stage
+            Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+            Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        }
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        $state.Stage = 'fix_committed'
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 1
+    }
+
     It "preserves and resumes an interrupted Architect with its new feedback" {
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Architect advice
         $before = $state.ActiveRoleCall | ConvertTo-Json -Compress
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
@@ -378,6 +454,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $state.Stage = 'fixing'
         $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fix
         Set-Content (Join-Path $repo 'README.txt') 'unfinished fixer patch'
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010
         $before = $state.ActiveRoleCall | ConvertTo-Json -Compress
         $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = '1'
         $env:CODEX_REVIEW_LOOP_FAKE_STDERR = 'technical failure'
@@ -385,6 +462,8 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         ($state.ActiveRoleCall | ConvertTo-Json -Compress) | Should Be $before
         $state.Stage | Should Be 'fixing'
         $state.RoleCalls[-1].Success | Should Be $false
+        $criticThread = $state.ActiveCriticCall.ThreadId
+        $criticThread | Should Not BeNullOrEmpty
         $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ''
         $env:CODEX_REVIEW_LOOP_FAKE_STDERR = ''
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
@@ -392,7 +471,13 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'unfinished fixer patch'
         $state.RoleCalls[-1].CoveredReviewCount | Should Be 10
         $last = Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
-        $last.prompt | Should Match '"UnfinishedFixerWork":true'
+        $last.callKind | Should Be 'resume'
+        $last.resumeThreadId | Should Be $criticThread
+        $saved = Read-ReviewLoopState $statePath
+        $saved.ActiveCriticCall | Should BeNullOrEmpty
+        $saved.RoleCalls[-1].StructuredResult.reviewerFeedback | Should Not BeNullOrEmpty
+        $saved.RoleCalls[-1].StructuredResult.architectFeedback | Should Not BeNullOrEmpty
+        $saved.RoleCalls[-1].StructuredResult.fixerFeedback | Should Not BeNullOrEmpty
     }
 
     It "recovers an interrupted critique independently and does not repeat a saved success" {
@@ -420,7 +505,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
     }
 
     It "rejects a Critic mutation without accepting feedback or cleaning the worktree" {
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = 'critic-v1.schema.json'
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = 'critic-v2.schema.json'
         (Test-ReliabilityThrows { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }) | Should Be $true
         @($state.RoleCalls | Where-Object Role -eq 'Critic').Count | Should Be 0
         Test-Path (Join-Path $repo 'fake-review-loop-change.test.txt') | Should Be $true
@@ -428,7 +513,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
     }
 
     It "rejects incomplete structured feedback as a technical failure" {
-        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = '{"schemaVersion":"1.0","reviewerFeedback":"Only one recipient."}'
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = '{"schemaVersion":"2.0","reviewerFeedback":"Review.","architectFeedback":"Advice."}'
         (Test-ReliabilityThrows { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }) | Should Be $true
         @($state.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.Success }).Count | Should Be 0
         $state.ReviewCycle | Should Be 10
@@ -439,6 +524,8 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $state.ActiveFindingIds = @('owned-finding')
         $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fix
         Set-Content (Join-Path $repo 'README.txt') 'unfinished patch'
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010
+        $state.ActiveCriticCall | Add-Member -NotePropertyName SchemaName -NotePropertyValue critic-v1.schema.json
         Write-ReviewLoopState $statePath $state | Out-Null
         $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = '124'
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
@@ -447,6 +534,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $saved = Read-ReviewLoopState $statePath
         $saved.Stage | Should Be 'fixing'
         $saved.ActiveRoleCall.Role | Should Be 'Fixer'
+        $saved.ActiveCriticCall.SchemaName | Should Be 'critic-v2.schema.json'
         $saved.BlockedCleanup | Should BeNullOrEmpty
         @($saved.RoleCalls | Where-Object Role -eq 'Critic').Count | Should Be 1
         $saved.RoleCalls[-1].Attempts.Count | Should Be 3
@@ -468,7 +556,24 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (& git -C $repo diff --cached --name-only) | Should Be 'README.txt'
     }
 
-    It "resumes a dirty interrupted Fixer after a tool update with the Critic first" {
+    It "finishes an interrupted native review after a tool update before new criticism" {
+        $state.Stage = 'reviewing'
+        $state.ReviewCycle = 11
+        $state.ExecutionFingerprint = 'old-tool'
+        Write-ReviewLoopState $statePath $state | Out-Null
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
+        $result.Status | Should Be 'completed'
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $calls.Count | Should Be 3
+        $calls[0].callKind | Should Be 'review'
+        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'critic-v2.schema.json'
+        $calls[2].callKind | Should Be 'review'
+        $saved = Read-ReviewLoopState $statePath
+        @($saved.RoleCalls | Where-Object Role -eq Critic)[0].CoveredReviewCount | Should Be 11
+        $saved.ReviewCycle | Should Be 12
+    }
+
+    It "finishes a dirty interrupted Fixer and repeated assessment after a tool update before new criticism" {
         $ledger = New-ReviewLoopLedger -RepoPath $repo
         Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
             -ReviewId review-10 -Head $state.CurrentHead | Out-Null
@@ -488,10 +593,13 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Write-ReviewLoopState $statePath $state | Out-Null
         $sequencePath = Join-Path $case.Root 'updated-fixer-results.json'
         Write-ReliabilityJsonArray -Path $sequencePath -Values @(
-            '{"schemaVersion":"1.0","reviewerFeedback":"Reviewer: examine the work.","architectFeedback":"Architect: make coherent decisions."}',
             '{"schemaVersion":"3.0","summary":"Finished preserved work.","targetedTest":{"available":true,"executable":"pwsh","arguments":["-NoProfile","-Command","exit 0"]}}',
+            '{"schemaVersion":"1.0","accept":false,"summary":"One correction remains.","feedback":["Complete the agreed solution."],"commitMessage":{"subject":"Finish preserved work","rationale":"Correction needed.","changes":["Finish the interrupted fix."]}}',
+            '{"schemaVersion":"3.0","summary":"Corrected preserved work.","targetedTest":{"available":true,"executable":"pwsh","arguments":["-NoProfile","-Command","exit 0"]}}',
             '{"schemaVersion":"1.0","accept":true,"summary":"Accepted preserved work.","feedback":[],"commitMessage":{"subject":"Finish preserved work","rationale":"Current checks passed.","changes":["Finish the interrupted fix."]}}',
+            '{"schemaVersion":"2.0","reviewerFeedback":"Reviewer: examine the work.","architectFeedback":"Architect: make coherent decisions.","fixerFeedback":"Fixer: keep focused."}',
             'No actionable findings.',
+            '{"schemaVersion":"2.0","reviewerFeedback":"Reviewer: examine the work.","architectFeedback":"Architect: make coherent decisions.","fixerFeedback":"Fixer: keep focused."}',
             'No actionable findings.'
         )
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequencePath
@@ -500,12 +608,14 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
 
         $result.Status | Should Be 'completed'
         $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
-        [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'critic-v1.schema.json'
-        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'fixer-result-v3.schema.json'
-        $calls[1].callKind | Should Be 'resume'
-        $calls[1].resumeThreadId | Should Be 'preserved-fixer-thread'
-        [IO.Path]::GetFileName($calls[2].schemaPath) | Should Be 'architecture-assessment-v1.schema.json'
-        ($calls[2].arguments -join ' ') | Should Match 'Architect: make'
+        [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'fixer-result-v3.schema.json'
+        $calls[0].callKind | Should Be 'resume'
+        $calls[0].resumeThreadId | Should Be 'preserved-fixer-thread'
+        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'architecture-assessment-v1.schema.json'
+        [IO.Path]::GetFileName($calls[2].schemaPath) | Should Be 'fixer-result-v3.schema.json'
+        [IO.Path]::GetFileName($calls[3].schemaPath) | Should Be 'architecture-assessment-v1.schema.json'
+        [IO.Path]::GetFileName($calls[4].schemaPath) | Should Be 'critic-v2.schema.json'
+        ($calls[1].arguments -join ' ') | Should Not Match 'Architect: make'
         (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved unfinished work'
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         (Read-ReviewLoopLedger -Path $paths.LedgerPath).Findings[0].Status | Should Be 'resolved'

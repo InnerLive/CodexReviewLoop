@@ -85,21 +85,24 @@ should never be placed in model-visible command output.
 
 ## Resume and `-NewRun`
 
-Overdue Critic feedback runs as the first new model call on resume, after
-repository validation and necessary technical recovery. Old profiles and runs
-need no manual conversion: a run with 41 completed native reviews and no prior
-critique receives one critique of the whole run immediately, then another after
-ten further completed reviews. Missed intervals are not replayed individually,
-and immediately resuming again does not repeat successful criticism.
+Resume finishes an interrupted review/fix round, including assessment, gates,
+and commit recovery, before starting a new critique. At a completed cycle
+boundary, overdue criticism precedes the next review. Old profiles and runs
+need no manual conversion: a ready run with 41 completed native reviews and no
+prior critique receives one critique of the whole run, then another at 42.
+Missed critiques are not replayed individually, and immediately resuming again
+does not repeat successful criticism.
 
 An interrupted Fixer with a resumable thread keeps its unfinished patch after a
 tool update. Its resumed result must pass the current Architect assessment,
 tests, and commit gates before it can be accepted.
 
 Use the same resume command and existing Reviewer-instruction override as
-before. No special Critic switch or `-NewRun` is needed. A resumable unfinished
-Fixer patch is identified as incomplete evidence and preserved while the Critic
-runs. Unknown changes and violated repository invariants still prevent unsafe
+before. No special Critic switch or `-NewRun` is needed. An already interrupted
+Critic call is recovered independently, even if a legacy checkpoint holds
+unfinished Fixer work alongside it. That patch remains incomplete evidence and
+is preserved. A tool update requalifies the pending critique under the current
+three-recipient contract. Unknown changes and violated repository invariants still prevent unsafe
 resume. Critic failures retain both checkpoints and never discard Fixer work;
 after the existing technical retries, the run stops with diagnostics rather
 than silently skipping the due critique.

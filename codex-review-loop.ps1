@@ -7,9 +7,10 @@ All model interactions run exclusively through the locally installed Codex CLI.
 The loop reviews the branch, applies verified fixes, and only completes after
 the number of clean passes configured in the profile.
 
-CriticInterval defaults to 10 completed native reviews across the durable run.
-Overdue Critic feedback runs first when resuming an existing long run, after
-technical recovery and repository validation. No extra resume switch is needed.
+CriticStartAfterReviews defaults to 5 completed native reviews across the durable
+run. The Critic then advises Reviewer, Architect, and Fixer after every finished
+review/fix round. Resume finishes interrupted work before new criticism.
+Zero disables new critiques. Old enabled profiles adopt the new default.
 
 ConfigPath is optional. Without an explicit path, profiles are resolved in this
 order:
