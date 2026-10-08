@@ -1,107 +1,70 @@
 # Codex Review Loop
 
-**Turn AI-generated branch changes into professionally reviewed, tested, and
-verified code.**
+**Ask Codex to review its changes, fix the problems, and verify the result.**
 
-Codex Review Loop uses Codex's native review function on the complete branch
-diff, lets free Architect and Fixer roles choose the solution, asks the same
-Architect to accept or reject the result, runs the repository's quality gates, and commits only
-accepted work. It repeats unattended until the branch is demonstrably clean.
-Starting after five completed reviews by default, an independent Critic gives
-Reviewer, Architect, and Fixer separate feedback on their working practices
-after every finished review/fix round. Resume completes interrupted work before
-new criticism; overdue feedback precedes the next review at a cycle boundary.
-After enough verified loop commits, it can also extract evidence-backed lessons
-into repository guidance before declaring the run complete.
+Codex Review Loop checks the changes on your branch, corrects findings, and
+runs your project's quality checks before committing accepted work. It repeats
+the process until the required reviews are clean. A Critic helps the roles
+improve their working practices; longer runs can also turn lessons learned
+into useful project guidance.
 
-## What it does
+## Set up once
 
-1. Runs native Codex review without a positional reviewer prompt or JSON schema;
-   optional supplemental developer instructions may come from the profile or CLI.
-2. Recognizes clear results locally and asks a small Luna helper only when the
-   review text is ambiguous.
-3. Passes review output containing findings unchanged to an Architect.
-4. Passes the Architect's advice unchanged to a Fixer.
-5. Lets the same Architect directly accept the solution or return feedback to the Fixer.
-6. Executes configured host gates and commits the exact accepted tree.
-7. Starts a new native review instead of blocking when a Fixer round is
-   exhausted.
-8. Repeats until the configured number of reviews are clean on the same
-   unchanged `HEAD` (two is the recommended default).
-9. Before completion, conditionally analyzes verified loop commits for durable
-   `AGENTS.md` or repository-skill guidance.
-10. Sends any retrospective guidance changes through the same Architect advice, Fixer, assessment,
-    host-gate, and commit path. An accepted solution is the final cycle by
-    default; profiles may opt into clean native reviews after a real commit.
+You need Windows, PowerShell 7, Git, and an installed Codex CLI that you have
+signed in to.
 
-## Requirements
-
-- Windows with PowerShell 7
-- Git
-- A locally installed and authenticated Codex CLI
-- A clean Git worktree when starting a new run
-
-## Quick start
-
-> [!WARNING]
-> Codex runs unattended with approval and sandbox checks bypassed. The loop may
-> edit and commit the target repository. Use a dedicated branch with a clean
-> worktree, and make sure the profile's `HostGates` cover the checks your project
-> requires.
+Clone this repository wherever you want to keep it, open PowerShell in that
+folder, and run:
 
 ```powershell
-git clone https://github.com/InnerLive/CodexReviewLoop.git C:\Tools\CodexReviewLoop
-Set-Location C:\Tools\CodexReviewLoop
-
-pwsh -File .\codex-review-loop.ps1 -RepoPath C:\dev\MyProject
+pwsh -File .\install-skills.ps1
 ```
 
-The first invocation finds an existing profile or creates a commented one and
-starts the run. By default, the loop uses the cost-conscious `standard` speed
-and compact terminal output.
+This installs both skills and remembers where the ReviewLoop repository is.
+Keep that folder available. After updating or moving it, run the installer
+again. Restart Codex if the skills do not appear.
 
-Use `ReviewerInstructions` in the profile for repository-specific guidance, or
-pass `-ReviewerInstructions '<text>'` for one invocation. An explicitly passed
-value wins, and `-ReviewerInstructions ''` disables the profile value.
+## Use it naturally
 
-The latest compatible checkpoint is resumed automatically. Use `-NewRun` only
-when you deliberately want a fresh run; the finding ledger is retained.
-Resume inherits the checkpoint's service tier unless `-Speed standard|fast` is
-passed explicitly to change subsequent calls in that same run.
+In the project where Codex has been working, just say:
 
-During unattended runs Windows is kept awake without keeping the display on or
-changing update policy. Long-running roles and tests are limited by inactivity,
-not by their total duration; the generated profile recommends 30 minutes.
+> Run ReviewLoop for your changes.
 
-Normal invocations print only the human dashboard. Automation can request one
-machine-readable result document and no terminal dashboard with `-Json`.
+Codex uses the current task to prepare the review and finds the tool through
+the installed skill. You do not need to provide a path, name the skill, or
+write a command. Existing compatible runs resume automatically.
 
-## Learn more
+> [!WARNING]
+> The loop runs unattended with approval and sandbox checks bypassed. It can
+> change files and create commits. Start a new run on a dedicated branch with
+> a clean working tree, and make sure your project's quality checks are configured.
 
-- [How the loop works](docs/how-it-works.md)
-- [Profiles and configuration](docs/configuration.md)
-- [Running, monitoring, and recovery](docs/operations.md)
+The included [prompting skill](skills/prompting/SKILL.md) is used automatically
+when you ask Codex to write or improve prompts, skills, or agent instructions.
+No special invocation is needed. The [review-loop skill](skills/review-loop/SKILL.md)
+handles preparing and running reviews when you ask for them.
 
-## Optional global working agreements
+## Optional working agreements
 
-The repository includes a small set of reusable Codex working agreements in
-[`docs/smallest-complete-work.md`](docs/smallest-complete-work.md). Install or
-refresh them at the beginning of your global `AGENTS.md` with either script:
+You can also give Codex a small set of general working agreements: preserve
+your goals, keep solutions as small as they can reasonably be, and avoid
+unnecessary work. Install them with:
 
 ```powershell
 pwsh -File .\install-global-agents.ps1
 ```
 
-```bash
-bash ./install-global-agents.sh
-```
+The installer preserves your other instructions. Read the
+[working agreements](docs/smallest-complete-work.md) before installing them.
 
-The installers use `$CODEX_HOME/AGENTS.md` when `CODEX_HOME` is set and
-`~/.codex/AGENTS.md` otherwise. They preserve other content, update their
-managed block without duplicating it, and warn when a non-empty global
-`AGENTS.override.md` prevents Codex from loading `AGENTS.md`.
+## More detail when you need it
 
-For the complete command reference:
+- [How reviews, fixes, and verification work](docs/how-it-works.md)
+- [Project settings and quality checks](docs/configuration.md)
+- [Running, resuming, and troubleshooting](docs/operations.md)
+- [How Codex discovers skills](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
+
+For direct command-line use:
 
 ```powershell
 pwsh -File .\codex-review-loop.ps1 -Help
