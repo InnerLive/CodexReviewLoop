@@ -1,6 +1,6 @@
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$powerShellInstaller = Join-Path $root "install-global-agents.ps1"
-$bashInstaller = Join-Path $root "install-global-agents.sh"
+$powerShellInstaller = Join-Path $root "install-working-agreements.ps1"
+$bashInstaller = Join-Path $root "install-working-agreements.sh"
 $rulesPath = Join-Path $root "docs\smallest-complete-work.md"
 $startMarker = "<!-- codex-smallest-complete-work:start -->"
 $endMarker = "<!-- codex-smallest-complete-work:end -->"
@@ -12,7 +12,7 @@ if ($null -eq $bashPath -and -not $IsWindows) {
     $bashPath = (Get-Command bash -ErrorAction SilentlyContinue).Source
 }
 
-Describe "Global AGENTS.md installers" {
+Describe "Working agreements installers" {
     BeforeEach {
         $originalCodexHome = $env:CODEX_HOME
         $codexHome = Join-Path $TestDrive (

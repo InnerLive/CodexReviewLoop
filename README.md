@@ -51,7 +51,7 @@ your goals, keep solutions as small as they can reasonably be, and avoid
 unnecessary work. Install them with:
 
 ```powershell
-pwsh -File .\install-global-agents.ps1
+pwsh -File .\install-working-agreements.ps1
 ```
 
 The installer preserves your other instructions. Read the
