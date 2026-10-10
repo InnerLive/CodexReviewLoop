@@ -103,7 +103,10 @@ Critic call is recovered independently, even if a legacy checkpoint holds
 unfinished Fixer work alongside it. That patch remains incomplete evidence and
 is preserved. A tool update requalifies the pending critique under the current
 three-recipient contract. Unknown changes and violated repository invariants still prevent unsafe
-resume. Critic failures retain both checkpoints and never discard Fixer work;
+resume outside the Critic transaction. Critic changes are discarded before
+feedback is consumed, including index-only changes. Interrupted calls restore
+their saved repository state before the normal resume checks and continue in
+the same Critic thread. Critic failures retain both checkpoints and never discard Fixer work;
 after the existing technical retries, the run stops with diagnostics rather
 than silently skipping the due critique.
 
@@ -182,6 +185,14 @@ Successful cleanup is intentionally absent from terminal output. A cleanup
 that cannot reproduce the exact clean checkpoint stops safely and remains
 idempotently resumable. Other local refs, ignored files, and modified submodule
 worktrees are not cleaned automatically.
+
+Critic calls use the same recovery locator, including when a Critic switches
+branches. Their additional backup restores local refs, the original index,
+and unfinished Fixer files. Older Critic checkpoints without a file backup
+can restore a clean worktree or an index-only change while preserving matching
+Fixer file contents. If an old dirty checkpoint's file contents or refs differ,
+the loop stops because those original bytes cannot be reconstructed safely.
+Ignored files and modified submodule worktrees remain outside automatic cleanup.
 
 Use `-NewRun` when you deliberately want a new run checkpoint. It still
 requires a clean worktree, respects the repository lock, and keeps compatible

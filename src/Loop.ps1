@@ -513,13 +513,16 @@ function Get-ReviewLoopReviewerRecoveryStatePath {
     }
 
     $state = Read-ReviewLoopState -Path $resolvedStatePath
-    $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
+    $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveCriticCall"
+    if ($null -eq $active) {
+        $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
+    }
     if (-not (Test-ReviewLoopSamePath -Left ([string]$state.RepoPath) -Right $RepoPath) -or
         ($PSBoundParameters.ContainsKey("ReviewBaseSetting") -and
             [string]$state.ReviewBaseSetting -ne $ReviewBaseSetting)) {
         throw "Reviewer recovery checkpoint does not match this repository invocation."
     }
-    if ($null -eq $active -or [string]$active.Role -ne "Reviewer" -or
+    if ($null -eq $active -or [string]$active.Role -notin @("Reviewer", "Critic") -or
         -not (Test-ReviewLoopStateCanResume -State $state)) {
         Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
         return ""
@@ -567,9 +570,13 @@ function Restore-ReviewLoopReviewerRepository {
     }
 
     $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    $baselineIndex = [string](Get-ReviewLoopObjectProperty `
+        -Object $Recovery -Name "IndexFingerprint" -Default "")
     if ([string]$current.Head -eq $baselineHead -and
         [string]$current.Fingerprint -eq $baselineFingerprint -and
-        [string]$current.HeadRef -eq $baselineHeadRef) {
+        [string]$current.HeadRef -eq $baselineHeadRef -and
+        ([string]::IsNullOrWhiteSpace($baselineIndex) -or
+            [string]$current.IndexFingerprint -eq $baselineIndex)) {
         return
     }
 
@@ -669,6 +676,161 @@ function Complete-ReviewLoopInterruptedReviewerRecovery {
     Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
     return $true
+}
+
+function New-ReviewLoopCriticRepositoryBackup {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$LogRoot,
+        [object]$Snapshot = (Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath)
+    )
+
+    $root = Join-Path (Join-Path $LogRoot "critic-recovery") ([Guid]::NewGuid().ToString("N"))
+    [System.IO.Directory]::CreateDirectory($root) | Out-Null
+    $entries = @(
+        foreach ($path in @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)) {
+            $source = Assert-ReviewLoopPathWithoutReparsePoints `
+                -RootPath $RepoPath -RelativePath $path -Description "Critic checkpoint"
+            $exists = Test-Path -LiteralPath $source -PathType Leaf
+            if ((Test-Path -LiteralPath $source) -and -not $exists) {
+                throw "Critic checkpoint cannot preserve a non-file path: $path"
+            }
+            $hash = ""
+            if ($exists) {
+                $saved = Join-Path (Join-Path $root "files") $path
+                [System.IO.Directory]::CreateDirectory((Split-Path -Parent $saved)) | Out-Null
+                [System.IO.File]::Copy($source, $saved)
+                $hash = (Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash
+                if ($hash -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+                    throw "Critic checkpoint could not preserve file '$path'."
+                }
+            }
+            [pscustomobject]@{ Path = $path; Exists = $exists; Sha256 = $hash }
+        }
+    )
+    $indexPath = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "--git-path", "index")
+    if (-not [System.IO.Path]::IsPathRooted($indexPath)) { $indexPath = Join-Path $RepoPath $indexPath }
+    $savedIndex = Join-Path $root "index"
+    [System.IO.File]::Copy($indexPath, $savedIndex)
+    $refs = @(& git -C $RepoPath for-each-ref "--format=%(refname) %(objectname) %(symref)" 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "Git could not preserve Critic checkpoint refs." }
+    $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ((ConvertTo-ReviewLoopJsonCompact $Snapshot) -ne (ConvertTo-ReviewLoopJsonCompact $current)) {
+        throw "The repository changed while preserving the Critic checkpoint."
+    }
+    return [pscustomobject]@{
+        Root = $root
+        IndexSha256 = (Get-FileHash -LiteralPath $savedIndex -Algorithm SHA256).Hash
+        Entries = $entries
+        Refs = $refs
+    }
+}
+
+function Invoke-ReviewLoopCriticRepositoryRecovery {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object]$Recovery
+    )
+
+    try {
+        $backup = Get-ReviewLoopObjectProperty -Object $Recovery -Name "RepositoryBackup"
+        if ($null -eq $backup) {
+            # Old clean checkpoints can recover without a backup. Dirty ones cannot
+            # reconstruct changed Fixer bytes, so retain the original safety boundary.
+            if ([string]$Recovery.WorktreeFingerprint -eq (Get-ReviewLoopSha256 "")) {
+                Restore-ReviewLoopReviewerRepository -RepoPath $RepoPath -Recovery $Recovery
+            }
+            $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+            if ([string]$current.Head -ne [string]$Recovery.RepositoryHead -or
+                [string]$current.HeadRef -ne [string]$Recovery.RepositoryHeadRef -or
+                [string]$current.RefsFingerprint -ne [string]$Recovery.RefsFingerprint -or
+                [string]$current.Fingerprint -ne [string]$Recovery.WorktreeFingerprint) {
+                throw "Interrupted Critic checkpoint no longer matches the repository state; its original files were not backed up."
+            }
+            # An index-only legacy mutation is disposable; keep the worktree intact.
+            if ([string]$current.IndexFingerprint -ne [string]$Recovery.IndexFingerprint) {
+                Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("read-tree", [string]$Recovery.RepositoryHead) | Out-Null
+            }
+            if ((Get-ReviewLoopGitIndexFingerprint -RepoPath $RepoPath) -ne [string]$Recovery.IndexFingerprint) {
+                throw "The original Critic index cannot be reconstructed without its backup."
+            }
+            return
+        }
+
+        $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        if ([string]$current.Head -eq [string]$Recovery.RepositoryHead -and
+            [string]$current.HeadRef -eq [string]$Recovery.RepositoryHeadRef -and
+            [string]$current.RefsFingerprint -eq [string]$Recovery.RefsFingerprint -and
+            [string]$current.IndexFingerprint -eq [string]$Recovery.IndexFingerprint -and
+            [string]$current.Fingerprint -eq [string]$Recovery.WorktreeFingerprint) { return }
+
+        $savedIndex = Assert-ReviewLoopPathWithoutReparsePoints `
+            -RootPath ([string]$backup.Root) -RelativePath "index" -Description "Critic recovery backup"
+        if ((Get-FileHash -LiteralPath $savedIndex -Algorithm SHA256).Hash -ne [string]$backup.IndexSha256) {
+            throw "Critic recovery index failed its integrity check."
+        }
+        foreach ($entry in @($backup.Entries)) {
+            if (-not $entry.Exists) { continue }
+            $saved = Assert-ReviewLoopPathWithoutReparsePoints `
+                -RootPath (Join-Path $backup.Root "files") -RelativePath $entry.Path -Description "Critic recovery backup"
+            if ((Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash -ne [string]$entry.Sha256) {
+                throw "Critic recovery file failed its integrity check: $($entry.Path)"
+            }
+        }
+        $cleanRecovery = [pscustomobject]@{
+            RepositoryHead = $Recovery.RepositoryHead
+            RepositoryBranch = $Recovery.RepositoryBranch
+            RepositoryHeadRef = $Recovery.RepositoryHeadRef
+            WorktreeFingerprint = Get-ReviewLoopSha256 ""
+            IndexFingerprint = $Recovery.IndexFingerprint
+        }
+        Restore-ReviewLoopReviewerRepository -RepoPath $RepoPath -Recovery $cleanRecovery
+        $baselineRefs = @{}
+        foreach ($line in @($backup.Refs)) {
+            $name, $value, $target = ([string]$line).Split(' ', 3)
+            $baselineRefs[$name] = [pscustomobject]@{ Value = $value; Target = $target }
+        }
+        $currentRefs = @(& git -C $RepoPath for-each-ref "--format=%(refname) %(objectname)" 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw "Git could not inspect Critic recovery refs." }
+        foreach ($line in $currentRefs) {
+            $name, $value = ([string]$line).Split(' ', 2)
+            if (-not $baselineRefs.ContainsKey($name)) {
+                Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("update-ref", "--no-deref", "-d", $name, $value) | Out-Null
+            }
+        }
+        foreach ($name in $baselineRefs.Keys) {
+            $reference = $baselineRefs[$name]
+            $arguments = if ([string]::IsNullOrWhiteSpace([string]$reference.Target)) {
+                @("update-ref", "--no-deref", $name, $reference.Value)
+            } else { @("symbolic-ref", $name, $reference.Target) }
+            Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments $arguments | Out-Null
+        }
+        foreach ($entry in @($backup.Entries)) {
+            $destination = Assert-ReviewLoopPathWithoutReparsePoints `
+                -RootPath $RepoPath -RelativePath $entry.Path -Description "Critic recovery"
+            if ($entry.Exists) {
+                [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+                [System.IO.File]::Copy((Join-Path (Join-Path $backup.Root "files") $entry.Path), $destination, $true)
+            }
+            elseif (Test-Path -LiteralPath $destination -PathType Leaf) { [System.IO.File]::Delete($destination) }
+        }
+        $indexPath = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "--git-path", "index")
+        if (-not [System.IO.Path]::IsPathRooted($indexPath)) { $indexPath = Join-Path $RepoPath $indexPath }
+        [System.IO.File]::Copy($savedIndex, $indexPath, $true)
+        $restored = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        if ([string]$restored.Head -ne [string]$Recovery.RepositoryHead -or
+            [string]$restored.HeadRef -ne [string]$Recovery.RepositoryHeadRef -or
+            [string]$restored.RefsFingerprint -ne [string]$Recovery.RefsFingerprint -or
+            [string]$restored.IndexFingerprint -ne [string]$Recovery.IndexFingerprint -or
+            [string]$restored.Fingerprint -ne [string]$Recovery.WorktreeFingerprint) {
+            throw "Critic cleanup did not restore the exact repository checkpoint."
+        }
+    }
+    catch {
+        throw (New-ReviewLoopFailureException `
+            -Message "Automatic Critic cleanup could not restore the saved repository checkpoint: $($_.Exception.Message)" `
+            -NextSteps @("Correct the reported Git or filesystem problem, then run the same command again without editing the checkpoint."))
+    }
 }
 
 function Assert-ReviewLoopRepositoryUnchanged {
@@ -3788,6 +3950,9 @@ function Invoke-ReviewLoopCriticGate {
             return
         }
     }
+    else {
+        Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $RepoPath -Recovery $pending
+    }
     $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
     $finished = Get-ReviewLoopLessonsLearnedFinalCompletion -State $State
     if ($null -eq $pending -and ($finished.CompletionAllowed -or (
@@ -4184,6 +4349,9 @@ function Invoke-ReviewLoopCore {
             -RepoPath $repo | Out-Null
         Complete-ReviewLoopInterruptedReviewerRecovery `
             -State $state -StatePath $statePath -RepoPath $repo | Out-Null
+        if ($null -ne $state.ActiveCriticCall) {
+            Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $repo -Recovery $state.ActiveCriticCall
+        }
         $branch = [string]$state.Branch
         Assert-ReviewLoopResumeInvariant `
             -State $state `

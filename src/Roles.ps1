@@ -253,6 +253,10 @@ function Invoke-ConfiguredCodexRole {
         }
     }
     if ($null -ne $pending) {
+        if ($Role -eq "Critic") {
+            Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $RepoPath -Recovery $pending
+            $pending | Add-Member -Force -NotePropertyName SchemaName -NotePropertyValue $SchemaName
+        }
         $pendingSnapshot = [pscustomobject]@{
             Head = [string](Get-ReviewLoopObjectProperty `
                 -Object $pending -Name "RepositoryHead" -Default "")
@@ -260,15 +264,6 @@ function Invoke-ConfiguredCodexRole {
                 -Object $pending -Name "WorktreeFingerprint" -Default "")
         }
         $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-        if ($Role -eq "Critic" -and (
-            [string]$pending.RepositoryBranch -ne [string]$currentSnapshot.Branch -or
-            [string]$pending.RepositoryHeadRef -ne [string]$currentSnapshot.HeadRef -or
-            [string]$pending.RefsFingerprint -ne [string]$currentSnapshot.RefsFingerprint -or
-            [string]$pending.IndexFingerprint -ne [string]$currentSnapshot.IndexFingerprint -or
-            [string]$pendingSnapshot.Head -ne [string]$currentSnapshot.Head -or
-            [string]$pendingSnapshot.Fingerprint -ne [string]$currentSnapshot.Fingerprint)) {
-            throw "Interrupted Critic checkpoint no longer matches the repository state."
-        }
         $pendingExecution = [string](Get-ReviewLoopObjectProperty `
             -Object $pending -Name "ExecutionFingerprint" -Default "")
         $legacyVerifierTransition = (
@@ -289,13 +284,18 @@ function Invoke-ConfiguredCodexRole {
             $pending = $null
         }
         elseif ($pendingExecution -ne $executionFingerprint) {
-            if ($Role -eq "Fixer" -and [string]$pending.Role -eq "Fixer" -and
+            if ($Role -eq "Critic" -and [string]$pending.Role -eq "Critic" -and
+                [string]$pending.CallId -eq $CallId) {
+                $pending.ExecutionFingerprint = $executionFingerprint
+                Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+            }
+            elseif ($Role -eq "Fixer" -and [string]$pending.Role -eq "Fixer" -and
                 [string]$pending.CallId -eq $CallId -and
                 [string]$pendingSnapshot.Head -eq [string]$currentSnapshot.Head -and
                 -not [string]::IsNullOrWhiteSpace([string]$pending.ThreadId)) {
                 Write-ReviewLoopStatus -Message "Resuming interrupted Fixer work under the current execution configuration; the result requires current assessment and gates." -Kind Info
             }
-            elseif ($Role -eq "Critic" -or (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+            elseif (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
                 $State.$activeCallProperty = $null
                 Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
                 $pending = $null
@@ -356,6 +356,23 @@ function Invoke-ConfiguredCodexRole {
     }
 
     $roleStartSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    $criticRecovery = $null
+    if ($Role -eq "Critic") {
+        $criticRecovery = if ($null -ne $pending) { $pending } else {
+            [pscustomobject]@{
+                RepositoryHead = $roleStartSnapshot.Head
+                WorktreeFingerprint = $roleStartSnapshot.Fingerprint
+                RepositoryBranch = $roleStartSnapshot.Branch
+                RepositoryHeadRef = $roleStartSnapshot.HeadRef
+                RefsFingerprint = $roleStartSnapshot.RefsFingerprint
+                IndexFingerprint = $roleStartSnapshot.IndexFingerprint
+            }
+        }
+        if ($null -eq (Get-ReviewLoopObjectProperty -Object $criticRecovery -Name "RepositoryBackup")) {
+            $criticRecovery | Add-Member -NotePropertyName RepositoryBackup -NotePropertyValue (
+                New-ReviewLoopCriticRepositoryBackup -RepoPath $RepoPath -LogRoot $LogRoot -Snapshot $roleStartSnapshot)
+        }
+    }
     if ($null -ne $pending -and $Role -in @("Reviewer", "Architect", "Fixer")) {
         $pending | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
@@ -385,11 +402,19 @@ function Invoke-ConfiguredCodexRole {
             StartedAt = [DateTimeOffset]::UtcNow.ToString("O")
             ThreadStartedAt = ""
         }
+        if ($Role -eq "Critic") {
+            $State.$activeCallProperty | Add-Member -NotePropertyName RepositoryBackup `
+                -NotePropertyValue $criticRecovery.RepositoryBackup
+        }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-        if ($Role -eq "Reviewer") {
+        if ($Role -in @("Reviewer", "Critic")) {
             Set-ReviewLoopReviewerRecoveryLocator `
                 -RepoPath $RepoPath -StatePath $StatePath
         }
+    }
+    elseif ($Role -eq "Critic" -and $null -ne $State) {
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        Set-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath -StatePath $StatePath
     }
 
     $arguments = @{
@@ -473,24 +498,19 @@ function Invoke-ConfiguredCodexRole {
         Invoke-ReviewLoopReviewerRepositoryRecovery `
             -RepoPath $RepoPath -Recovery $reviewerRecovery -State $State
     }
+    elseif ($Role -eq "Critic") {
+        Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $RepoPath -Recovery $criticRecovery
+    }
     if ($null -ne $callError) {
         throw $callError
     }
 
-    if (-not $mayEditRepository -and $Role -ne "Reviewer" -and
+    if (-not $mayEditRepository -and $Role -notin @("Reviewer", "Critic") -and
         $worktreeBefore -ne (Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath)) {
         throw "Read-only role '$Role' changed the repository worktree despite its role contract."
     }
     if ($null -ne $State) {
         $roleEndSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-        if ($Role -eq "Critic" -and (
-            $roleStartSnapshot.Head -ne $roleEndSnapshot.Head -or
-            $roleStartSnapshot.Branch -ne $roleEndSnapshot.Branch -or
-            $roleStartSnapshot.HeadRef -ne $roleEndSnapshot.HeadRef -or
-            $roleStartSnapshot.RefsFingerprint -ne $roleEndSnapshot.RefsFingerprint -or
-            $roleStartSnapshot.IndexFingerprint -ne $roleEndSnapshot.IndexFingerprint)) {
-            throw "Read-only role 'Critic' changed the repository identity."
-        }
         $call | Add-Member -Force -NotePropertyName ExecutionFingerprint `
             -NotePropertyValue $executionFingerprint
         $call | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
@@ -509,7 +529,7 @@ function Invoke-ConfiguredCodexRole {
             $State.$activeCallProperty = $null
         }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-        if ($Role -eq "Reviewer") {
+        if ($Role -eq "Reviewer" -or ($Role -eq "Critic" -and [bool]$call.Success)) {
             Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
         }
     }

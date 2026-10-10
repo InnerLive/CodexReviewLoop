@@ -504,19 +504,153 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (Get-Content (Join-Path $repo 'unrelated.txt')) | Should Be 'user work'
     }
 
-    It "rejects a Critic mutation without accepting feedback or cleaning the worktree" {
+    It "discards a Critic mutation and accepts its feedback exactly once" {
         $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = 'critic-v2.schema.json'
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        @($state.RoleCalls | Where-Object Role -eq 'Critic').Count | Should Be 1
+        $state.RoleCalls[-1].StructuredResult.fixerFeedback | Should Not BeNullOrEmpty
+        Test-Path (Join-Path $repo 'fake-review-loop-change.test.txt') | Should Be $false
+        $state.ActiveCriticCall | Should BeNullOrEmpty
+        (& git -C $repo status --porcelain | Out-String).Trim() | Should Be ''
+    }
+
+    It "restores overwritten deleted and binary Fixer files after a failed Critic" {
+        $state.Stage = 'fixing'
+        $state.ActiveFindingIds = @('owned-finding')
+        $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fix
+        Set-Content (Join-Path $repo 'README.txt') 'unfinished fixer patch'
+        Remove-Item -LiteralPath (Join-Path $repo 'review-loop-test.proj')
+        $binaryPath = Join-Path $repo 'unfinished.bin'
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0, 255, 128, 13, 10))
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010
+        $before = $state.ActiveRoleCall | ConvertTo-Json -Compress
+        $planPath = Join-Path $case.Root 'critic-mutations.json'
+        Write-ReliabilityJsonArray -Path $planPath -Values @([pscustomobject]@{
+            exitCode = 1
+            mutations = @(
+                @{ path = 'README.txt'; content = 'critic overwrite' },
+                @{ path = 'review-loop-test.proj'; content = 'critic recreation' },
+                @{ path = 'unfinished.bin'; delete = $true },
+                @{ path = 'critic-only.txt'; content = 'disposable' })
+        })
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = '1'
         (Test-ReliabilityThrows { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }) | Should Be $true
-        @($state.RoleCalls | Where-Object Role -eq 'Critic').Count | Should Be 0
-        Test-Path (Join-Path $repo 'fake-review-loop-change.test.txt') | Should Be $true
-        $state.ActiveCriticCall | Should Not BeNullOrEmpty
+        ($state.ActiveRoleCall | ConvertTo-Json -Compress) | Should Be $before
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'unfinished fixer patch'
+        Test-Path (Join-Path $repo 'review-loop-test.proj') | Should Be $false
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($binaryPath)) | Should Be 'AP+ADQo='
+        Test-Path (Join-Path $repo 'critic-only.txt') | Should Be $false
+        $state.ActiveCriticCall.RepositoryBackup | Should Not BeNullOrEmpty
+        $thread = $state.ActiveCriticCall.ThreadId
+        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ''
+        $state = Read-ReviewLoopState $statePath
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        $last = Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
+        $last.resumeThreadId | Should Be $thread
+        $state.RoleCalls[-1].Success | Should Be $true
+        ($state.ActiveRoleCall | ConvertTo-Json -Compress) | Should Be $before
+    }
+
+    It "recovers a backed-up interrupted Critic branch commit refs and index before public resume" {
+        $branch = & git -C $repo branch --show-current
+        & git -C $repo symbolic-ref refs/remotes/origin/HEAD "refs/heads/$branch"
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010 preserved-critic-thread
+        $state.ActiveCriticCall.ExecutionFingerprint = 'old-tool'
+        & (Get-Module CodexReviewLoop) {
+            param($r, $s, $p, $logs)
+            $s.ActiveCriticCall | Add-Member -NotePropertyName RepositoryBackup -NotePropertyValue (
+                New-ReviewLoopCriticRepositoryBackup -RepoPath $r -LogRoot $logs)
+            Write-ReviewLoopState -Path $p -State $s | Out-Null
+            Set-ReviewLoopReviewerRecoveryLocator -RepoPath $r -StatePath $p
+        } $repo $state $statePath $runRoot
+        Set-Content (Join-Path $repo 'README.txt') 'critic commit'
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m 'disposable critic commit'
+        & git -C $repo switch -q -c critic-other
+        & git -C $repo tag critic-tag
+        & git -C $repo symbolic-ref refs/remotes/origin/HEAD refs/heads/critic-other
+        & git -C $repo update-index --assume-unchanged README.txt
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
+        $result.Status | Should Be 'completed'
+        $result.StatePath | Should Be $statePath
+        (& git -C $repo branch --show-current) | Should Be $branch
+        (& git -C $repo rev-parse HEAD) | Should Be $state.CurrentHead
+        (& git -C $repo for-each-ref --format='%(refname)' | Out-String) | Should Not Match 'critic-other|critic-tag'
+        (& git -C $repo ls-files -v README.txt) | Should Be 'H README.txt'
+        (& git -C $repo symbolic-ref refs/remotes/origin/HEAD) | Should Be "refs/heads/$branch"
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $calls[0].callKind | Should Be 'resume'
+        $calls[0].resumeThreadId | Should Be 'preserved-critic-thread'
+        $saved = Read-ReviewLoopState $statePath
+        @($saved.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.CallId -eq 'critic-0010' }).Count | Should Be 1
+        $saved.ActiveCriticCall | Should BeNullOrEmpty
     }
 
     It "rejects incomplete structured feedback as a technical failure" {
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = 'critic-v2.schema.json'
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = '{"schemaVersion":"2.0","reviewerFeedback":"Review.","architectFeedback":"Advice."}'
         (Test-ReliabilityThrows { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }) | Should Be $true
         @($state.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.Success }).Count | Should Be 0
         $state.ReviewCycle | Should Be 10
+        Test-Path (Join-Path $repo 'fake-review-loop-change.test.txt') | Should Be $false
+    }
+
+    It "restores a legacy clean Critic index mutation before public resume" {
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010 critic-thread
+        Write-ReviewLoopState $statePath $state | Out-Null
+        & git -C $repo update-index --assume-unchanged README.txt
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
+        $result.Status | Should Be 'completed'
+        $result.StatePath | Should Be $statePath
+        (& git -C $repo ls-files -v README.txt) | Should Be 'H README.txt'
+        $saved = Read-ReviewLoopState $statePath
+        @($saved.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.CallId -eq 'critic-0010' }).Count | Should Be 1
+        $saved.ActiveCriticCall | Should BeNullOrEmpty
+    }
+
+    It "retains an interrupted Critic when its required backup is corrupted" {
+        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = '1'
+        (Test-ReliabilityThrows { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }) | Should Be $true
+        $pending = $state.ActiveCriticCall | ConvertTo-Json -Depth 20 -Compress
+        Set-Content (Join-Path $repo 'README.txt') 'critic leftovers'
+        Set-Content (Join-Path $state.ActiveCriticCall.RepositoryBackup.Root 'index') 'corrupt'
+        $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ''
+        $failure = ''
+        try { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }
+        catch { $failure = $_.Exception.Message }
+        $failure | Should Match 'Critic recovery index failed its integrity check'
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'critic leftovers'
+        ($state.ActiveCriticCall | ConvertTo-Json -Depth 20 -Compress) | Should Be $pending
+        @($state.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.Success }).Count | Should Be 0
+    }
+
+    It "preserves the staged and unstaged split and index flags of backed-up Fixer work" {
+        Set-Content (Join-Path $repo 'README.txt') 'staged fixer version'
+        & git -C $repo add README.txt
+        Set-Content (Join-Path $repo 'README.txt') 'unstaged fixer version'
+        & git -C $repo update-index --assume-unchanged review-loop-test.proj
+        $pending = New-CriticTestPendingCall $state $repo Critic critic-0010
+        & (Get-Module CodexReviewLoop) {
+            param($r, $p, $logs)
+            $p | Add-Member -NotePropertyName RepositoryBackup -NotePropertyValue (
+                New-ReviewLoopCriticRepositoryBackup -RepoPath $r -LogRoot $logs)
+        } $repo $pending $runRoot
+        Set-Content (Join-Path $repo 'README.txt') 'critic staged overwrite'
+        & git -C $repo add README.txt
+        Set-Content (Join-Path $repo 'staged-new.txt') 'critic staged addition'
+        & git -C $repo add staged-new.txt
+        & git -C $repo update-index --no-assume-unchanged review-loop-test.proj
+        & (Get-Module CodexReviewLoop) {
+            param($r, $p)
+            Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $r -Recovery $p
+            Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $r -Recovery $p
+        } $repo $pending
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'unstaged fixer version'
+        (& git -C $repo show :README.txt) | Should Be 'staged fixer version'
+        (& git -C $repo ls-files -v review-loop-test.proj) | Should Be 'h review-loop-test.proj'
+        Test-Path (Join-Path $repo 'staged-new.txt') | Should Be $false
     }
 
     It "stops a resumed run on Critic timeout without resetting the interrupted Fixer" {
@@ -542,18 +676,17 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'unfinished patch'
     }
 
-    It "refuses an index change during an interrupted Critic even when file contents match" {
+    It "discards a legacy interrupted Critic index change while preserving Fixer file contents" {
         $state.ActiveFindingIds = @('owned-finding')
         $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fix
         Set-Content (Join-Path $repo 'README.txt') 'unfinished patch'
         $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010
         & git -C $repo add README.txt
-        $failure = ''
-        try { Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex }
-        catch { $failure = $_.Exception.Message }
-        $failure | Should Match 'Interrupted Critic checkpoint'
-        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
-        (& git -C $repo diff --cached --name-only) | Should Be 'README.txt'
+        Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
+        (& git -C $repo diff --cached --name-only | Out-String).Trim() | Should Be ''
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'unfinished patch'
+        $state.RoleCalls[-1].Success | Should Be $true
+        $state.ActiveRoleCall.Role | Should Be 'Fixer'
     }
 
     It "finishes an interrupted native review after a tool update before new criticism" {

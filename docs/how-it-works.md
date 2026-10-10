@@ -47,6 +47,13 @@ critique is still recovered.
 
 Critic output and its covered review count are saved atomically with the role
 result. Its own active-call checkpoint preserves an interrupted work role.
+Each Critic call is a repository transaction: the loop backs up the index,
+local refs, and any unfinished Fixer files before the call, then discards Critic
+mutations and verifies the original state before accepting feedback. Cleanup
+also runs on technical failure and before resuming an interrupted critique.
+Successful cleanup is silent and preserves the critique's thread and all
+pre-existing Fixer work. An unverifiable restoration stops with the recovery
+checkpoint intact.
 All three addressed feedback texts appear in the terminal, without internal model
 reasoning. Lessons Learned remains the separate completion-time analysis for
 durable repository guidance. Historical schema 1.0 critiques retain their two
@@ -99,7 +106,7 @@ from a clean Git checkpoint. If the Reviewer changes the active branch or
 silently restores that exact checkpoint before consuming the review text. A
 successful review remains usable after cleanup. If exact restoration cannot be
 verified, the call is not accepted and the run stops with its recovery
-checkpoint intact. Other analysis roles retain their strict no-mutation
+checkpoint intact. Analysis roles other than Reviewer and Critic retain their strict no-mutation
 failure behavior.
 
 The loop first recognizes established finding and clean signals locally. If
