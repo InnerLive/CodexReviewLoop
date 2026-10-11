@@ -111,6 +111,7 @@ function New-ReliabilityTestCase {
     }
     $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $caseRoot | Out-Null
+    $caseRoot = (Get-Item -LiteralPath $caseRoot).FullName
     $repo = New-ReliabilityRepo -Path (Join-Path $caseRoot "repo")
     $logRoot = Join-Path $caseRoot "logs"
     $configPath = New-ReliabilityConfig -Path (Join-Path $caseRoot "profile.psd1") `
@@ -608,6 +609,115 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $saved = Read-ReviewLoopState $statePath
         @($saved.RoleCalls | Where-Object { $_.Role -eq 'Critic' -and $_.CallId -eq 'critic-0010' }).Count | Should Be 1
         $saved.ActiveCriticCall | Should BeNullOrEmpty
+    }
+
+    It "requalifies the newest completed run instead of an older Critic with or without a locator" {
+        Set-Content $configPath ((Get-Content -Raw $configPath).Replace(
+            'CleanPassesRequired = 2', "CriticStartAfterReviews = 0`n    CleanPassesRequired = 2"))
+        $state.Status = 'failed'
+        $state.CreatedAt = '2026-01-01T00:00:00+00:00'
+        $state.ActiveCriticCall = New-CriticTestPendingCall $state $repo Critic critic-0010 old-critic-thread
+        Write-ReviewLoopState $statePath $state | Out-Null
+        $oldBytes = Get-Content -Raw $statePath
+        Set-Content (Join-Path $repo 'README.txt') 'accepted newer work'
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m 'accepted newer work'
+        $newHead = & git -C $repo rev-parse HEAD
+        $newRoot = Join-Path $paths.ProfileRoot 'new-completed-generation'
+        New-Item -ItemType Directory -Path $newRoot | Out-Null
+        $newPath = Join-Path $newRoot 'run-v1.json'
+        $new = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $newRoot -ReviewBaseCommit $state.ReviewBaseCommit -ExecutionFingerprint old-guidance
+        $new.CreatedAt = '2026-01-02T00:00:00+00:00'
+        $new.Status = 'completed'
+        $new.Stage = 'completed'
+        $new.CleanPasses = 2
+        $new.CleanHead = $newHead
+        Add-CriticTestReviews -State $new -From 1 -To 2
+        Write-ReviewLoopState $newPath $new | Out-Null
+        foreach ($useLocator in @($false, $true)) {
+            if ($useLocator) {
+                & (Get-Module CodexReviewLoop) {
+                    param($r, $p)
+                    Set-ReviewLoopReviewerRecoveryLocator -RepoPath $r -StatePath $p
+                } $repo $statePath
+            }
+            $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+                -ReviewerInstructions "Updated review guidance $useLocator" -CodexPath $fakeCodex -Json
+            $result.Status | Should Be 'completed'
+            $result.StatePath | Should Be $newPath
+            $result.CleanPasses | Should Be 2
+            (& git -C $repo rev-parse HEAD) | Should Be $newHead
+            (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'accepted newer work'
+            (Get-Content -Raw $statePath) | Should Be $oldBytes
+        }
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $calls.Count | Should Be 4
+        @($calls | Where-Object callKind -eq 'review').Count | Should Be 4
+        (Read-ReviewLoopState $newPath).ReviewCycle | Should Be 6
+    }
+
+    It "does not mutate Git or files when a legacy Critic identity cannot be recovered" {
+        $pending = New-CriticTestPendingCall $state $repo Critic critic-0010
+        Set-Content (Join-Path $repo 'README.txt') 'newer committed work'
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m 'newer work'
+        & git -C $repo tag user-tag
+        Set-Content (Join-Path $repo 'README.txt') 'uncommitted user work'
+        & git -C $repo add README.txt
+        Set-Content (Join-Path $repo 'user.txt') 'untracked user bytes'
+        & (Get-Module CodexReviewLoop) {
+            param($r, $p)
+            $before = ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)
+            $index = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $r '.git/index')))
+            $failure = ''
+            try { Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $r -Recovery $p }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'original files were not backed up'
+            (ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)) | Should Be $before
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $r '.git/index'))) | Should Be $index
+        } $repo $pending
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'uncommitted user work'
+        (Get-Content (Join-Path $repo 'user.txt')) | Should Be 'untracked user bytes'
+    }
+
+    It "retains unknown legacy user and technical refs without cleaning files" {
+        $pending = New-CriticTestPendingCall $state $repo Critic critic-0010
+        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/turn-diffs/captures/test/base')) {
+            & git -C $repo update-ref $ref $state.CurrentHead
+            Set-Content (Join-Path $repo 'README.txt') 'preserved concurrent bytes'
+            & (Get-Module CodexReviewLoop) {
+                param($r, $p)
+                $before = ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)
+                $failure = ''
+                try { Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $r -Recovery $p }
+                catch { $failure = $_.Exception.Message }
+                $failure | Should Match 'original files were not backed up'
+                (ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)) | Should Be $before
+            } $repo $pending
+            (& git -C $repo show-ref --verify --hash $ref) | Should Be $state.CurrentHead
+            (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved concurrent bytes'
+            & git -C $repo update-ref -d $ref $state.CurrentHead
+        }
+    }
+
+    It "checks legacy index reconstruction before modifying the actual index or files" {
+        & git -C $repo update-index --assume-unchanged README.txt
+        $pending = New-CriticTestPendingCall $state $repo Critic critic-0010
+        & git -C $repo update-index --no-assume-unchanged README.txt
+        Set-Content (Join-Path $repo 'README.txt') 'preserved file change'
+        & (Get-Module CodexReviewLoop) {
+            param($r, $p)
+            $before = ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)
+            $index = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $r '.git/index')))
+            $failure = ''
+            try { Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $r -Recovery $p }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'original Critic index cannot be reconstructed'
+            (ConvertTo-ReviewLoopJsonCompact (Get-ReviewLoopRepositorySnapshot -RepoPath $r)) | Should Be $before
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $r '.git/index'))) | Should Be $index
+        } $repo $pending
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved file change'
     }
 
     It "retains an interrupted Critic when its required backup is corrupted" {

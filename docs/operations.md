@@ -111,6 +111,12 @@ after the existing technical retries, the run stops with diagnostics rather
 than silently skipping the due critique.
 
 Running the same command resumes the latest compatible checkpoint by default.
+Checkpoint generations are selected before their status is considered. A newer
+completed run supersedes older interrupted calls, including a stale recovery
+locator. On its unchanged `HEAD`, the completed checkpoint remains selected;
+changed Reviewer instructions or execution settings requalify its clean-pass
+evidence in the same run. An unchanged invocation retains completion. A completed
+run whose `HEAD` has moved does not revive an older generation.
 Resume requires the same repository, branch, recorded symbolic review base,
 and `HEAD`. When `-ReviewBase` is omitted, the newest resumable checkpoint for
 that repository, profile, and branch supplies its saved base even if the
@@ -190,8 +196,12 @@ Critic calls use the same recovery locator, including when a Critic switches
 branches. Their additional backup restores local refs, the original index,
 and unfinished Fixer files. Older Critic checkpoints without a file backup
 can restore a clean worktree or an index-only change while preserving matching
-Fixer file contents. If an old dirty checkpoint's file contents or refs differ,
-the loop stops because those original bytes cannot be reconstructed safely.
+Fixer file contents. Without a backup, `HEAD`, its symbolic ref, and the complete
+ref fingerprint must match before any repository cleanup. Dirty file contents
+must also match. Index reconstruction is verified in a temporary index before
+the real index is changed. If these checks fail, recovery stops without changing
+repository refs, the index, or files because the missing original state cannot be
+reconstructed safely.
 Ignored files and modified submodule worktrees remain outside automatic cleanup.
 
 Use `-NewRun` when you deliberately want a new run checkpoint. It still

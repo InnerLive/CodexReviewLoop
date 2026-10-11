@@ -113,7 +113,6 @@ function Get-ReviewLoopLatestBranchStatePath {
             if ($profileRootName -ne "$prefix$expectedBaseKey" -or
                 -not (Test-ReviewLoopSamePath -Left ([string]$state.RepoPath) -Right $RepoPath) -or
                 [string]$state.Branch -ne $Branch -or
-                -not (Test-ReviewLoopStateCanResume -State $state) -or
                 ($filterBySetting -and
                     [string]$state.ReviewBaseSetting -ne $ReviewBaseSetting)) {
                 return
@@ -473,6 +472,7 @@ function Get-ReviewLoopReviewerRecoveryStatePath {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$LogRoot,
+        [Parameter(Mandatory = $true)][hashtable]$Config,
         [string]$ReviewBaseSetting = ""
     )
 
@@ -513,6 +513,16 @@ function Get-ReviewLoopReviewerRecoveryStatePath {
     }
 
     $state = Read-ReviewLoopState -Path $resolvedStatePath
+    # A locator is discovery metadata, not authority over a newer generation.
+    $latestArguments = @{ Config = $Config; RepoPath = $RepoPath; Branch = [string]$state.Branch }
+    if ($PSBoundParameters.ContainsKey("ReviewBaseSetting")) {
+        $latestArguments.ReviewBaseSetting = $ReviewBaseSetting
+    }
+    $latest = Get-ReviewLoopLatestBranchStatePath @latestArguments
+    if (-not [string]::IsNullOrWhiteSpace($latest) -and
+        -not (Test-ReviewLoopSamePath -Left $latest -Right $resolvedStatePath)) {
+        return $latest
+    }
     $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveCriticCall"
     if ($null -eq $active) {
         $active = Get-ReviewLoopObjectProperty -Object $state -Name "ActiveRoleCall"
@@ -735,24 +745,43 @@ function Invoke-ReviewLoopCriticRepositoryRecovery {
     try {
         $backup = Get-ReviewLoopObjectProperty -Object $Recovery -Name "RepositoryBackup"
         if ($null -eq $backup) {
-            # Old clean checkpoints can recover without a backup. Dirty ones cannot
-            # reconstruct changed Fixer bytes, so retain the original safety boundary.
-            if ([string]$Recovery.WorktreeFingerprint -eq (Get-ReviewLoopSha256 "")) {
-                Restore-ReviewLoopReviewerRepository -RepoPath $RepoPath -Recovery $Recovery
-            }
+            # Without a ref inventory, validate identity before any cleanup writes.
             $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+            $clean = [string]$Recovery.WorktreeFingerprint -eq (Get-ReviewLoopSha256 "")
             if ([string]$current.Head -ne [string]$Recovery.RepositoryHead -or
                 [string]$current.HeadRef -ne [string]$Recovery.RepositoryHeadRef -or
                 [string]$current.RefsFingerprint -ne [string]$Recovery.RefsFingerprint -or
-                [string]$current.Fingerprint -ne [string]$Recovery.WorktreeFingerprint) {
+                (-not $clean -and [string]$current.Fingerprint -ne [string]$Recovery.WorktreeFingerprint)) {
                 throw "Interrupted Critic checkpoint no longer matches the repository state; its original files were not backed up."
             }
-            # An index-only legacy mutation is disposable; keep the worktree intact.
-            if ([string]$current.IndexFingerprint -ne [string]$Recovery.IndexFingerprint) {
-                Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("read-tree", [string]$Recovery.RepositoryHead) | Out-Null
+            $candidateIndex = ""
+            try {
+                if ([string]$current.IndexFingerprint -ne [string]$Recovery.IndexFingerprint) {
+                    $candidateIndex = Join-Path ([System.IO.Path]::GetTempPath()) (
+                        "review-loop-critic-index-" + [Guid]::NewGuid().ToString("N"))
+                    $previousIndex = $env:GIT_INDEX_FILE
+                    try {
+                        $env:GIT_INDEX_FILE = $candidateIndex
+                        Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("read-tree", [string]$Recovery.RepositoryHead) | Out-Null
+                        if ((Get-ReviewLoopGitIndexFingerprint -RepoPath $RepoPath) -ne [string]$Recovery.IndexFingerprint) {
+                            throw "The original Critic index cannot be reconstructed without its backup."
+                        }
+                    }
+                    finally { $env:GIT_INDEX_FILE = $previousIndex }
+                }
+                if ($clean -and [string]$current.Fingerprint -ne [string]$Recovery.WorktreeFingerprint) {
+                    Restore-ReviewLoopReviewerRepository -RepoPath $RepoPath -Recovery $Recovery
+                }
+                if (-not [string]::IsNullOrWhiteSpace($candidateIndex)) {
+                    $indexPath = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "--git-path", "index")
+                    if (-not [System.IO.Path]::IsPathRooted($indexPath)) { $indexPath = Join-Path $RepoPath $indexPath }
+                    [System.IO.File]::Copy($candidateIndex, $indexPath, $true)
+                }
             }
-            if ((Get-ReviewLoopGitIndexFingerprint -RepoPath $RepoPath) -ne [string]$Recovery.IndexFingerprint) {
-                throw "The original Critic index cannot be reconstructed without its backup."
+            finally {
+                if (-not [string]::IsNullOrWhiteSpace($candidateIndex) -and (Test-Path -LiteralPath $candidateIndex)) {
+                    [System.IO.File]::Delete($candidateIndex)
+                }
             }
             return
         }
@@ -4236,6 +4265,7 @@ function Invoke-ReviewLoopCore {
         $recoveryArguments = @{
             RepoPath = $repo
             LogRoot = [string]$config.LogRoot
+            Config = $config
         }
         if ($reviewBaseOverrideBound) {
             $recoveryArguments.ReviewBaseSetting = $reviewBaseSetting
@@ -4253,10 +4283,15 @@ function Invoke-ReviewLoopCore {
             $active = Get-ReviewLoopLatestBranchStatePath @activeArguments
         }
         if (-not [string]::IsNullOrWhiteSpace($active)) {
-            $statePath = $active
-            $state = Read-ReviewLoopState -Path $statePath
-            $reviewBaseSetting = [string]$state.ReviewBaseSetting
-            $resumed = $true
+            $candidate = Read-ReviewLoopState -Path $active
+            if ((Test-ReviewLoopStateCanResume -State $candidate) -or
+                ([string]$candidate.Status -eq "completed" -and
+                    [string]$candidate.CurrentHead -eq (Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")))) {
+                $statePath = $active
+                $state = $candidate
+                $reviewBaseSetting = [string]$state.ReviewBaseSetting
+                $resumed = $true
+            }
         }
     }
 
@@ -4387,7 +4422,7 @@ function Invoke-ReviewLoopCore {
                 $state.LessonsLearned.Status = "pending"
             }
             if ((Test-ReviewLoopGitClean -RepoPath $repo) -and
-                (Test-ReviewLoopCycleBoundary -State $state)) {
+                ((Test-ReviewLoopCycleBoundary -State $state) -or [string]$state.Status -eq "completed")) {
                 $state.ActiveRoleCall = $null
                 $state.ActiveClusterId = ""
                 $state.ActiveFindingIds = @()
@@ -4397,6 +4432,7 @@ function Invoke-ReviewLoopCore {
                 $state.LastFixerResult = $null
                 $state.PendingCommit = $null
                 $state.Stage = "initialized"
+                $state.Status = "running"
             }
         }
         $state | Add-Member -Force -NotePropertyName ExecutionFingerprint `
