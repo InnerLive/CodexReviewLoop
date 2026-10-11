@@ -29,12 +29,19 @@ Each recipient receives only its own latest
 feedback. Existing role instructions and Architect advice remain in force.
 Evidence-backed praise is valid feedback. The Critic need not recommend changes
 when the current approach works well and must not demand optimization for its own sake.
+An accepted patch or green suite does not by itself show that a recurring
+working-practice failure has been corrected. Unresolved criticism remains direct
+until the evidence supports recovery; it calls for change at the next relevant
+decision, not only after another defect appears.
 
 The Critic knows that its feedback persists across subsequent recipient calls
 until replaced. Delivery identifies the completed-review count on which the
-critique was based and notes that later work may already have addressed specific
-points. This context also accompanies critiques saved before the tool update;
-their original text remains unchanged.
+critique was based. Recipients must reconcile applicable criticism with current
+evidence and explain the resulting change in their existing output, or give a
+concrete reason the concern is resolved or inapplicable. Agreement or a promise
+alone is insufficient. Their independent judgment, output contracts, and decision
+responsibilities remain unchanged. This context also accompanies critiques saved
+before the tool update; their original text remains unchanged.
 
 Critiques run between review/fix rounds, before the next review. Completion
 takes precedence, and an exhausted invocation budget leaves overdue criticism

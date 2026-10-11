@@ -199,6 +199,19 @@ function New-CriticTestPendingCall {
     } $State $Repo $Role $CallId $ThreadId
 }
 
+function Assert-CriticTestFeedbackDelivery {
+    param($Call, [int]$ReviewCount, [string]$Feedback)
+
+    $arguments = @($Call.arguments | Where-Object { $_ -like 'developer_instructions=*' })
+    $arguments.Count | Should Be 1
+    $instructions = $arguments[0].Substring('developer_instructions='.Length) | ConvertFrom-Json
+    $expected = (Get-Content -Raw (Join-Path $root 'prompts/critic-feedback.md')).
+        Replace('{{CRITIC_ID}}', ('critic-{0:D4}' -f $ReviewCount)).
+        Replace('{{COVERED_REVIEWS}}', [string]$ReviewCount).
+        Replace('{{FEEDBACK}}', $Feedback)
+    $instructions.EndsWith($expected) | Should Be $true
+}
+
 Describe "Periodic Critic process and resume" -Tags @("Process") {
     BeforeEach {
         $case = New-ReliabilityTestCase
@@ -343,14 +356,11 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         ($calls[1].arguments -join ' ') | Should Match 'every subsequent call to its recipient'
         $calls[1].prompt | Should Match '"CriticStartAfterReviews":5'
         foreach ($index in @(2, 3)) {
-            ($calls[$index].arguments -join ' ') | Should Match 'after 10 completed native reviews'
-            ($calls[$index].arguments -join ' ') | Should Match 'may already have addressed specific points'
-            ($calls[$index].arguments -join ' ') | Should Match 'Architect: make'
+            Assert-CriticTestFeedbackDelivery $calls[$index] 10 'Architect: make coherent decisions.'
             ($calls[$index].arguments -join ' ') | Should Not Match 'Reviewer: examine'
         }
         ($calls[4].arguments -join ' ') | Should Match 'Keep my original review context'
-        ($calls[4].arguments -join ' ') | Should Match 'Reviewer: examine'
-        ($calls[4].arguments -join ' ') | Should Match 'after 10 completed native reviews'
+        Assert-CriticTestFeedbackDelivery $calls[4] 10 'Reviewer: examine the current work independently.'
         ($calls[4].arguments -join ' ') | Should Not Match 'Architect: make'
         $state.RoleCalls[-1].CriticId | Should Be 'critic-0010'
         $saved = Read-ReviewLoopState $statePath
@@ -378,10 +388,10 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $calls.Count | Should Be 4
         $calls[1].callKind | Should Be 'resume'
         $calls[1].resumeThreadId | Should Be 'fixer-thread'
+        Assert-CriticTestFeedbackDelivery $calls[1] 10 'Fixer: implement the agreed solution coherently.'
+        Assert-CriticTestFeedbackDelivery $calls[3] 11 'Fixer: implement the agreed solution coherently.'
         foreach ($i in @(1, 3)) {
-            ($calls[$i].arguments -join ' ') | Should Match 'Fixer: implement'
             ($calls[$i].arguments -join ' ') | Should Not Match 'Reviewer: examine|Architect: make'
-            ($calls[$i].arguments -join ' ') | Should Match 'may already have addressed specific points'
         }
         $calls[2].prompt | Should Match 'Fixer: implement'
         $calls[2].prompt | Should Match 'Reviewer: examine'
@@ -445,8 +455,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $last = Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
         $last.callKind | Should Be 'resume'
         $last.resumeThreadId | Should Be 'interrupted-thread'
-        ($last.arguments -join ' ') | Should Match 'Architect: make'
-        ($last.arguments -join ' ') | Should Match 'after 10 completed native reviews'
+        Assert-CriticTestFeedbackDelivery $last 10 'Architect: make coherent decisions.'
         ($last.arguments -join ' ') | Should Not Match 'Reviewer: examine'
     }
 
