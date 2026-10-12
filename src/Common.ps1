@@ -224,8 +224,9 @@ function Get-ReviewLoopRepositoryRoot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     $candidate = Resolve-ReviewLoopPath -Path $RepoPath -MustExist
-    $root = (& git -C $candidate rev-parse --show-toplevel 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $candidate, 'rev-parse', '--show-toplevel')
+    $root = $gitResult.Stdout.Trim()
+    if ($gitResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
         throw (New-ReviewLoopFailureException `
             -Message "The selected RepoPath is not inside a Git worktree: $candidate" `
             -NextSteps @(
@@ -246,10 +247,12 @@ function Test-ReviewLoopSamePath {
     $rightPath = Get-ReviewLoopComparablePath -Path $Right
     if ((Test-Path -LiteralPath $leftPath -PathType Container) -and
         (Test-Path -LiteralPath $rightPath -PathType Container)) {
-        $leftRoot = (& git -C $leftPath rev-parse --show-toplevel 2>$null | Out-String).Trim()
-        $leftExit = $LASTEXITCODE
-        $rightRoot = (& git -C $rightPath rev-parse --show-toplevel 2>$null | Out-String).Trim()
-        if ($leftExit -eq 0 -and $LASTEXITCODE -eq 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $leftPath, 'rev-parse', '--show-toplevel')
+        $leftRoot = $gitResult.Stdout.Trim()
+        $leftExit = $gitResult.ExitCode
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $rightPath, 'rev-parse', '--show-toplevel')
+        $rightRoot = $gitResult.Stdout.Trim()
+        if ($leftExit -eq 0 -and $gitResult.ExitCode -eq 0) {
             $leftPath = Get-ReviewLoopComparablePath -Path $leftRoot
             $rightPath = Get-ReviewLoopComparablePath -Path $rightRoot
         }
@@ -379,14 +382,15 @@ function Get-ReviewLoopNextProfilePath {
 function Get-ReviewLoopFallbackReviewBase {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $originHead = (& git -C $RepoPath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($originHead)) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD')
+    $originHead = $gitResult.Stdout.Trim()
+    if ($gitResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($originHead)) {
         return $originHead
     }
 
     foreach ($candidate in @("origin/main", "origin/master", "main", "master", "HEAD^", "HEAD")) {
-        & git -C $RepoPath rev-parse --verify "$candidate^{commit}" *> $null
-        if ($LASTEXITCODE -eq 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'rev-parse', '--verify', "$candidate^{commit}")
+        if ($gitResult.ExitCode -eq 0) {
             return $candidate
         }
     }
@@ -400,8 +404,9 @@ function Get-ReviewLoopOptionalGitLines {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $output = @(& git -C $RepoPath @Arguments 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments (@('-C', $RepoPath) + $Arguments)
+    $output = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         return @()
     }
     return @($output | ForEach-Object { [string]$_ })
@@ -421,8 +426,8 @@ function Resolve-ReviewLoopBranchReference {
         @("refs/heads/$Reference", "refs/remotes/$Reference")
     }
     foreach ($candidate in $candidates) {
-        & git -C $RepoPath show-ref --verify --quiet $candidate 2>$null
-        if ($LASTEXITCODE -eq 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'show-ref', '--verify', '--quiet', $candidate)
+        if ($gitResult.ExitCode -eq 0) {
             return [pscustomobject]@{
                 FullName = $candidate
                 ShortName = $candidate -replace '^refs/heads/', '' -replace '^refs/remotes/', ''
@@ -558,12 +563,12 @@ function Get-ReviewLoopGraphReviewBase {
     }
 
     $eligible = foreach ($candidate in $candidates) {
-        & git -C $RepoPath merge-base --is-ancestor $candidate.FullName HEAD 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'merge-base', '--is-ancestor', $candidate.FullName, 'HEAD')
+        if ($gitResult.ExitCode -ne 0) {
             continue
         }
-        & git -C $RepoPath merge-base --is-ancestor $fallbackCommit[0] $candidate.FullName 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'merge-base', '--is-ancestor', $fallbackCommit[0], $candidate.FullName)
+        if ($gitResult.ExitCode -ne 0) {
             continue
         }
         $distance = @(Get-ReviewLoopOptionalGitLines -RepoPath $RepoPath -Arguments @(
@@ -1093,7 +1098,8 @@ function Get-ReviewLoopExecutionProfileText {
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [string]$ReviewBase = "",
-        [AllowEmptyString()][string]$ReviewerInstructions = ""
+        [AllowEmptyString()][string]$ReviewerInstructions = "",
+        [AllowEmptyString()][string]$TaskContext = ""
     )
 
     $profile = Import-PowerShellDataFile -LiteralPath (
@@ -1117,6 +1123,7 @@ function Get-ReviewLoopExecutionProfileText {
         $executionSettings["ReviewBase"] = $ReviewBase
     }
     $executionSettings["ReviewerInstructions"] = $effectiveReviewerInstructions
+    $executionSettings["TaskContext"] = $TaskContext
     return ConvertTo-ReviewLoopFingerprintData -Value $executionSettings
 }
 
@@ -1330,7 +1337,8 @@ function Get-ReviewLoopExecutionFingerprint {
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [string]$ReviewBase = "",
-        [AllowEmptyString()][string]$ReviewerInstructions = ""
+        [AllowEmptyString()][string]$ReviewerInstructions = "",
+        [AllowEmptyString()][string]$TaskContext = ""
     )
 
     $files = [System.Collections.Generic.List[string]]::new()
@@ -1364,6 +1372,7 @@ function Get-ReviewLoopExecutionFingerprint {
     if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
         $profileTextArguments.ReviewerInstructions = $ReviewerInstructions
     }
+    $profileTextArguments.TaskContext = $TaskContext
     $profileText = Get-ReviewLoopExecutionProfileText @profileTextArguments
     $records = @($records) + "$profileRelative`n$(Get-ReviewLoopSha256 $profileText)"
     return Get-ReviewLoopSha256 ($records -join "`n")
@@ -1414,49 +1423,97 @@ function Get-ReviewLoopRoleConfig {
     return $roleConfig
 }
 
-function Get-ReviewLoopGitValue {
+function Get-ReviewLoopProcessCommandLine {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.ProcessStartInfo]$StartInfo)
+
+    # Match Windows ArgumentList quoting; count UTF-16 characters, including NUL.
+    $quoted = @($StartInfo.ArgumentList | ForEach-Object {
+        $value = [string]$_
+        if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { $value }
+        else {
+            $escaped = [regex]::Replace($value, '(\\*)"', '$1$1\"')
+            '"' + [regex]::Replace($escaped, '(\\+)$', '$1$1') + '"'
+        }
+    })
+    $arguments = if ($StartInfo.ArgumentList.Count) { $quoted -join ' ' } else { $StartInfo.Arguments }
+    return '"' + $StartInfo.FileName.Trim('"') + '"' + $(if ($arguments) { ' ' + $arguments } else { '' })
+}
+
+function ConvertTo-ReviewLoopProcessPath {
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$WorkingDirectory = '')
+    if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) { return $Path }
+    $relative = [System.IO.Path]::GetRelativePath($WorkingDirectory, $Path)
+    if ($relative.Length -lt $Path.Length) { return $relative }
+    return $Path
+}
+
+function Assert-ReviewLoopProcessCommandLine {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.ProcessStartInfo]$StartInfo)
+
+    $limit = 500
+    $length = (Get-ReviewLoopProcessCommandLine -StartInfo $StartInfo).Length + 1
+    if ($length -gt $limit) {
+        throw "Process command line has $length UTF-16 characters including executable, Windows quoting and final NUL; maximum is $limit. Use concise instructions and equivalent short paths. Process was not started."
+    }
+}
+
+function Invoke-ReviewLoopGitProcess {
     param(
-        [Parameter(Mandatory = $true)][string]$RepoPath,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$InputText = $null
     )
 
-    $invoke = {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = "git"
+        $startInfo.FileName = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardInput = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
-        foreach ($argument in @("-C", $RepoPath) + $Arguments) {
+        foreach ($argument in $Arguments) {
             [void]$startInfo.ArgumentList.Add([string]$argument)
         }
 
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
         try {
+            Assert-ReviewLoopProcessCommandLine -StartInfo $startInfo
             if (-not $process.Start()) {
                 throw "Git could not start."
             }
             # Git must not inherit a background job's remoting input pipe.
-            $process.StandardInput.Close()
             $stdoutTask = $process.StandardOutput.ReadToEndAsync()
             $stderrTask = $process.StandardError.ReadToEndAsync()
+            if ($null -ne $InputText) { $process.StandardInput.Write($InputText) }
+            $process.StandardInput.Close()
             $process.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            $lines = if ($stdout.Length -gt 0) { @($stdout.TrimEnd("`r", "`n") -split "\r?\n") } else { @() }
             return [pscustomobject]@{
                 ExitCode = $process.ExitCode
-                Stdout = $stdoutTask.GetAwaiter().GetResult()
-                Stderr = $stderrTask.GetAwaiter().GetResult()
+                Stdout = $stdout
+                Stderr = $stderr
+                Lines = @($lines)
+                Output = @($lines) + @(if ($stderr.Length -gt 0) { $stderr.TrimEnd("`r", "`n") })
             }
         }
         finally {
             $process.Dispose()
         }
-    }
+
+}
+
+function Get-ReviewLoopGitValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$InputText = $null
+    )
 
     $last = $null
     for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $last = & $invoke
+        $last = Invoke-ReviewLoopGitProcess -Arguments (@("-C", $RepoPath) + $Arguments) -InputText $InputText
         if ([int]$last.ExitCode -eq 0) {
             return ([string]$last.Stdout).Trim()
         }
@@ -1484,12 +1541,14 @@ function Test-ReviewLoopGitClean {
 function Get-ReviewLoopWorktreePatch {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $changed = @(& git -C $RepoPath diff --name-only --no-renames HEAD -- 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--name-only', '--no-renames', 'HEAD', '--')
+    $changed = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git diff --name-only failed."
     }
-    $untracked = @(& git -C $RepoPath ls-files --others --exclude-standard 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-files', '--others', '--exclude-standard')
+    $untracked = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git ls-files --others failed."
     }
     $untrackedSet = [System.Collections.Generic.HashSet[string]]::new(
@@ -1502,16 +1561,16 @@ function Get-ReviewLoopWorktreePatch {
     foreach ($path in @($changed + $untracked | Where-Object {
         -not [string]::IsNullOrWhiteSpace([string]$_)
     } | Sort-Object -Unique)) {
-        $patch = & git -C $RepoPath diff --binary --no-ext-diff --no-renames `
-            --unified=80 HEAD -- ([string]$path) 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--binary', '--no-ext-diff', '--no-renames', '--unified=80', 'HEAD', '--', ([string]$path))
+        $patch = @($gitResult.Lines)
+        if ($gitResult.ExitCode -ne 0) {
             throw "git diff failed for path '$path'."
         }
         $text = ($patch | Out-String).Trim()
         if ([string]::IsNullOrWhiteSpace($text) -and $untrackedSet.Contains([string]$path)) {
-            $patch = & git -C $RepoPath diff --binary --no-index --no-renames `
-                --unified=80 -- /dev/null ([string]$path) 2>$null
-            if ($LASTEXITCODE -notin @(0, 1)) {
+            $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--binary', '--no-index', '--no-renames', '--unified=80', '--', '/dev/null', ([string]$path))
+            $patch = @($gitResult.Lines)
+            if ($gitResult.ExitCode -notin @(0, 1)) {
                 throw "git diff failed for untracked path '$path'."
             }
             $text = ($patch | Out-String).Trim()

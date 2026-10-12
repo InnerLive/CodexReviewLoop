@@ -1,57 +1,54 @@
 ---
 name: review-loop
-description: Explain, prepare, run, or resume CodexReviewLoop with task-specific reviewer context. Use when the user mentions ReviewLoop or asks to use it.
+description: Explain, prepare, run, or resume CodexReviewLoop with shared task context. Use when the user mentions ReviewLoop or asks to use it.
 ---
 
 # Review Loop
 
 Use `codex-review-loop.ps1` with PowerShell 7. Read `installation.json` beside
-this skill's `SKILL.md`; its `repositoryPath` is the tool checkout recorded by
-the installer. Use it as `$reviewLoopRoot`. Infer the repository to review and
-the relevant task context from the current conversation, not from the tool's
-location. Do not ask the user to supply paths or routine configuration that
-you can resolve yourself.
+this skill; `repositoryPath` records the tool checkout. Infer the target
+repository from the conversation. Do not ask the user for paths or routine
+configuration you can resolve yourself.
 
-It reviews the branch diff against a pinned base, routes findings through
-Architect and Fixer, and runs configured gates before committing accepted work.
-Start or resume only when the user asks to run it. A new run requires a clean
-worktree and can edit and auto-commit.
-A request such as "Run ReviewLoop for your changes" is a request to run it,
-not merely to explain the command. Preserve unrelated user changes.
+Start or resume when asked, including "Run ReviewLoop for your changes".
+The loop can edit and auto-commit. New runs require a clean dedicated branch;
+preserve unrelated user changes.
 
-## Reviewer context
+## Shared task
 
-Before launching, consider which task goal, acceptance criterion, or deliberate
-tradeoff the fresh Reviewer would otherwise miss. Supply this context neutrally
-in brief `ReviewerInstructions`, applying [prompting](../prompting/SKILL.md).
-Do not present your implementation choices as requirements or prior checks
-as proof of correctness. Keep the review focused on concrete defects relevant
-to the requested implementation and its correctness, security, and compatibility
-requirements; intentional choices remain open to contrary evidence.
+For a new run, pass the original goal, acceptance criteria and relevant user
+constraints neutrally in `-TaskContext`, applying [prompting](../prompting/SKILL.md).
+Implementation choices and prior successful checks are evidence, not requirements.
+No supplied task is also valid: the Architect reconstructs the goal from source,
+branch changes, commit messages and project documentation before the first review.
+The shared goal and necessary architecture work reach every participant and persist
+across cycles.
+
+On resume, omit `TaskContext` to inherit the saved task. Replace it only when the
+user changes the assignment; an explicit empty value requests reconstruction.
+Such changes requalify prior decisions without silently deleting open work.
+Keep optional `ReviewerInstructions` for guidance specific to the Reviewer,
+preserving applicable profile guidance. It does not define the shared task.
+When supplied, retain its exact text on resume; the checkpoint stores only its fingerprint.
 
 ## Run and resume
 
-With the tool checkout, target repository, and prepared text resolved:
+Resolve the tool, target and any task text, then invoke:
 
 ```powershell
-& (Join-Path $reviewLoopRoot 'codex-review-loop.ps1') -RepoPath $repoPath -ReviewerInstructions $reviewerInstructions
+& (Join-Path $reviewLoopRoot 'codex-review-loop.ps1') -RepoPath $repoPath
 ```
 
-The CLI discovers or generates a profile. Use `-ConfigPath` or `-ReviewBase`
-when needed. `-ReviewerInstructions` replaces the profile value, so retain
-applicable profile guidance. It reaches only the Reviewer; Architect and Fixer
-receive findings and advice.
+Add `-TaskContext $taskContext` when supplying a new task. Profiles and review
+bases are discovered automatically; use overrides when required by the project.
+Repeating the command resumes a compatible checkpoint. `-NewRun` starts a fresh
+run and is not needed to refresh an exhausted repair round.
 
-Repeating the command resumes a compatible checkpoint; `-NewRun` starts a
-fresh run. Retain the exact reviewer text for resume: the checkpoint stores
-its fingerprint, not the text. Changing it requalifies prior review evidence.
+`MaxFixAttempts` returns a preserved candidate to native review;
+`MaxReviewCycles` bounds one invocation and resets on resume. At `limit_reached`,
+assess progress before continuing. Repeated defects without progress or growing
+scope require causal diagnosis, not blindly restarting. Architect acceptance,
+configured gates and current completion evidence remain required.
 
-`MaxFixAttempts` limits a fix round before another review;
-`MaxReviewCycles` limits one invocation and resets on resume. At `limit_reached`,
-assess progress before continuing. Repeated findings without progress or growing
-scope require diagnosing the cause, not blindly restarting. Finish when the
-configured completion condition is met.
-
-Consult documentation in the resolved tool checkout as needed:
-`docs/how-it-works.md` for workflow and completion, `docs/configuration.md` for
-profiles and options, and `docs/operations.md` for operation and recovery.
+Consult the tool's `docs/how-it-works.md` for workflow,
+`docs/configuration.md` for settings, and `docs/operations.md` for recovery.

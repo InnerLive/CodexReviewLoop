@@ -176,8 +176,11 @@ supported developer-instructions setting.
 - Findings remain active until the Architect accepts a solution after the Fixer or a later
   native review reports clean. An edit or commit alone never resolves them.
 - Architect rejection returns to the Fixer. Exhausting `MaxFixAttempts`
-  preserves the rejected patch, restores the clean checkpoint, and starts a
-  new native review; it does not create a blocked finding.
+  preserves and fingerprints the complete owned candidate for a new native
+  review against the same base; it neither discards progress nor blocks findings.
+- The Architect owns the evidenced shared goal and durable architecture orders.
+  Omission never closes an order. Completion requires their explicit assessment
+  and an overall judgment bound to the current tree and context revision.
 - Configured host gates run after verification and before every commit. Recheck
   the patch, stage the exact tree, and advance HEAD with an old-value check.
 - Completion normally requires the configured clean passes on unchanged HEAD.

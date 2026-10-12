@@ -54,7 +54,8 @@ function Get-CodexRoleArguments {
         [string]$ReviewBase = "",
         [string]$DeveloperInstructions = "",
         [string]$SchemaPath = "",
-        [string]$ResultPath = ""
+        [string]$ResultPath = "",
+        [string]$ProcessWorkingDirectory = ""
     )
 
     if ($Mode -eq "Review") {
@@ -73,16 +74,16 @@ function Get-CodexRoleArguments {
         [void]$arguments.Add("--ignore-user-config")
         [void]$arguments.Add("--ignore-rules")
     }
-    [void]$arguments.Add("--dangerously-bypass-approvals-and-sandbox")
+    [void]$arguments.Add("--yolo")
     [void]$arguments.Add("-C")
-    [void]$arguments.Add((Resolve-ReviewLoopPath -Path $RepoPath -MustExist))
+    [void]$arguments.Add((ConvertTo-ReviewLoopProcessPath -WorkingDirectory $ProcessWorkingDirectory -Path (Resolve-ReviewLoopPath -Path $RepoPath -MustExist)))
     [void]$arguments.Add("-m")
     [void]$arguments.Add($Model)
     [void]$arguments.Add("-c")
-    [void]$arguments.Add("model_reasoning_effort=`"$($Thinking.ToLowerInvariant())`"")
+    [void]$arguments.Add("model_reasoning_effort='$($Thinking.ToLowerInvariant())'")
     [void]$arguments.Add("-c")
     $tier = if ($Speed -eq "fast") { "fast" } else { "default" }
-    [void]$arguments.Add("service_tier=`"$tier`"")
+    [void]$arguments.Add("service_tier='$tier'")
     if ($Speed -eq "fast") {
         [void]$arguments.Add("--enable")
         [void]$arguments.Add("fast_mode")
@@ -91,11 +92,11 @@ function Get-CodexRoleArguments {
     if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($SchemaPath)) {
         Assert-CodexOutputSchemaSupported -SchemaPath $SchemaPath
         [void]$arguments.Add("--output-schema")
-        [void]$arguments.Add((Resolve-ReviewLoopPath -Path $SchemaPath -MustExist))
+        [void]$arguments.Add((ConvertTo-ReviewLoopProcessPath -WorkingDirectory $ProcessWorkingDirectory -Path (Resolve-ReviewLoopPath -Path $SchemaPath -MustExist)))
     }
     if ($Mode -ne "Review" -and -not [string]::IsNullOrWhiteSpace($ResultPath)) {
         [void]$arguments.Add("-o")
-        [void]$arguments.Add((Resolve-ReviewLoopPath -Path $ResultPath))
+        [void]$arguments.Add((ConvertTo-ReviewLoopProcessPath -WorkingDirectory $ProcessWorkingDirectory -Path (Resolve-ReviewLoopPath -Path $ResultPath)))
     }
     if (-not [string]::IsNullOrEmpty($DeveloperInstructions)) {
         # JSON string literals are valid TOML basic strings as well.
@@ -129,10 +130,18 @@ function Get-CodexRoleArguments {
     return $arguments.ToArray()
 }
 
+function Get-ReviewLoopRoleArtifactStem {
+    param([Parameter(Mandatory = $true)][string]$CallId,
+        [Parameter(Mandatory = $true)][string]$Role)
+    $safeRole = [regex]::Replace($Role.ToLowerInvariant(), "[^a-z0-9-]+", "-").Trim("-")
+    return "$( (Get-ReviewLoopSha256 $CallId).Substring(0, 12))-$safeRole"
+}
+
 function New-CodexProcessStartInfo {
     param(
         [Parameter(Mandatory = $true)][string]$CodexExecutable,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$WorkingDirectory = ""
     )
 
     $extension = [System.IO.Path]::GetExtension($CodexExecutable)
@@ -140,7 +149,7 @@ function New-CodexProcessStartInfo {
         $pwsh = (Get-Command "pwsh.exe" -ErrorAction Stop | Select-Object -First 1).Source
         $info = [System.Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $pwsh
-        foreach ($prefix in @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $CodexExecutable)) {
+        foreach ($prefix in @("-nop", "-noni", "-ep", "Bypass", "-f", (ConvertTo-ReviewLoopProcessPath -Path $CodexExecutable -WorkingDirectory $WorkingDirectory))) {
             [void]$info.ArgumentList.Add($prefix)
         }
     }
@@ -160,6 +169,7 @@ function New-CodexProcessStartInfo {
         [void]$info.ArgumentList.Add($argument)
     }
     $info.UseShellExecute = $false
+    $info.WorkingDirectory = $WorkingDirectory
     $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true
     $info.RedirectStandardOutput = $true
@@ -621,6 +631,7 @@ function Invoke-ReviewLoopObservedProcess {
             $marker = "--- new attempt $(Get-Date -Format o) ---"
             $stderrWriter.WriteLine($marker)
         }
+        Assert-ReviewLoopProcessCommandLine -StartInfo $StartInfo
         if (-not $process.Start()) {
             throw "$DisplayName could not be started."
         }
@@ -821,7 +832,8 @@ function Invoke-CodexCliRole {
         [string]$CallId = "",
         [string]$DeveloperInstructions = "",
         [Alias("TimeoutSeconds")][long]$InactivityTimeoutSeconds = 1800,
-        [AllowNull()][scriptblock]$OnThreadStarted = $null
+        [AllowNull()][scriptblock]$OnThreadStarted = $null,
+        [AllowNull()][scriptblock]$ValidateStructuredResult = $null
     )
 
     if ($Mode -eq "Review" -and -not [string]::IsNullOrWhiteSpace($Prompt)) {
@@ -838,12 +850,11 @@ function Invoke-CodexCliRole {
     $logDirectory = Resolve-ReviewLoopPath -Path $LogRoot
     [System.IO.Directory]::CreateDirectory($logDirectory) | Out-Null
     $executable = Resolve-CodexCliExecutable -CodexPath $CodexPath
-    $safeRole = [regex]::Replace($Role.ToLowerInvariant(), "[^a-z0-9-]+", "-").Trim("-")
     if ([string]::IsNullOrWhiteSpace($CallId)) {
         $CallId = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
     }
     $isNativeReview = $Mode -eq "Review"
-    $stemBase = Join-Path $logDirectory "$CallId-$safeRole"
+    $stemBase = Join-Path $logDirectory (Get-ReviewLoopRoleArtifactStem -CallId $CallId -Role $Role)
     $stem = $stemBase
     $invocation = 2
     while (
@@ -889,10 +900,11 @@ function Invoke-CodexCliRole {
             -ReviewBase $ReviewBase `
             -DeveloperInstructions $effectiveDeveloperInstructions `
             -SchemaPath $SchemaPath `
+            -ProcessWorkingDirectory $logDirectory `
             -ResultPath $(if ($isNativeReview) { "" } else { $resultPath })
 
         Write-ReviewLoopStatus -Message "$Role · $Model/$Thinking · $Speed · attempt $attempt/$MaxAttempts" -Kind Progress
-        $startInfo = New-CodexProcessStartInfo -CodexExecutable $executable -Arguments $arguments
+        $startInfo = New-CodexProcessStartInfo -CodexExecutable $executable -Arguments $arguments -WorkingDirectory $logDirectory
         Clear-ReviewLoopModelHelperEnvironment -StartInfo $startInfo
         $observed = $null
         try {
@@ -993,6 +1005,16 @@ function Invoke-CodexCliRole {
                 }
                 else {
                     $structured = $validation.Value
+                    if ($null -ne $ValidateStructuredResult) {
+                        try {
+                            & $ValidateStructuredResult $structured | Out-Null
+                        }
+                        catch {
+                            $exitCode = 4
+                            $failureKind = "invalid_structured_output"
+                            $failureReason = $_.Exception.Message
+                        }
+                    }
                 }
             }
         }

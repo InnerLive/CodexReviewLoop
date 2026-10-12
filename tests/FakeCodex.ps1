@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "ArchitectureFixtures.ps1")
 
 function Test-FakeBoolean {
     param([AllowNull()][object]$Value)
@@ -75,7 +76,11 @@ $tailDelayText = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_T
 $pidFile = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_PID_FILE")
 $threadId = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_THREAD")
 $mutateSchema = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA")
-$invocationPlan = Read-FakeInvocationPlan -Path $invocationSequencePath
+$schemaOptionIndex = [Array]::IndexOf([string[]]$arguments, "--output-schema")
+$phaseSchema = if ($schemaOptionIndex -ge 0) { [IO.Path]::GetFileName($arguments[$schemaOptionIndex + 1]) } else { "" }
+$phase = Get-TestArchitecturePhase -SchemaName $phaseSchema -Prompt $prompt
+$useDefaultPhase = Test-TestArchitectureDefaultPhase -Phase $phase -PlanPath $invocationSequencePath
+$invocationPlan = if ($useDefaultPhase) { $null } else { Read-FakeInvocationPlan -Path $invocationSequencePath }
 
 $exitText = [string](Get-FakePlanValue -Plan $invocationPlan -Name "exitCode" -Default $exitText)
 $stderrText = [string](Get-FakePlanValue -Plan $invocationPlan -Name "stderr" -Default $stderrText)
@@ -107,6 +112,8 @@ if (-not [string]::IsNullOrWhiteSpace($childPidPath)) {
     [void]$childStartInfo.ArgumentList.Add("-NonInteractive")
     [void]$childStartInfo.ArgumentList.Add("-Command")
     [void]$childStartInfo.ArgumentList.Add("Start-Sleep -Seconds $childSleepSeconds")
+    . (Join-Path (Split-Path -Parent $PSScriptRoot) 'src/Common.ps1')
+    Assert-ReviewLoopProcessCommandLine -StartInfo $childStartInfo
     $childProcess = [System.Diagnostics.Process]::Start($childStartInfo)
     [System.IO.File]::WriteAllText(
         $childPidPath,
@@ -144,6 +151,7 @@ if ($callKind -eq "review") {
     $reviewIndex = [Array]::IndexOf([string[]]$arguments, "review")
     foreach ($globalOption in @(
             "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
             "-C",
             "-m",
             "-c",
@@ -161,6 +169,7 @@ if ($callKind -eq "review") {
 if (-not [string]::IsNullOrWhiteSpace($logPath)) {
     $record = [pscustomobject]@{
         invocationId = [Guid]::NewGuid().ToString("N")
+        phase = $phase
         callKind = $callKind
         resumeThreadId = $resumeThreadId
         arguments = $arguments
@@ -187,7 +196,10 @@ if (-not [string]::IsNullOrWhiteSpace($exitText)) {
 $nativeReviewResult = ""
 if ($exitCode -eq 0 -and
     ($callKind -eq "review" -or -not [string]::IsNullOrWhiteSpace($resultPath))) {
-    if ($null -ne $plannedResult) {
+    if ($useDefaultPhase) {
+        $result = Get-TestArchitecturePhaseResult -Phase $phase
+    }
+    elseif ($null -ne $plannedResult) {
         $result = [string]$plannedResult
     }
     elseif (-not [string]::IsNullOrWhiteSpace($resultSequencePath) -and (Test-Path -LiteralPath $resultSequencePath)) {
@@ -217,6 +229,12 @@ if ($exitCode -eq 0 -and
             "architecture-advice-v2.schema.json" {
                 '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'
             }
+            "architecture-assessment-v1.schema.json" {
+                '{"schemaVersion":"1.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+            }
+            "architecture-advice-v3.schema.json" {
+                '{"schemaVersion":"3.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[],"orders":[],"selectedWorkIds":[]}'
+            }
             "review-classification-v1.schema.json" {
                 '{"schemaVersion":"1.0","hasFindings":false}'
             }
@@ -226,14 +244,15 @@ if ($exitCode -eq 0 -and
             "fixer-result-v3.schema.json" {
                 '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
             }
-            "architecture-assessment-v1.schema.json" {
-                '{"schemaVersion":"1.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+            "architecture-assessment-v2.schema.json" {
+                '{"schemaVersion":"2.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]},"newOrders":[],"workOutcomes":[],"goalComplete":false}'
             }
             default {
                 '{}'
             }
         }
     }
+    $result = Convert-TestArchitectureResult -SchemaName ([IO.Path]::GetFileName($schemaPath)) -Text $result
     if ($callKind -eq "review") {
         $legacyNativeReview = $null
         try {

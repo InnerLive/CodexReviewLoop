@@ -212,7 +212,7 @@ function New-EndToEndTestCase {
     New-Item -ItemType Directory -Path $caseRoot | Out-Null
     $configPath = New-TestConfig `
         -Path (Join-Path $caseRoot "profile.psd1") `
-        -LogRoot (Join-Path $caseRoot "logs") `
+        -LogRoot (New-TestLogRoot -ToolRoot $root) `
         -CleanPassesRequired 1
     $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
     $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = Join-Path $caseRoot "results.json"
@@ -1075,17 +1075,17 @@ Describe "Global CLI arguments" -Tags @("Fast", "FullLocal") {
 
     It "uses the requested thinking level" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking max
-        ($args -join " ") | Should Match 'model_reasoning_effort="max"'
+        ($args -join " ") | Should Match "model_reasoning_effort='max'"
     }
 
     It "maps standard to the default tier explicitly" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Speed standard
-        ($args -join " ") | Should Match 'service_tier="default"'
+        ($args -join " ") | Should Match "service_tier='default'"
     }
 
     It "maps fast to the fast tier explicitly" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low -Speed fast
-        ($args -join " ") | Should Match 'service_tier="fast"'
+        ($args -join " ") | Should Match "service_tier='fast'"
     }
 
     It "enables fast mode for fast" {
@@ -1100,7 +1100,7 @@ Describe "Global CLI arguments" -Tags @("Fast", "FullLocal") {
 
     It "uses unattended full access for every call" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking low
-        ($args -join " ") | Should Match 'dangerously-bypass-approvals-and-sandbox'
+        ($args -join " ") | Should Match 'yolo'
     }
 
     It "ignores Codex exec rules and never emits a managed sandbox" {
@@ -1129,19 +1129,19 @@ Describe "Global CLI arguments" -Tags @("Fast", "FullLocal") {
 
     It "builds resume arguments with the same tier" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m -Thinking medium -Speed fast -Mode Resume -ThreadId thread-1
-        ($args -join " ") | Should Match 'service_tier="fast".*resume thread-1 -$'
+        ($args -join " ") | Should Match "service_tier='fast'.*resume thread-1 -`$"
     }
 
     It "builds the native Codex review command without an output schema" {
         $args = Get-CodexRoleArguments -RepoPath $repo.FullName -Model m `
             -Thinking high -Mode Review -ReviewBase origin/main
-        ($args -join " ") | Should Match "^--dangerously-bypass-approvals-and-sandbox .* review --base origin/main$"
+        ($args -join " ") | Should Match "^--yolo .* review --base origin/main$"
         @($args | Select-Object -Last 3) | Should Be @("review", "--base", "origin/main")
         ($args -contains "exec") | Should Be $false
         ($args -contains "--json") | Should Be $false
         @($args | Where-Object { $_ -eq "--output-schema" }).Count | Should Be 0
         @($args | Where-Object { $_ -eq "-o" }).Count | Should Be 0
-        ($args -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
+        ($args -contains "--yolo") | Should Be $true
     }
 
     It "passes multiline quoted Unicode reviewer instructions as TOML-compatible JSON" {
@@ -1589,7 +1589,7 @@ Describe "Run state" -Tags @("Fast", "FullLocal") {
     }
 
     It "rejects unknown state versions" {
-        $state.SchemaVersion = "2.0"
+        $state.SchemaVersion = "99.0"
         (Test-Throws { Write-ReviewLoopState -Path (Join-Path $TestDrive "state.json") -State $state }) | Should Be $true
     }
 
@@ -1615,7 +1615,7 @@ Describe "Fake Codex integration" -Tags @("Process") {
             $script:ReviewLoopRetryDelayOverride = { param([int]$seconds) }
         }
         $repo = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))) -Force
-        $logRoot = Join-Path $TestDrive "logs"
+        $logRoot = New-TestLogRoot -ToolRoot $root
         $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $TestDrive ("calls-{0}.jsonl" -f ([Guid]::NewGuid().ToString("N")))
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
         $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
@@ -1634,6 +1634,7 @@ Describe "Fake Codex integration" -Tags @("Process") {
 
     AfterEach {
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-TestLogRoots -ToolRoot $root
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_LOG -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_RESULT -ErrorAction SilentlyContinue
         Remove-Item Env:\CODEX_REVIEW_LOOP_FAKE_EXIT_CODE -ErrorAction SilentlyContinue
@@ -1716,10 +1717,10 @@ Describe "Fake Codex integration" -Tags @("Process") {
         $records[2].resumeThreadId | Should Be "architect-thread"
         $records[3].resumeThreadId | Should Be "architect-thread"
         foreach ($record in @($records[0], $records[1], $records[2], $records[3])) {
-            ($record.arguments -join " ") |
-                Should Match 'coherence and integrity of this software system as a whole'
-            ($record.arguments -join " ") |
-                Should Match 'current findings -> Architect advice -> Fixer changes'
+            $record.prompt |
+                Should Match 'coherence and integrity'
+            $record.prompt |
+                Should Match 'independent assessment controls acceptance'
         }
         $reloaded = Read-ReviewLoopState -Path $statePath
         $reloaded.RoleSessions.Architect | Should Be "architect-thread"
@@ -1755,13 +1756,13 @@ Describe "Fake Codex integration" -Tags @("Process") {
             ForEach-Object { $_ | ConvertFrom-Json })
         @($records.callKind) | Should Be @("exec", "resume")
         foreach ($record in $records) {
-            ($record.arguments -join " ") | Should Match 'Fixer for the current findings'
-            ($record.arguments -join " ") | Should Match 'preserve correct existing or partial work'
-            ($record.arguments -join " ") | Should Match 'targetedTest\.executable'
+            $record.prompt | Should Match 'Fixer for the current findings'
+            $record.prompt | Should Match 'preserve correct existing or partial work'
+            $record.prompt | Should Match 'targetedTest\.executable'
         }
     }
 
-    It "sends Architect history once and uses finding deltas on resume" {
+    It "sends only current Architect findings and uses finding deltas on resume" {
         $repoPath = New-TestRepo $repo.FullName
         $configPath = New-TestConfig `
             -Path (Join-Path $TestDrive "architect-deltas.psd1") `
@@ -1802,17 +1803,17 @@ Describe "Fake Codex integration" -Tags @("Process") {
         $records.Count | Should Be 2
         $records[0].callKind | Should Be "exec"
         $records[0].prompt | Should Match "first-current-finding"
-        $records[0].prompt | Should Match "historic-context-marker"
+        $records[0].prompt | Should Not Match "historic-context-marker"
         $records[1].callKind | Should Be "resume"
         $records[1].prompt | Should Match "second-current-finding"
-        $records[1].prompt | Should Match 'Additional history.+\[\]'
+        $records[1].prompt | Should Not Match 'Additional history'
         $records[1].prompt | Should Not Match "historic-context-marker"
         $records[1].prompt | Should Match 'changedPaths'
         foreach ($record in $records) {
-            ($record.arguments -join " ") |
-                Should Match 'coherence and integrity of this software system as a whole'
-            ($record.arguments -join " ") |
-                Should Match 'current findings -> Architect advice -> Fixer changes'
+            $record.prompt |
+                Should Match 'coherence and integrity'
+            $record.prompt |
+                Should Match 'independent assessment controls acceptance'
         }
     }
 
@@ -1862,19 +1863,19 @@ Describe "Fake Codex integration" -Tags @("Process") {
 
     It "passes standard to the fake CLI" {
         Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Speed standard -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
-        (Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Match 'service_tier=\\?"default'
+        (Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Match 'service_tier=.?[\x22\x27]default'
     }
 
     It "passes fast to the fake CLI" {
         Invoke-CodexCliRole -Role Test -RepoPath $repo.FullName -Model model -Thinking low -Speed fast -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex | Out-Null
-        (Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Match 'service_tier=\\?"fast'
+        (Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG) | Should Match 'service_tier=.?[\x22\x27]fast'
     }
 
     It "passes fast to resume calls" {
         Invoke-CodexCliRole -Role Fixer -RepoPath $repo.FullName -Model model -Thinking high -Speed fast -Prompt p -LogRoot $logRoot -Mode Resume -ThreadId thread-1 -CodexPath $fakeCodex | Out-Null
         $text = Get-Content -Raw $env:CODEX_REVIEW_LOOP_FAKE_LOG
         $text | Should Match 'resume'
-        $text | Should Match 'service_tier=\\?"fast'
+        $text | Should Match 'service_tier=.?[\x22\x27]fast'
     }
 
     It "classifies fast unavailability without fallback" {
@@ -1912,7 +1913,7 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
         $repo = New-TestRepo (Join-Path $TestDrive ([Guid]::NewGuid().ToString("N")))
         $caseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
-        $logRoot = Join-Path $caseRoot "logs"
+        $logRoot = New-TestLogRoot -ToolRoot $root
         $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT = ""
         $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = ""
@@ -1929,6 +1930,7 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
     }
 
     AfterEach {
+        Clear-TestLogRoots -ToolRoot $root
         @(
             "CODEX_REVIEW_LOOP_FAKE_LOG",
             "CODEX_REVIEW_LOOP_FAKE_RESULT",
@@ -1975,11 +1977,13 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
                 -Prompt p -LogRoot $logs -CodexPath $fake -CallId "stream-live"
         } -ArgumentList $modulePath, $repo, $logRoot, $fakeCodex
         try {
-            $jsonlPath = Join-Path $logRoot "stream-live-test.jsonl"
+            $jsonlPath = $null
             $deadline = [DateTime]::UtcNow.AddSeconds(8)
             while ([DateTime]::UtcNow -lt $deadline -and
-                (-not (Test-Path -LiteralPath $jsonlPath) -or
+                ($null -eq $jsonlPath -or
                  (Get-Item -LiteralPath $jsonlPath -ErrorAction SilentlyContinue).Length -eq 0)) {
+                $observed = @(Get-ChildItem -LiteralPath $logRoot -Filter '*.jsonl' -File)
+                if ($observed.Count -eq 1) { $jsonlPath = $observed[0].FullName }
                 Start-Sleep -Milliseconds 100
             }
             Test-Path -LiteralPath $jsonlPath | Should Be $true
@@ -1987,7 +1991,8 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
             $job.State | Should Be "Running"
             Wait-Job -Job $job -Timeout 15 | Out-Null
             $job.State | Should Be "Completed"
-            Receive-Job -Job $job | Out-Null
+            $result = Receive-Job -Job $job
+            $result.JsonlPath | Should Be $jsonlPath
         }
         finally {
             Stop-Job -Job $job -ErrorAction SilentlyContinue
@@ -2315,7 +2320,10 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
     It "contains every production prompt" {
         $expected = @(
             "architect-assessment.md",
+            "architect-completion.md",
+            "architect-orientation.md",
             "architect.md",
+            "architecture-context.md",
             "critic-feedback.md",
             "critic.md",
             "developer-analysis.md",
@@ -2393,16 +2401,14 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
     It "keeps the complete free-role prompts stable" {
         $expected = @{
             "architect.md" = @'
-Provide advice for the current finding cluster.
+Plan a solution for current findings and necessary architecture work. Select
+existing or new work by stable ID; omission does not withdraw open work.
 
 Current findings:
 {{FINDINGS}}
 
-Current repository context:
+Repository scope:
 {{REPOSITORY_CONTEXT}}
-
-Additional history (`[]` when already established in this thread):
-{{HISTORY}}
 '@
             "fixer.md" = @'
 Work on the current finding cluster.
@@ -2415,6 +2421,10 @@ New feedback:
 '@
             "architect-assessment.md" = @'
 Inspect the current repository state and assess the latest Fixer result.
+Assess selected architecture work explicitly: accept it only with evidence, or
+withdraw it with a concrete reason. Omitted work stays open. Identify additional
+necessary work when inspection exposes it. Judge whether the overall goal is
+fulfilled; passing tests or fixing the current findings alone does not prove it.
 
 Recovery context (`{}` when the findings, repository context, and advice are already established in this thread):
 {{CONTEXT}}
@@ -2466,7 +2476,7 @@ Fixer result and targeted-test evidence:
             Get-Content -Raw -LiteralPath (Join-Path $root "prompts\$_")
         }
         $prompts = $prompts -join "`n"
-        $prompts | Should Not Match '(?i)\bmust\b|\bnever\b|fail closed|\bprefer\b|\bonly\b|smallest|bounded'
+        $prompts | Should Not Match '(?i)approval role|veto role|majority decision|mandatory redesign'
     }
 
     It "gives the Architect assessment the fixer result without requiring advice conformance" {
@@ -2541,20 +2551,18 @@ Fixer result and targeted-test evidence:
             $instructions.$role | Should Match 'does not interpret prose as instructions'
             $instructions.$role | Should Match 'structured result fields'
         }
-        $instructions.Architect | Should Match 'passed unchanged to the Fixer as advice'
-        $instructions.Architect | Should Match 'coherence and integrity of this software system as a whole'
-        $instructions.Architect | Should Match "system's design and invariants"
-        $instructions.Architect | Should Match 'Correctness, security, maintainability, and appropriate scope take precedence'
-        $instructions.Architect | Should Match 'read-only role'
-        $instructions.Architect | Should Match 'actual relevant code, current diff, and repository state'
-        $instructions.Architect | Should Match 'Fixer summaries and targeted-test results are evidence, not substitutes'
-        $instructions.Architect | Should Match 'current findings -> Architect advice -> Fixer changes -> Architect assessment -> configured host gates -> commit'
-        $instructions.Architect | Should Match 'orchestrator does not execute steps from architecture prose'
-        $instructions.Architect | Should Match 'accept field selects the implemented workflow transition'
-        $instructions.Architect | Should Match 'Rejection feedback is passed to the Fixer'
-        $instructions.Architect | Should Match 'ideally within 72 characters'
-        $instructions.Architect | Should Match "repository's established language and style"
-        $instructions.Architect | Should Match 'return an empty subject, an empty rationale, and an empty changes list'
+        $instructions.Architect | Should Match 'coherence and integrity'
+        $instructions.Architect | Should Match 'evidenced goal, correctness, security and maintainability'
+        $instructions.Architect | Should Match 'read-only work'
+        $instructions.Architect | Should Match 'leave files, index and Git refs unchanged'
+        $instructions.Architect | Should Match 'passing tests do not substitute for inspecting the actual result'
+        $instructions.Architect | Should Match 'independent assessment controls acceptance'
+        $instructions.Architect | Should Match 'orchestrator runs authoritative tests and gates and owns commits'
+        $instructions.Architect | Should Match 'Close work explicitly with evidence'
+        $instructions.Architect | Should Match 'withdraw unnecessary work with a reason'
+        $instructions.Architect | Should Match 'concise solution-oriented commit subject'
+        $instructions.Architect | Should Match "repository's established language"
+        $instructions.Architect | Should Match 'On rejection, leave the commit proposal empty'
         $instructions.Fixer | Should Match 'Fixer for the current findings'
         $instructions.Fixer | Should Match 'Use your judgment to improve the repository'
         $instructions.Fixer | Should Match 'advice, not a requirement to follow a prescribed plan'
@@ -2874,11 +2882,13 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Clear-EndToEndTestCase
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
+        Clear-TestLogRoots -ToolRoot $root
     }
 
     It "rejects an unavailable host gate before starting a reviewer" {
         $configPath = New-TestConfig `
-            -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
+            -Path $configPath -LogRoot (New-TestLogRoot -ToolRoot $root) -WithHostGate
         $missingExecutable = "missing-review-loop-host-gate-$([Guid]::NewGuid().ToString('N')).exe"
         $content = (Get-Content -Raw -LiteralPath $configPath).Replace(
             'FilePath = "pwsh"',
@@ -2930,7 +2940,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         @($state.RoleCalls | Where-Object { [string]$_.Speed -ne "standard" }).Count |
             Should Be 0
         @($records | Where-Object {
-            ($_.arguments -join " ") -notmatch 'service_tier=\\?"default'
+            ($_.arguments -join " ") -notmatch 'service_tier=.?[\x22\x27]default'
         }).Count | Should Be 0
         $terminal | Should Match "Checkpoint speed changed: fast -> standard"
     }
@@ -2967,7 +2977,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         @($state.RoleCalls | Where-Object { [string]$_.Speed -ne "fast" }).Count |
             Should Be 0
         @($records | Where-Object {
-            ($_.arguments -join " ") -notmatch 'service_tier=\\?"fast'
+            ($_.arguments -join " ") -notmatch 'service_tier=.?[\x22\x27]fast'
         }).Count | Should Be 0
     }
 
@@ -3056,7 +3066,7 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
 
     It "implements update, consolidation, and deletion through the normal workflow" {
         $configPath = New-TestConfig `
-            -Path $configPath -LogRoot (Join-Path $caseRoot "logs") -WithHostGate
+            -Path $configPath -LogRoot (New-TestLogRoot -ToolRoot $root) -WithHostGate
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1")
         Set-Content -LiteralPath $configPath -Value $content -Encoding UTF8
@@ -3185,13 +3195,13 @@ Describe "End-to-end orchestration with fake Codex" -Tags @("Orchestration") {
         $lessonsCalls[0].prompt | Should Match '"diff"'
         $architectCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         })[0]
         $architectCall.prompt | Should Match "repository_skill"
         $architectCall.prompt | Should Match "Broader reviews extended discovery"
         $assessmentCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-assessment-v1.schema.json"
+                "architecture-assessment-v2.schema.json"
         })[0]
         $assessmentCall.prompt | Should Match "(?m)^\{\}\r?$"
         $assessmentCall.prompt | Should Not Match "Broader reviews extended discovery"
@@ -3226,6 +3236,8 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Clear-EndToEndTestCase
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
+        Clear-TestLogRoots -ToolRoot $root
     }
 
     It "runs post-commit native reviews when explicitly configured" {
@@ -3304,11 +3316,11 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
                 "lessons-learned-v2.schema.json" -and
-            ($_.arguments -join " ") -match 'service_tier=\\?"?fast'
+            ($_.arguments -join " ") -match 'service_tier=.?[\x22\x27]?fast'
         }).Count | Should Be 1
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         }).Count | Should Be 0
     }
 
@@ -3405,8 +3417,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
             Where-Object { [string]$_.callKind -eq "review" })
         $records.Count | Should Be 2
         foreach ($record in $records) {
-            @($record.arguments | Select-Object -Last 3) |
-                Should Be @("review", "--base", "parent")
+            ($record.arguments -join " ") | Should Match 'review --base parent'
         }
     }
 
@@ -3435,8 +3446,7 @@ Describe "End-to-end orchestration with fake Codex 2" -Tags @("Orchestration") {
         $record = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { [string]$_.callKind -eq "review" })[0]
-        @($record.arguments | Select-Object -Last 3) |
-            Should Be @("review", "--base", "parent")
+        ($record.arguments -join " ") | Should Match 'review --base parent'
     }
 
     It "does not resume a checkpoint when an explicit override selects another base" {
@@ -3609,6 +3619,8 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Clear-EndToEndTestCase
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
+        Clear-TestLogRoots -ToolRoot $root
     }
 
     It "emits one JSON document and no human dashboard when requested" {
@@ -3726,7 +3738,7 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
             Should Match "Partial Fixer work was preserved"
     }
 
-    It "restores a failed partial-work recovery and returns to the native Reviewer" {
+    It "preserves a failed partial-work recovery for the next native Reviewer" {
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("CleanPassesRequired = 2", "CleanPassesRequired = 1").
             Replace("MaxReviewCycles = 6", "MaxReviewCycles = 2")
@@ -3748,6 +3760,7 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
             }
             [pscustomobject]@{ result = "not json" }
             [pscustomobject]@{ result = "No findings." }
+            [pscustomobject]@{ result = $architecture }
         )
         $invocationPlanPath = Join-Path $caseRoot "failed-partial-recovery-invocations.json"
         Set-Content -LiteralPath $invocationPlanPath `
@@ -3758,14 +3771,16 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
             -RepoPath $repo -ConfigPath $configPath -Speed standard `
             -CodexPath $fakeCodex -NewRun -HeartbeatSeconds 0 -ColorMode Never
 
-        $result.Status | Should Be "completed"
-        Test-Path -LiteralPath (Join-Path $repo "failed-partial.txt") | Should Be $false
-        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        $result.Status | Should Be "failed"
+        (Get-Content (Join-Path $repo "failed-partial.txt")) | Should Be "partial"
+        $state = Read-ReviewLoopState $result.StatePath
+        $state.RetainedCandidate | Should Not BeNullOrEmpty
+        Test-Path $state.RetainedCandidate.Artifact.ManifestPath | Should Be $true
+        $state.CleanPasses | Should Be 0
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
         @($records | Where-Object { $_.callKind -eq "review" }).Count | Should Be 2
-        @(Get-ChildItem -LiteralPath (Join-Path $result.RunRoot "blocked") `
-            -Directory -Filter "*-restart-attempt-1").Count | Should Be 1
+        $result.Reason | Should Match "select necessary open work"
         $terminal = Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")
         $terminal | Should Match "fresh partial-work recovery Fixer also failed"
         $terminal | Should Match "Review cycle 2"
@@ -3841,10 +3856,11 @@ Describe "End-to-end orchestration with fake Codex 3" -Tags @("Orchestration") {
         $resumed.PartialFixRecovery | Should BeNullOrEmpty
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
-        $records[0].callKind | Should Be "exec"
-        $records[0].prompt | Should Match "previous Fixer process ended"
-        $records[0].prompt | Should Match "restart recovery defect"
-        $records[0].prompt | Should Match "Inspect and finish the current worktree"
+        $fixerRecord = @($records | Where-Object schemaPath -Match "fixer-result")[0]
+        $fixerRecord.callKind | Should Be "exec"
+        $fixerRecord.prompt | Should Match "previous Fixer process ended"
+        $fixerRecord.prompt | Should Match "restart recovery defect"
+        $fixerRecord.prompt | Should Match "Inspect and finish the current worktree"
     }
 
 }
@@ -3866,11 +3882,13 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         Disable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop)
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
         Clear-EndToEndTestCase
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
+        Clear-TestLogRoots -ToolRoot $root
     }
 
     It "uses the configured fixer-attempt budget and resumes the durable Fixer thread" {
         $configPath = New-TestConfig -Path $configPath `
-            -LogRoot (Join-Path $caseRoot "logs") -WithHostGate `
+            -LogRoot (New-TestLogRoot -ToolRoot $root) -WithHostGate `
             -CleanPassesRequired 1
         $content = (Get-Content -Raw -LiteralPath $configPath).
             Replace("MaxFixAttempts = 2", "MaxFixAttempts = 3")
@@ -3915,7 +3933,7 @@ Describe "End-to-end orchestration with fake Codex 4" -Tags @("Orchestration") {
         }
         $assessmentCalls = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-assessment-v1.schema.json"
+                "architecture-assessment-v2.schema.json"
         })
         $assessmentCalls.Count | Should Be 3
         @($assessmentCalls | Where-Object { $_.callKind -ne "resume" }).Count | Should Be 0
@@ -4040,7 +4058,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
             Should Be $true
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         }).Count | Should Be 0
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
     }
@@ -4075,7 +4093,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         }).Count | Should Be 1
         $architectCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         })[0]
         ([string]$architectCall.prompt).Replace("`r`n", "`n") |
             Should Match ([regex]::Escape($ambiguousReview))
@@ -4113,7 +4131,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         @($firstRecords | Where-Object { $_.callKind -eq "review" }).Count | Should Be 1
         @($firstRecords | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         }).Count | Should Be 0
 
         $completed = Invoke-CodexReviewLoop `
@@ -4130,7 +4148,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         }).Count | Should Be 2
         @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-advice-v2.schema.json"
+                "architecture-advice-v3.schema.json"
         }).Count | Should Be 0
     }
 
@@ -4184,7 +4202,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
         $result.Status | Should Be "completed"
         $records = Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json }
         $architectCalls = @($records | Where-Object {
-            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-advice-v2.schema.json"
+            [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq "architecture-advice-v3.schema.json"
         })
         $architectCalls.Count | Should Be 1
         ([string]$architectCalls[0].prompt).Replace("`r`n", "`n") |
@@ -4196,7 +4214,7 @@ Reviewer = @{ Model = "fake"; Thinking = "high" }
             '"approach":"Change both affected paths together."'))
         $assessmentCall = @($records | Where-Object {
             [System.IO.Path]::GetFileName([string]$_.schemaPath) -eq
-                "architecture-assessment-v1.schema.json"
+                "architecture-assessment-v2.schema.json"
         })[0]
         $assessmentCall.callKind | Should Be "resume"
         $assessmentCall.resumeThreadId | Should Be "cluster-thread"

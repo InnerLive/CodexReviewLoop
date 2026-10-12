@@ -2,8 +2,14 @@
 
 [Back to the README](../README.md)
 
-The loop reviews and improves the complete branch diff between a pinned
-`ReviewBase` commit and the current `HEAD`.
+The loop reviews and improves the complete branch diff from a pinned
+`ReviewBase` commit, including a retained, uncommitted Fixer candidate.
+
+A persisted Fixer ref-identity failure remains fail-closed on ordinary resume.
+An independently evidenced external delta can only be acknowledged by the
+[explicit public requalification operation](operations.md#explicit-external-ref-change-requalification).
+It preserves the failed role and candidate and requests fresh native review;
+it never converts old role/test evidence into acceptance or ignores a ref class.
 
 `ReviewBase = 'Auto'` resolves only when a new durable run starts. It first
 uses branch-creation reflog evidence, then a unique nearest ancestor branch,
@@ -69,34 +75,47 @@ all three texts and replace the feedback delivered on subsequent role calls.
 Existing session history is not rewritten. Each recipient call records the
 critique ID actually delivered; old results are not relabeled as new decisions.
 
+## Shared goal and architecture work
+
+Before the first native review, the existing Architect reconstructs the intended
+behavior from the branch diff, commit messages, source, tests, and documentation.
+Optional `TaskContext` supplies the original assignment. Explicit requirements,
+repository evidence, and remaining uncertainties stay distinguishable; existing
+code is not automatically the specification.
+
+The versioned run state stores this goal and architecture orders with stable IDs,
+rationale, evidence, completion criteria, and status. The Architect may create
+necessary work without a native finding, but must justify its connection to the
+goal or a defect cause. Omitting an order never closes it. Every working role,
+including resumed sessions, receives the compact current goal and open orders.
+Larger artifacts are referenced instead of replayed.
+
 ## The cycle
 
 ```mermaid
 flowchart LR
-    review[Native Codex review] --> parse{Clear result?}
-    parse -- Ambiguous --> classify[Luna ReviewClassifier]
-    parse -- Clear --> findings{Findings?}
-    classify --> findings
-    findings -- Yes --> architect[Architect advice]
+    orient[Architect clarifies goal] --> review[Native review of full candidate]
+    review --> parse{Clear result?}
+    parse -- Ambiguous --> classify[ReviewClassifier]
+    parse -- Clear --> work{Findings or open work?}
+    classify --> work
+    work -- Yes --> architect[Architect bundles necessary work]
     architect --> fix[Fixer]
-    fix --> test[Optional targeted test]
-    test --> verify[Architect assessment]
-    verify -- Reject --> fix
-    verify -- Accept --> gates[Host gates]
-    gates --> commit[Commit verified tree]
-    commit --> finalLesson{Final lessons-learned solution?}
-    finalLesson -- No --> review
-    finalLesson -- Yes --> postReview{Real commit and<br/>post-review enabled?}
-    postReview -- No --> done[Complete]
-    postReview -- Yes --> review
-    findings -- No --> clean{Required clean passes<br/>on unchanged HEAD?}
+    fix --> test[Targeted test]
+    test --> verify[Independent Architect assessment]
+    verify -- Reject within budget --> fix
+    verify -- Attempt limit --> retained[Preserve complete candidate]
+    retained --> review
+    verify -- Accept --> gates[Host gates and exact-tree commit]
+    gates --> clean{Completion evidence sufficient?}
+    work -- No, retained candidate --> verify
+    work -- No, clean accepted tree --> clean
     clean -- No --> review
-    clean -- Yes --> eligible{Lessons learned eligible?}
-    eligible -- No --> done
-    eligible -- Yes --> lessons[Read-only LessonsLearned analysis]
-    lessons --> changes{Guidance changes?}
-    changes -- No --> done
-    changes -- Yes --> architect
+    clean -- Yes --> lessons[Eligible lessons-learned phase]
+    lessons -- Necessary guidance work --> architect
+    lessons -- Done or ineligible --> goal[Architect judges overall goal]
+    goal -- Necessary work --> architect
+    goal -- Fulfilled, gates pass --> done[Complete]
 ```
 
 ## 1. Native review
@@ -108,7 +127,8 @@ developer instructions without replacing the native `review --base` workflow.
 Every native review starts fresh; Reviewer threads are deliberately not reused.
 
 The native Reviewer is treated as a repository transaction. Each call starts
-from a clean Git checkpoint. If the Reviewer changes the active branch or
+from a clean checkpoint or the exact owned, retained Fixer candidate. Dirty
+candidates receive a backup of files, index, and refs before the native review. If the Reviewer changes the active branch or
 `HEAD`, the index, tracked files, or non-ignored untracked paths, the loop
 silently restores that exact checkpoint before consuming the review text. A
 successful review remains usable after cleanup. If exact restoration cannot be
@@ -125,7 +145,8 @@ as a technical failure.
 Review text classified as containing findings is passed unchanged to the
 Architect. The ledger stores a history copy, but historical states never
 suppress findings from the current native review. A clean native review
-advances the clean-pass counter.
+advances the clean-pass counter only when no architecture work or unaccepted
+candidate remains. It cannot substitute for Architect acceptance.
 
 ## 2. Free architecture advice
 
@@ -166,16 +187,17 @@ The first call for each cluster supplies the findings and Architect advice.
 Corrections in the same thread send only new feedback. A fresh recovery thread
 receives the complete context again.
 
-`MaxFixAttempts` is the number of Fixer calls allowed in one review round. When
-the value is reached without acceptance, the loop preserves the rejected patch
-as a diagnostic artifact, restores the clean repository state, discards the
-old Fixer round, and immediately starts another native review. It does not
-block the finding or stop the run.
+`MaxFixAttempts` limits Fixer calls in one review round. At the limit, the loop
+archives and fingerprints the full candidate, including new files and index,
+and retains it for the next native review against the same base. The limit
+alone never discards progress. Unexpected changes stop the run. A clean review
+of this candidate leads to independent Architect assessment, tests, gates, and
+commit before ordinary clean passes can count.
 
 If a Fixer process leaves partial changes before a resumable thread ID is
 available, those changes are preserved and one fresh Fixer completes the same
 semantic attempt. A second technical failure preserves the latest evidence,
-restores the clean checkpoint, and returns to native review.
+retains the owned candidate, and returns to native review.
 
 The Fixer may provide one targeted test through `targetedTest.executable` and
 `targetedTest.arguments`. The executable is the program started by the
@@ -199,6 +221,12 @@ may be accepted when the repository state satisfactorily resolves the findings.
 Normal assessment resumes send only the Fixer and test result. Without a
 durable Architect thread, recovery repeats the findings, advice, and current
 repository context so the assessment remains self-contained.
+
+The Architect selects existing orders with its advice and explicitly assesses
+selected orders after implementation. New necessary orders may arise during
+assessment. Accepted or justified withdrawn orders become durable only after
+gates and any required exact-tree commit. An accepted no-op follows the same
+gate path. Results are bound to the repository snapshot and goal revision.
 
 The Architect decides directly:
 
@@ -234,8 +262,18 @@ message during crash recovery.
 The orchestrator owns authoritative tests, staging, and commits. Analysis roles
 must leave the repository unchanged, and the Fixer may edit the worktree but
 may not create commits or change refs.
+One ref capture supplies both the complete native inventory and the existing
+ref fingerprint. Fixer identity failures publish both snapshots and their ref
+delta, and remain unresolved across resume. Resuming a pending Fixer checks its
+recorded identity before taking a new role-start snapshot; uncertain refs never
+become a new accepted baseline. Candidate files remain intact on this failure.
 
 ## Completion and genuine failures
+
+Completion also requires no current findings, open architecture orders,
+unaccepted candidate, or pending transaction, and an explicit Architect judgment
+of the overall goal on the exact current tree and context revision. A valid
+judgment is reused. No additional approval role is introduced.
 
 Completion requires the configured number of consecutive clean native reviews
 on an unchanged `HEAD`; two is the recommended default. Every commit or other

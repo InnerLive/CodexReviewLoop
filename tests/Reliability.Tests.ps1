@@ -4,6 +4,7 @@ $modulePath = Join-Path $root "CodexReviewLoop.psd1"
 $fakeCodex = Join-Path $here "FakeCodex.ps1"
 
 Import-Module $modulePath -Force
+. (Join-Path $here 'ArchitectureFixtures.ps1')
 
 function New-ReliabilityRepo {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -113,7 +114,7 @@ function New-ReliabilityTestCase {
     New-Item -ItemType Directory -Path $caseRoot | Out-Null
     $caseRoot = (Get-Item -LiteralPath $caseRoot).FullName
     $repo = New-ReliabilityRepo -Path (Join-Path $caseRoot "repo")
-    $logRoot = Join-Path $caseRoot "logs"
+    $logRoot = New-TestLogRoot -ToolRoot $root
     $configPath = New-ReliabilityConfig -Path (Join-Path $caseRoot "profile.psd1") `
         -RepoPath $repo -LogRoot $logRoot
     $env:CODEX_REVIEW_LOOP_FAKE_LOG = Join-Path $caseRoot "calls.jsonl"
@@ -138,6 +139,7 @@ function New-ReliabilityTestCase {
 }
 
 function Clear-ReliabilityTestCase {
+    Clear-TestLogRoots -ToolRoot $root
     & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
     @(
         "CODEX_REVIEW_LOOP_FAKE_LOG",
@@ -202,14 +204,12 @@ function New-CriticTestPendingCall {
 function Assert-CriticTestFeedbackDelivery {
     param($Call, [int]$ReviewCount, [string]$Feedback)
 
-    $arguments = @($Call.arguments | Where-Object { $_ -like 'developer_instructions=*' })
-    $arguments.Count | Should Be 1
-    $instructions = $arguments[0].Substring('developer_instructions='.Length) | ConvertFrom-Json
+    $instructions = [string]$Call.prompt
     $expected = (Get-Content -Raw (Join-Path $root 'prompts/critic-feedback.md')).
         Replace('{{CRITIC_ID}}', ('critic-{0:D4}' -f $ReviewCount)).
         Replace('{{COVERED_REVIEWS}}', [string]$ReviewCount).
         Replace('{{FEEDBACK}}', $Feedback)
-    $instructions.EndsWith($expected) | Should Be $true
+    $instructions.Contains($expected) | Should Be $true
 }
 
 Describe "Periodic Critic process and resume" -Tags @("Process") {
@@ -242,14 +242,16 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Clear-ReliabilityTestCase
     }
 
-    It "defaults old profiles and resumes 41 reviews with one critique before any other model call" {
+    It "defaults old profiles and critiques 41 reviews before the next native review" {
         $config.CriticStartAfterReviews | Should Be 5
         Add-CriticTestReviews -State $state -From 11 -To 41
         $state.PSObject.Properties.Remove('ActiveCriticCall')
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $result.Status | Should Be 'completed'
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'critic-v2.schema.json'
         @($calls | Where-Object schemaPath -match 'critic-v2').Count | Should Be 2
         $saved = Read-ReviewLoopState $statePath
@@ -261,7 +263,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $critics[0].Thinking | Should Be 'high'
         $saved.ReviewCycle | Should Be 43
         $saved.ActiveCriticCall | Should BeNullOrEmpty
-        ($calls[1].arguments -join ' ') | Should Match 'Reviewer: examine'
+        ($calls[1].arguments -join ' ') | Should Not Match 'Reviewer: examine'
         ($calls[1].arguments -join ' ') | Should Not Match 'Architect: make'
     }
 
@@ -279,7 +281,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         Add-CriticTestReviews -State $state -From 7 -To 7
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 3
         @($calls | Where-Object callKind -eq 'exec').Count | Should Be 3
         $calls[1].prompt | Should Match 'Reviewer: examine'
@@ -296,12 +300,16 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Write-ReviewLoopState $statePath $state | Out-Null
         $first = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $first.Status | Should Be 'limit_reached'
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 1
         $calls[0].callKind | Should Be 'review'
         $second = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $second.Status | Should Be 'completed'
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'critic-v2.schema.json'
         $calls[2].callKind | Should Be 'review'
         (Read-ReviewLoopState $statePath).CleanPasses | Should Be 2
@@ -339,11 +347,11 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
                 -Speed standard -Prompt 'Current work' -LogRoot $logs -SchemaName $schema `
                 -CallId $id -State $s -StatePath $path -CodexPath $cli
         }
-        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v2.schema.json' | Out-Null
+        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v3.schema.json' | Out-Null
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
-        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v2.schema.json' | Out-Null
-        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v2.schema.json' | Out-Null
-        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect assessment 'architecture-assessment-v1.schema.json' | Out-Null
+        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v3.schema.json' | Out-Null
+        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect advice 'architecture-advice-v3.schema.json' | Out-Null
+        & $module $invoke $config $state $statePath $repo $runRoot $fakeCodex Architect assessment 'architecture-assessment-v2.schema.json' | Out-Null
         $config.ReviewerInstructions = 'Keep my original review context.'
         & $module {
             param($c, $s, $path, $r, $logs, $cli)
@@ -351,16 +359,18 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
                 -Prompt '' -LogRoot $logs -Mode Review -ReviewBase HEAD -CallId review-11 `
                 -State $s -StatePath $path -CodexPath $cli
         } $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 5
-        ($calls[1].arguments -join ' ') | Should Match 'every subsequent call to its recipient'
+        $calls[1].prompt | Should Match 'feedback, which remains in context until replaced'
         $calls[1].prompt | Should Match '"CriticStartAfterReviews":5'
         foreach ($index in @(2, 3)) {
             Assert-CriticTestFeedbackDelivery $calls[$index] 10 'Architect: make coherent decisions.'
             ($calls[$index].arguments -join ' ') | Should Not Match 'Reviewer: examine'
         }
         ($calls[4].arguments -join ' ') | Should Match 'Keep my original review context'
-        Assert-CriticTestFeedbackDelivery $calls[4] 10 'Reviewer: examine the current work independently.'
+        ($calls[4].arguments -join ' ') | Should Not Match 'Reviewer: examine the current work independently'
         ($calls[4].arguments -join ' ') | Should Not Match 'Architect: make'
         $state.RoleCalls[-1].CriticId | Should Be 'critic-0010'
         $saved = Read-ReviewLoopState $statePath
@@ -384,7 +394,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Add-CriticTestReviews -State $state -From 11 -To 11
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         & (Get-Module CodexReviewLoop) $invokeFixer $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 4
         $calls[1].callKind | Should Be 'resume'
         $calls[1].resumeThreadId | Should Be 'fixer-thread'
@@ -414,12 +426,14 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
                 -Prompt 'Fix' -LogRoot $logs -SchemaName fixer-result-v3.schema.json `
                 -CallId legacy-fix -State $s -StatePath $p -CodexPath $cli | Out-Null
             Invoke-ConfiguredCodexRole -Config $c -Role Architect -RepoPath $r -Speed standard `
-                -Prompt 'Advice' -LogRoot $logs -SchemaName architecture-advice-v2.schema.json `
+                -Prompt 'Advice' -LogRoot $logs -SchemaName architecture-advice-v3.schema.json `
                 -CallId legacy-advice -State $s -StatePath $p -CodexPath $cli | Out-Null
         } $config $state $statePath $repo $runRoot $fakeCodex
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         ($calls[1].arguments -join ' ') | Should Not Match 'Latest Critic feedback|Reviewer: examine|Architect: make'
-        ($calls[2].arguments -join ' ') | Should Match 'Architect: make'
+        $calls[2].prompt | Should Match 'Architect: make'
         @($state.RoleCalls | Where-Object Role -eq Fixer)[0].CriticId | Should Be ''
         @($state.RoleCalls | Where-Object Role -eq Critic)[0].StructuredResult |
             ConvertTo-Json -Compress | Should Be $before
@@ -449,7 +463,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         & (Get-Module CodexReviewLoop) {
             param($c, $s, $path, $r, $logs, $cli)
             Invoke-ConfiguredCodexRole -Config $c -Role Architect -RepoPath $r -Speed standard `
-                -Prompt 'Advice' -LogRoot $logs -SchemaName architecture-advice-v2.schema.json `
+                -Prompt 'Advice' -LogRoot $logs -SchemaName architecture-advice-v3.schema.json `
                 -CallId advice -State $s -StatePath $path -CodexPath $cli
         } $config $state $statePath $repo $runRoot $fakeCodex | Out-Null
         $last = Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | Select-Object -Last 1 | ConvertFrom-Json
@@ -499,7 +513,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
         $state = Read-ReviewLoopState $statePath
         Invoke-CriticTestGate $config $state $statePath $repo $runRoot $fakeCodex
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 1
         $calls[0].callKind | Should Be 'resume'
         $calls[0].resumeThreadId | Should Be 'critic-thread'
@@ -571,7 +587,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         & (Get-Module CodexReviewLoop) {
             param($r, $s, $p, $logs)
             $s.ActiveCriticCall | Add-Member -NotePropertyName RepositoryBackup -NotePropertyValue (
-                New-ReviewLoopCriticRepositoryBackup -RepoPath $r -LogRoot $logs)
+                New-ReviewLoopRepositoryBackup -RepoPath $r -LogRoot $logs)
             Write-ReviewLoopState -Path $p -State $s | Out-Null
             Set-ReviewLoopReviewerRecoveryLocator -RepoPath $r -StatePath $p
         } $repo $state $statePath $runRoot
@@ -590,7 +606,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (& git -C $repo for-each-ref --format='%(refname)' | Out-String) | Should Not Match 'critic-other|critic-tag'
         (& git -C $repo ls-files -v README.txt) | Should Be 'H README.txt'
         (& git -C $repo symbolic-ref refs/remotes/origin/HEAD) | Should Be "refs/heads/$branch"
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls[0].callKind | Should Be 'resume'
         $calls[0].resumeThreadId | Should Be 'preserved-critic-thread'
         $saved = Read-ReviewLoopState $statePath
@@ -660,7 +678,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
             (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'accepted newer work'
             (Get-Content -Raw $statePath) | Should Be $oldBytes
         }
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 4
         @($calls | Where-Object callKind -eq 'review').Count | Should Be 4
         (Read-ReviewLoopState $newPath).ReviewCycle | Should Be 6
@@ -754,7 +774,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         & (Get-Module CodexReviewLoop) {
             param($r, $p, $logs)
             $p | Add-Member -NotePropertyName RepositoryBackup -NotePropertyValue (
-                New-ReviewLoopCriticRepositoryBackup -RepoPath $r -LogRoot $logs)
+                New-ReviewLoopRepositoryBackup -RepoPath $r -LogRoot $logs)
         } $repo $pending $runRoot
         Set-Content (Join-Path $repo 'README.txt') 'critic staged overwrite'
         & git -C $repo add README.txt
@@ -815,7 +835,9 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         Write-ReviewLoopState $statePath $state | Out-Null
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
         $result.Status | Should Be 'completed'
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         $calls.Count | Should Be 3
         $calls[0].callKind | Should Be 'review'
         [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'critic-v2.schema.json'
@@ -859,13 +881,15 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
 
         $result.Status | Should Be 'completed'
-        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.schemaPath -notmatch 'architecture-orientation' -and $_.phase -ne 'completion' })
         [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'fixer-result-v3.schema.json'
         $calls[0].callKind | Should Be 'resume'
         $calls[0].resumeThreadId | Should Be 'preserved-fixer-thread'
-        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'architecture-assessment-v1.schema.json'
+        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'architecture-assessment-v2.schema.json'
         [IO.Path]::GetFileName($calls[2].schemaPath) | Should Be 'fixer-result-v3.schema.json'
-        [IO.Path]::GetFileName($calls[3].schemaPath) | Should Be 'architecture-assessment-v1.schema.json'
+        [IO.Path]::GetFileName($calls[3].schemaPath) | Should Be 'architecture-assessment-v2.schema.json'
         [IO.Path]::GetFileName($calls[4].schemaPath) | Should Be 'critic-v2.schema.json'
         ($calls[1].arguments -join ' ') | Should Not Match 'Architect: make'
         (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved unfinished work'
@@ -881,6 +905,7 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
         $repo = $case.Repo
         $logRoot = $case.LogRoot
         $configPath = $case.ConfigPath
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
     }
 
     AfterEach {
@@ -895,7 +920,7 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
         foreach ($arguments in $calls) {
             @($arguments | Where-Object { $_ -eq "--ignore-user-config" }).Count | Should Be 1
             @($arguments | Where-Object { $_ -eq "--ignore-rules" }).Count | Should Be 1
-            @($arguments | Where-Object { $_ -eq "--dangerously-bypass-approvals-and-sandbox" }).Count | Should Be 1
+            @($arguments | Where-Object { $_ -eq "--yolo" }).Count | Should Be 1
             @($arguments | Where-Object { $_ -eq "--sandbox" }).Count | Should Be 0
         }
     }
@@ -916,48 +941,48 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
 
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
-        (@($records[0].arguments) -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
-        (@($records[1].arguments) -contains "--dangerously-bypass-approvals-and-sandbox") | Should Be $true
+        (@($records[0].arguments) -contains "--yolo") | Should Be $true
+        (@($records[1].arguments) -contains "--yolo") | Should Be $true
         @($records | Where-Object { @($_.arguments) -contains "--sandbox" }).Count | Should Be 0
     }
 
     It "rejects worktree changes made by an analysis role with full command access" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "architecture-advice-v2.schema.json"
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "architecture-advice-v3.schema.json"
         $message = ""
         try {
             & (Get-Module CodexReviewLoop) {
                 param($profile, $repository, $logs, $fake)
                 Invoke-ConfiguredCodexRole -Config $profile -Role Architect -RepoPath $repository `
                     -Speed standard -Prompt review -LogRoot $logs -CodexPath $fake `
-                    -SchemaName "architecture-advice-v2.schema.json"
+                    -SchemaName "architecture-advice-v3.schema.json"
             } $config $repo $logRoot $fakeCodex | Out-Null
         }
         catch {
             $message = $_.Exception.Message
         }
 
-        $message | Should Match "changed the repository worktree"
+        $message | Should Match "changed repository state"
         (& git -C $repo status --porcelain=v1) | Should Not BeNullOrEmpty
     }
 
     It "rejects worktree changes made by the Architect assessment" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
-        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "architecture-assessment-v1.schema.json"
+        $env:CODEX_REVIEW_LOOP_FAKE_MUTATE_ON_SCHEMA = "architecture-assessment-v2.schema.json"
         $message = ""
         try {
             & (Get-Module CodexReviewLoop) {
                 param($profile, $repository, $logs, $fake)
                 Invoke-ConfiguredCodexRole -Config $profile -Role Architect -RepoPath $repository `
                     -Speed standard -Prompt assess -LogRoot $logs -CodexPath $fake `
-                    -SchemaName "architecture-assessment-v1.schema.json"
+                    -SchemaName "architecture-assessment-v2.schema.json"
             } $config $repo $logRoot $fakeCodex | Out-Null
         }
         catch {
             $message = $_.Exception.Message
         }
 
-        $message | Should Match "changed the repository worktree"
+        $message | Should Match "changed repository state"
         (& git -C $repo status --porcelain=v1) | Should Not BeNullOrEmpty
     }
 
@@ -1173,7 +1198,7 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
 
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 1 `
-            -SchemaPath (Join-Path $root "schemas\architecture-advice-v2.schema.json")
+            -SchemaPath (Join-Path $root "schemas\architecture-advice-v3.schema.json")
 
         $call.Success | Should Be $true
         (Get-Content -Raw -LiteralPath $call.ResultPath) | Should Not Match $secret
@@ -1190,12 +1215,163 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
 
         $call = Invoke-CodexCliRole -Role Test -RepoPath $repo -Model model -Thinking low `
             -Prompt p -LogRoot $logRoot -CodexPath $fakeCodex -MaxAttempts 2 `
-            -SchemaPath (Join-Path $root "schemas\architecture-advice-v2.schema.json")
+            -SchemaPath (Join-Path $root "schemas\architecture-advice-v3.schema.json")
         $call.Success | Should Be $true
         $call.StructuredResult.summary | Should Be "advice"
         $records = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json })
         $records[1].callKind | Should Be "resume"
+    }
+
+    It "corrects incomplete acceptance before success and before completed-cache reuse" {
+        $module = Get-Module CodexReviewLoop
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $statePath = Join-Path $caseRoot 'state.json'
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+            -ReviewBaseCommit (& git -C $repo rev-parse HEAD) -RunRoot $logRoot
+        & $module {
+            param($s)
+            Merge-ReviewLoopWorkOrders -State $s -Orders @([pscustomobject]@{
+                id='QUALIFICATION'; objective='Verify the candidate'; rationale='Acceptance evidence';
+                doneWhen='Candidate tests and source bindings agree'; evidence=@('README.md')
+            })
+            $s.ActiveWorkIds = @('QUALIFICATION')
+        } $state
+        $workBefore = $state.ArchitectWork | ConvertTo-Json -Depth 30 -Compress
+        $invalid = [ordered]@{
+            schemaVersion='2.0'; accept=$true; summary='Candidate assessed'; feedback=@();
+            commitMessage=@{subject='Verify candidate'; rationale='Evidence'; changes=@('Verified')};
+            newOrders=@(); workOutcomes=@(); goalComplete=$false
+        }
+        $invalidText = $invalid | ConvertTo-Json -Depth 15 -Compress
+        $invalid.workOutcomes = @(@{id='QUALIFICATION'; status='accepted'; evidence='Tests and source bindings agree'})
+        $validText = $invalid | ConvertTo-Json -Depth 15 -Compress
+        $sequence = Join-Path $caseRoot 'assessment-results.json'
+        Write-ReliabilityJsonArray -Path $sequence -Values @($invalidText, $validText, $validText)
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
+        $invoke = {
+            param($c,$s,$p,$r,$logs,$fake)
+            Invoke-ConfiguredCodexRole -Config $c -Role Architect -RepoPath $r -Speed standard `
+                -Prompt 'Assess selected work' -LogRoot $logs -CodexPath $fake `
+                -SchemaName 'architecture-assessment-v2.schema.json' -CallId assessment `
+                -State $s -StatePath $p
+        }
+        $first = & $module $invoke $config $state $statePath $repo $logRoot $fakeCodex
+        $first.Success | Should Be $true
+        $first.Attempts.Count | Should Be 2
+        $first.Attempts[0].ExitCode | Should Be 4
+        $first.Attempts[0].FailureKind | Should Be 'invalid_structured_output'
+        ($state.ArchitectWork | ConvertTo-Json -Depth 30 -Compress) | Should Be $workBefore
+        $record = $state.RoleCalls[-1]
+        $record.StructuredResult = $invalidText | ConvertFrom-Json
+        $cachedBefore = $record | ConvertTo-Json -Depth 30 -Compress
+        $originalHash = (Get-FileHash $record.ResultPath).Hash
+        $second = & $module $invoke $config $state $statePath $repo $logRoot $fakeCodex
+        $second.Success | Should Be $true
+        $second.ResultPath | Should Not Be $record.ResultPath
+        ($record | ConvertTo-Json -Depth 30 -Compress) | Should Be $cachedBefore
+        (Get-FileHash $record.ResultPath).Hash | Should Be $originalHash
+        ($state.ArchitectWork | ConvertTo-Json -Depth 30 -Compress) | Should Be $workBefore
+        $third = & $module $invoke $config $state $statePath $repo $logRoot $fakeCodex
+        $third.ResultPath | Should Be $second.ResultPath
+        $records = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $records.Count | Should Be 3
+        $records[1].callKind | Should Be 'resume'
+        $records[2].callKind | Should Be 'resume'
+        $records[2].prompt | Should Match 'explicitly assess every selected'
+        $records[2].prompt | Should Match "final run exit remain the orchestrator's obligations"
+        @($state.ArchitectWork.Orders | Where-Object status -ne 'open').Count | Should Be 0
+    }
+
+    It "corrects orientation plan and completion semantics before success and cache reuse" {
+        $module=Get-Module CodexReviewLoop
+        $config=Import-PowerShellDataFile -LiteralPath $configPath
+        foreach($kind in @('orientation','plan','goal')){
+            $state=New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
+                -ReviewBaseCommit (& git -C $repo rev-parse HEAD) -RunRoot $logRoot
+            & $module {
+                param($s)
+                Merge-ReviewLoopWorkOrders -State $s -Orders @([pscustomobject]@{
+                    id='CLOSED';objective='Original work';rationale='Evidence';doneWhen='Verified';evidence=@('README.md')
+                })
+                $s.ArchitectWork.Orders[0].status='accepted'
+            } $state
+            $statePath=Join-Path $caseRoot "$kind-state.json"
+            $order=@{id='CLOSED';objective='New work';rationale='New evidence';doneWhen='Verified';evidence=@('README.md')}
+            $newOrder=$order.Clone();$newOrder.id='NEW'
+            switch($kind){
+                orientation {
+                    $schema='architecture-orientation-v1.schema.json'
+                    $invalid=@{schemaVersion='1.0';goal=@{statement='Clarified goal';sources=@('README.md');uncertainties=@()};orders=@($order)}
+                    $valid=$invalid.Clone();$valid.orders=@($newOrder)
+                }
+                plan {
+                    $schema='architecture-advice-v3.schema.json'
+                    $invalid=@{schemaVersion='3.0';summary='Plan';approach='Address new work';steps=@();considerations=@();orders=@($order);selectedWorkIds=@('CLOSED')}
+                    $valid=$invalid.Clone();$valid.orders=@($newOrder);$valid.selectedWorkIds=@('NEW')
+                }
+                goal {
+                    $schema='architecture-assessment-v2.schema.json'
+                    $invalid=@{schemaVersion='2.0';accept=$false;summary='Remaining work';feedback=@();commitMessage=@{subject='';rationale='';changes=@()};newOrders=@();workOutcomes=@();goalComplete=$false}
+                    $valid=$invalid.Clone();$valid.newOrders=@($newOrder)
+                }
+            }
+            $invalidText=$invalid|ConvertTo-Json -Depth 20 -Compress
+            $validText=$valid|ConvertTo-Json -Depth 20 -Compress
+            $sequence=Join-Path $caseRoot "$kind-results.json"
+            $phase=if($kind -eq 'orientation'){'orientation'}else{''}
+            Write-ReliabilityJsonArray -Path $sequence -Values @(
+                @{phase=$phase;result=$invalidText}, @{phase=$phase;result=$validText},
+                @{phase=$phase;result=$validText})
+            $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE=$sequence
+            $invoke={
+                param($c,$s,$p,$r,$logs,$fake,$schema,$kind)
+                Invoke-ConfiguredCodexRole -Config $c -Role Architect -RepoPath $r -Speed standard `
+                    -Prompt 'Assess current task' -LogRoot $logs -CodexPath $fake -SchemaName $schema `
+                    -CallId "boundary-$kind" -State $s -StatePath $p `
+                    -RequireWorkSelection:($kind -eq 'plan') -RequireGoalDecision:($kind -eq 'goal')
+            }
+            $workBefore=$state.ArchitectWork|ConvertTo-Json -Depth 30 -Compress
+            $first=& $module $invoke $config $state $statePath $repo $logRoot $fakeCodex $schema $kind
+            $first.Success|Should Be $true
+            if ($first.Attempts.Count -ne 2) {
+                throw "$kind expected semantic correction; attempts=$($first.Attempts.Count); result=$($first.FinalMessage); work=$workBefore"
+            }
+            $first.Attempts.Count|Should Be 2
+            $first.Attempts[0].ExitCode|Should Be 4
+            $first.Attempts[0].FailureKind|Should Be 'invalid_structured_output'
+            ($state.ArchitectWork|ConvertTo-Json -Depth 30 -Compress)|Should Be $workBefore
+            $state.ActiveWorkIds.Count|Should Be 0
+            $record=$state.RoleCalls[-1]
+            # Simulate a schema-valid legacy checkpoint before semantic validation existed.
+            $record.StructuredResult=$invalidText|ConvertFrom-Json
+            $record.FinalMessage=$invalidText
+            [IO.File]::WriteAllText($record.ResultPath,$invalidText,[Text.UTF8Encoding]::new($false))
+            $recordBefore=$record|ConvertTo-Json -Depth 30 -Compress
+            $oldHash=(Get-FileHash $record.ResultPath).Hash
+            $second=& $module $invoke $config $state $statePath $repo $logRoot $fakeCodex $schema $kind
+            $second.Success|Should Be $true
+            $second.ResultPath|Should Not Be $record.ResultPath
+            ($record|ConvertTo-Json -Depth 30 -Compress)|Should Be $recordBefore
+            (Get-FileHash $record.ResultPath).Hash|Should Be $oldHash
+            ($state.ArchitectWork|ConvertTo-Json -Depth 30 -Compress)|Should Be $workBefore
+            $third=& $module $invoke $config $state $statePath $repo $logRoot $fakeCodex $schema $kind
+            $third.ResultPath|Should Be $second.ResultPath
+            & $module {
+                param($s,$r,$kind)
+                switch($kind){
+                    orientation {Register-ReviewLoopOrientation -State $s -Result $r}
+                    plan {Register-ReviewLoopWorkPlan -State $s -Result $r -RequireSelection}
+                    goal {Register-ReviewLoopWorkAssessment -State $s -Result $r -RequireGoalDecision}
+                }
+            } $state $second.StructuredResult $kind
+            $state.ArchitectWork.Orders[0].status|Should Be 'accepted'
+            @($state.ArchitectWork.Orders|Where-Object id -eq NEW).Count|Should Be 1
+            if($kind -eq 'plan'){$state.ActiveWorkIds|Should Be @('NEW')}
+        }
+        $records=@(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG|ForEach-Object{$_|ConvertFrom-Json})
+        $records.Count|Should Be 9
+        @($records|Where-Object callKind -eq resume).Count|Should Be 6
     }
 
     It "terminates a timed-out role" {
@@ -1338,6 +1514,487 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
 
 }
 
+Describe "Fixer ref identity evidence and resume" -Tags @("GitSafety", "GitSafetyA") {
+    BeforeEach {
+        $case = New-ReliabilityTestCase
+        $repo = $case.Repo
+        $logRoot = $case.LogRoot
+        New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+        $statePath = Join-Path $logRoot 'run-v1.json'
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $logRoot
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
+    }
+    AfterEach { Clear-ReliabilityTestCase }
+
+    It "captures exact complete rows with the unchanged legacy fingerprint" {
+        $branch = (& git -C $repo symbolic-ref HEAD | Out-String).Trim()
+        & git -C $repo symbolic-ref refs/remotes/origin/HEAD $branch
+        & (Get-Module CodexReviewLoop) {
+            param($r, $logs)
+            $snapshot = Get-ReviewLoopRepositorySnapshot $r
+            $native = @(& git -C $r for-each-ref '--format=%(refname) %(objectname) %(symref)')
+            ($snapshot.Refs -join "`n") | Should Be ($native -join "`n")
+            $legacy = @(& git -C $r for-each-ref '--format=%(refname) %(objectname)')
+            $snapshot.RefsFingerprint | Should Be (Get-ReviewLoopSha256 (@($legacy | Sort-Object) -join "`n"))
+            Assert-ReviewLoopFixerRepositoryIdentity -Before $snapshot -After (Get-ReviewLoopRepositorySnapshot $r) -LogRoot $logs -CallId unchanged
+            Test-Path (Join-Path $logs 'unchanged-repository-identity-failure.json') | Should Be $false
+        } $repo $logRoot
+    }
+
+    It "rejects HEAD, symbolic HEAD, user branch, tag and technical ref changes with exact public deltas" {
+        Set-Content (Join-Path $repo 'README.txt') 'preserved fixer candidate'
+        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/turn-diffs/captures/test/base')) {
+            $before = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+            & git -C $repo update-ref $ref $before.Head
+            $after = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+            & (Get-Module CodexReviewLoop) {
+                param($a, $b, $logs)
+                $failure = ''
+                try { Assert-ReviewLoopFixerRepositoryIdentity -Before $a -After $b -LogRoot $logs -CallId mutation }
+                catch { $failure = $_.Exception.Message }
+                $failure | Should Match 'Fixer changed HEAD or Git refs'
+            } $before $after $logRoot
+            $proof = Get-Content -Raw (Join-Path $logRoot 'mutation-repository-identity-failure.json') | ConvertFrom-Json
+            ($proof.ChangedFields -join ',') | Should Be 'RefsFingerprint,Refs'
+            ($proof.Before.Refs -join "`n") | Should Be ($before.Refs -join "`n")
+            ($proof.After.Refs -join "`n") | Should Be ($after.Refs -join "`n")
+            $proof.RefDelta.Count | Should Be 1
+            $proof.RefDelta[0].Change | Should Be 'Added'
+            $proof.RefDelta[0].Row | Should Be (@($after.Refs | Where-Object { $_ -clike "$ref *" })[0])
+            (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved fixer candidate'
+        }
+        $before = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        & git -C $repo symbolic-ref HEAD refs/heads/user-branch
+        & (Get-Module CodexReviewLoop) {
+            param($r, $a, $logs)
+            $failure = ''
+            try { Assert-ReviewLoopFixerRepositoryIdentity -Before $a -After (Get-ReviewLoopRepositorySnapshot $r) -LogRoot $logs -CallId symbolic }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Changed fields: HeadRef'
+        } $repo $before $logRoot
+        $proof = Get-Content -Raw (Join-Path $logRoot 'symbolic-repository-identity-failure.json') | ConvertFrom-Json
+        ($proof.ChangedFields -join ',') | Should Be 'HeadRef'
+        $before = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        & git -C $repo add README.txt
+        & git -C $repo commit -q -m 'actual head movement'
+        & (Get-Module CodexReviewLoop) {
+            param($r, $a, $logs)
+            $failure = ''
+            try { Assert-ReviewLoopFixerRepositoryIdentity -Before $a -After (Get-ReviewLoopRepositorySnapshot $r) -LogRoot $logs -CallId head }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Changed fields: Head'
+        } $repo $before $logRoot
+        $proof = Get-Content -Raw (Join-Path $logRoot 'head-repository-identity-failure.json') | ConvertFrom-Json
+        ($proof.ChangedFields -contains 'Head') | Should Be $true
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved fixer candidate'
+    }
+
+    It "refuses and persists a pending ref violation before starting a resumed Fixer after tool change" {
+        $state.Stage = 'fixing'
+        $state.ActiveRoleCall = New-CriticTestPendingCall $state $repo Fixer fixer-identity
+        $state.ActiveRoleCall.ExecutionFingerprint = 'old-tool'
+        $start = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        $state.ActiveRoleCall | Add-Member RepositoryRefs $start.Refs
+        Set-Content (Join-Path $repo 'README.txt') 'preserved dirty candidate'
+        Set-Content (Join-Path $repo 'new-candidate.txt') 'preserved new candidate'
+        & git -C $repo tag unexpected-tag
+        Write-ReviewLoopState $statePath $state | Out-Null
+        $config = Import-PowerShellDataFile $case.ConfigPath
+        $config['__ExecutionFingerprint'] = 'updated-tool'
+        & (Get-Module CodexReviewLoop) {
+            param($c, $s, $r, $logs, $path, $fake)
+            $failure = ''
+            try { Invoke-ConfiguredCodexRole -Config $c -Role Fixer -RepoPath $r -Speed standard -Prompt 'Continue' -LogRoot $logs -SchemaName fixer-result-v3.schema.json -CallId fixer-identity -State $s -StatePath $path -CodexPath $fake }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Fixer changed HEAD or Git refs'
+        } $config $state $repo $logRoot $statePath $fakeCodex
+        $saved = Read-ReviewLoopState $statePath
+        $failure = $saved.ActiveRoleCall.RepositoryIdentityFailure
+        $failure.Sha256 | Should Be (Get-FileHash $failure.Path -Algorithm SHA256).Hash
+        $proof = Get-Content -Raw $failure.Path | ConvertFrom-Json
+        $proof.BeforeInventoryAvailable | Should Be $true
+        $proof.RefDelta.Count | Should Be 1
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        # Even restoring the tag externally must not erase the persisted violation.
+        & git -C $repo tag -d unexpected-tag | Out-Null
+        & (Get-Module CodexReviewLoop) {
+            param($c, $s, $r, $logs, $path, $fake)
+            $failure = ''
+            try { Invoke-ConfiguredCodexRole -Config $c -Role Fixer -RepoPath $r -Speed standard -Prompt 'Continue' -LogRoot $logs -SchemaName fixer-result-v3.schema.json -CallId fixer-identity -State $s -StatePath $path -CodexPath $fake }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Unresolved Fixer repository identity violation'
+        } $config $saved $repo $logRoot $statePath $fakeCodex
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved dirty candidate'
+        (Get-Content (Join-Path $repo 'new-candidate.txt')) | Should Be 'preserved new candidate'
+        (Get-FileHash $failure.Path -Algorithm SHA256).Hash | Should Be $failure.Sha256
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "does not invent missing legacy ref inventory rows" {
+        $before = & (Get-Module CodexReviewLoop) {
+            param($r) Get-ReviewLoopRepositorySnapshot $r | Select-Object Head, HeadRef, RefsFingerprint
+        } $repo
+        & git -C $repo tag legacy-unknown
+        & (Get-Module CodexReviewLoop) {
+            param($r, $a, $logs)
+            $failure = ''
+            try { Assert-ReviewLoopFixerRepositoryIdentity -Before $a -After (Get-ReviewLoopRepositorySnapshot $r) -LogRoot $logs -CallId legacy }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Fixer changed HEAD or Git refs'
+        } $repo $before $logRoot
+        $proof = Get-Content -Raw (Join-Path $logRoot 'legacy-repository-identity-failure.json') | ConvertFrom-Json
+        $proof.BeforeInventoryAvailable | Should Be $false
+        $proof.Before.Refs | Should BeNullOrEmpty
+        $proof.RefDelta | Should BeNullOrEmpty
+        $proof.AfterInventoryAvailable | Should Be $true
+        (& git -C $repo show-ref --verify --hash refs/tags/legacy-unknown) | Should Be $before.Head
+    }
+
+    It "detects a symbolic technical ref retarget even with identical object IDs and fingerprint" {
+        $head = $state.CurrentHead
+        & git -C $repo update-ref refs/heads/target-a $head
+        & git -C $repo update-ref refs/heads/target-b $head
+        & git -C $repo symbolic-ref refs/codex/symbolic refs/heads/target-a
+        $before = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        & git -C $repo symbolic-ref refs/codex/symbolic refs/heads/target-b
+        $after = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        $after.RefsFingerprint | Should Be $before.RefsFingerprint
+        $failure = ''
+        try { & (Get-Module CodexReviewLoop) { param($a,$b,$logs) Assert-ReviewLoopFixerRepositoryIdentity -Before $a -After $b -LogRoot $logs -CallId symbolic-same-object } $before $after $logRoot }
+        catch { $failure = $_.Exception.Message }
+        $failure | Should Match 'Changed fields: Refs'
+        $proof = Get-Content -Raw (Join-Path $logRoot 'symbolic-same-object-repository-identity-failure.json') | ConvertFrom-Json -DateKind String
+        ($proof.ChangedFields -join ',') | Should Be 'Refs'
+        $proof.RefDelta.Count | Should Be 2
+        $proof.RefDelta[0].Row | Should Be "refs/codex/symbolic $head refs/heads/target-a"
+        $proof.RefDelta[1].Row | Should Be "refs/codex/symbolic $head refs/heads/target-b"
+    }
+}
+
+Describe "Explicit external ref requalification" -Tags @("GitSafety", "GitSafetyA") {
+    $global:RefRecoveryOriginalWrite = & (Get-Module CodexReviewLoop) { ${function:Write-ReviewLoopState} }
+    BeforeEach {
+        $case = New-ReliabilityTestCase
+        $repo = $case.Repo
+        $runRoot = & (Get-Module CodexReviewLoop) {
+            param($configPath,$r)
+            $config = Import-ReviewLoopConfig -ConfigPath $configPath -RepoPath $r
+            $config.ReviewBase = Get-ReviewLoopGitValue $r @('rev-parse', 'HEAD')
+            $paths = New-ReviewLoopRunPaths -Config $config -RepoPath $r
+            Initialize-ReviewLoopRunPaths -Paths $paths | Out-Null
+            $paths.RunRoot
+        } $case.ConfigPath $repo
+        New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+        $statePath = Join-Path $runRoot 'run-v1.json'
+        $packagePath = Join-Path $case.Root 'approval.json'
+        & (Get-Module CodexReviewLoop) {
+            param($r, $logs, $path, $approval)
+            Initialize-ReviewLoopConsole -TranscriptPath '' -HostOutputEnabled $false
+            $base = Get-ReviewLoopGitValue $r @('rev-parse', 'HEAD')
+            & git -C $r update-ref refs/codex/capture/old $base
+            & git -C $r update-ref refs/codex/checkpoint/old $base
+            $s = New-ReviewLoopState -RepoPath $r -ReviewBase $base -ReviewBaseCommit $base -Speed standard -RunRoot $logs
+            $start = Get-ReviewLoopRepositorySnapshot $r
+            $s.Stage = 'fixing'; $s.ActiveClusterId = 'cluster'; $s.ActiveFindingIds = @('F1'); $s.ActiveWorkIds = @('W1')
+            Merge-ReviewLoopWorkOrders -State $s -Orders @([pscustomobject]@{
+                id='W1'; objective='Preserve the candidate'; rationale='The public contract remains mandatory'
+                doneWhen='Current review and gates accept the exact candidate'; evidence=@('README.txt')
+            })
+            $s.ArchitectWork.OrientationRequired = $false
+            $s.ArchitectWork.Goal = [pscustomobject]@{statement='Preserve the candidate';sources=@('README.txt');uncertainties=@()}
+            $s.ActiveRoleCall = [pscustomobject]@{
+                Role = 'Fixer'; CallId = 'failed-fixer'; RepositoryHead = $start.Head
+                RepositoryHeadRef = $start.HeadRef; RefsFingerprint = $start.RefsFingerprint; RepositoryRefs = $start.Refs
+            }
+            Set-Content (Join-Path $r 'README.txt') 'preserved edited bytes'
+            & git -C $r add README.txt
+            Set-Content (Join-Path $r 'new.txt') 'preserved untracked bytes'
+            & git -C $r update-ref -d refs/codex/capture/old
+            & git -C $r update-ref -d refs/codex/checkpoint/old
+            & git -C $r update-ref refs/codex/capture/new $base
+            & git -C $r update-ref refs/codex/checkpoint/new $base
+            try { Assert-ReviewLoopFixerRepositoryIdentity -Before $start -After (Get-ReviewLoopRepositorySnapshot $r) -LogRoot $logs -CallId failed-fixer -State $s -StatePath $path }
+            catch { if ($_.Exception.Message -notmatch 'Fixer changed HEAD') { throw } }
+            $s.Status = 'failed'; $s.Stage = 'stopped'; $s.ExitCode = 2
+            Write-ReviewLoopState $path $s | Out-Null
+            $ledger = Join-Path (Split-Path -Parent $logs) 'ledger-v2.json'
+            $findingLedger = New-ReviewLoopLedger -RepoPath $r
+            $finding = ConvertTo-ReviewLoopFindingRecord -Finding ([pscustomobject]@{
+                title='[P1] candidate defect';description='Preserve the public contract';locations=@([pscustomobject]@{path='README.txt';line=1})
+            }) -ReviewId old-review -Head $base
+            $finding.Id = 'F1'
+            $findingLedger.Findings = @($finding)
+            Write-ReviewLoopLedger -Path $ledger -Ledger $findingLedger | Out-Null
+            $lease = Get-ReviewLoopGitValue $r @('rev-parse', '--git-path', 'codex-review-loop.lock')
+            if (-not [IO.Path]::IsPathRooted($lease)) { $lease = Join-Path $r $lease }
+            [IO.File]::WriteAllBytes($lease, [byte[]]@())
+            $actor = Join-Path $logs 'independent-actor.json'
+            Write-ReviewLoopAtomicJson $actor ([pscustomobject]@{ ClosedTurnId = 'actual-external-turn'; ObservedAt = '2026-10-12T04:50:35Z' })
+            $role = Join-Path $logs 'failed-fixer.jsonl'
+            Set-Content $role '{"type":"turn.completed"}'
+            $proof = Get-Content -Raw $s.ActiveRoleCall.RepositoryIdentityFailure.Path | ConvertFrom-Json -DateKind String
+            $package = [pscustomobject]@{
+                SchemaVersion = '1.0'; OperatorApproved = $true; RepoPath = $r; RunId = $s.RunId
+                CallId = 'failed-fixer'; ReviewBaseCommit = $base
+                StateSha256 = (Get-FileHash $path -Algorithm SHA256).Hash
+                Failure = $s.ActiveRoleCall.RepositoryIdentityFailure; ApprovedRefDelta = $proof.RefDelta
+                Candidate = Get-ReviewLoopRepositorySnapshot $r
+                ExternalActorEvidence = @([pscustomobject]@{ Path = $actor; Sha256 = (Get-FileHash $actor -Algorithm SHA256).Hash })
+                RoleEvidence = @([pscustomobject]@{ Path = $role; Sha256 = (Get-FileHash $role -Algorithm SHA256).Hash })
+                Ledger = [pscustomobject]@{ Path = $ledger; Sha256 = (Get-FileHash $ledger -Algorithm SHA256).Hash }
+            }
+            Write-ReviewLoopAtomicJson $approval $package
+        } $repo $runRoot $statePath $packagePath
+        $state = Read-ReviewLoopState $statePath
+        $package = Get-Content -Raw $packagePath | ConvertFrom-Json -DateKind String
+        $stateHash = (Get-FileHash $statePath -Algorithm SHA256).Hash
+        $failureHash = $package.Failure.Sha256
+    }
+    AfterEach {
+        & (Get-Module CodexReviewLoop) { Set-Item Function:script:Write-ReviewLoopState -Value $global:RefRecoveryOriginalWrite }
+        Clear-ReliabilityTestCase
+    }
+
+    It "dry-runs without checkpoint writes or model calls and returns exact candidate pins" {
+        $package.Candidate = $null; $package.StateSha256 = ''
+        $package | ConvertTo-Json -Depth 100 | Set-Content $packagePath
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -RequalificationDryRun -Json
+        $result.ExitCode | Should Be 0
+        $result.Status | Should Be 'requalification_ready'
+        $result.CandidateApproved | Should Be $false
+        $result.StateSha256 | Should Be $stateHash
+        $current = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        ($result.Candidate.Refs -join "`n") | Should Be ($current.Refs -join "`n")
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        Test-Path (Join-Path $runRoot 'repository-backups') | Should Be $false
+    }
+
+    It "atomically preserves candidate, ledger, work orders and original failure for fresh review" {
+        $result = & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $packagePath
+        $result.Status | Should Be 'requalified'
+        $saved = Read-ReviewLoopState $statePath
+        $saved.Stage | Should Be 'review_round_requested'
+        $saved.ActiveRoleCall | Should BeNullOrEmpty
+        $saved.CompletionRequalificationRequired | Should Be $true
+        $saved.RetainedCandidate.FixerResult.Success | Should Be $false
+        $saved.RetainedCandidate.FixerResult.StructuredResult | Should BeNullOrEmpty
+        $saved.RetainedCandidate.FindingIds[0] | Should Be 'F1'
+        $saved.RetainedCandidate.WorkIds[0] | Should Be 'W1'
+        $saved.ArchitectWork.Orders[0].id | Should Be 'W1'
+        (Get-FileHash $package.Ledger.Path -Algorithm SHA256).Hash | Should Be $package.Ledger.Sha256
+        (Get-FileHash $package.Failure.Path -Algorithm SHA256).Hash | Should Be $failureHash
+        (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved edited bytes'
+        (Get-Content (Join-Path $repo 'new.txt')) | Should Be 'preserved untracked bytes'
+        & (Get-Module CodexReviewLoop) { param($r,$c) Assert-ReviewLoopRepositoryUnchanged $r $c 'preserved candidate' } $repo $package.Candidate
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "is idempotent after acknowledgement without another state transition" {
+        & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $packagePath | Out-Null
+        $saved = Read-ReviewLoopState $statePath
+        $afterHash = (Get-FileHash $statePath -Algorithm SHA256).Hash
+        $result = & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $saved $statePath $repo $packagePath
+        $result.Status | Should Be 'already_requalified'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $afterHash
+        @((Read-ReviewLoopState $statePath).ExternalRefRequalifications).Count | Should Be 1
+    }
+
+    It "refuses extra branch, tag, technical ref and HEAD changes before state writes" {
+        foreach ($ref in @('refs/heads/unapproved','refs/tags/unapproved','refs/codex/unapproved')) {
+            & git -C $repo update-ref $ref $state.CurrentHead
+            $failure = ''
+            try { & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $packagePath }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'Current full repository identity differs'
+            (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+            & git -C $repo update-ref -d $ref
+        }
+        & git -C $repo commit -q -m 'unapproved head'
+        $failure = ''
+        try { & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $packagePath }
+        catch { $failure = $_.Exception.Message }
+        $failure | Should Match 'Current full repository identity differs'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+    }
+
+    It "refuses candidate file and index changes and absent approval without writes" {
+        foreach ($kind in @('file','index','approval')) {
+            if ($kind -eq 'file') { Set-Content (Join-Path $repo 'new.txt') 'unapproved content' }
+            if ($kind -eq 'index') { & git -C $repo add new.txt }
+            if ($kind -eq 'approval') { $package.OperatorApproved = $false; $package | ConvertTo-Json -Depth 100 | Set-Content $packagePath }
+            $failure = ''
+            try { & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $packagePath }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Not BeNullOrEmpty
+            (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+            if ($kind -eq 'file') { Set-Content (Join-Path $repo 'new.txt') 'preserved untracked bytes' }
+            if ($kind -eq 'index') { & git -C $repo reset -q HEAD -- new.txt }
+        }
+    }
+
+    It "refuses forged delta and missing actor, role or legacy inventory proofs" {
+        foreach ($kind in @('delta','actor','role','legacy')) {
+            $attempt = Get-Content -Raw $packagePath | ConvertFrom-Json -DateKind String
+            if ($kind -eq 'delta') { $attempt.ApprovedRefDelta[0].Row += 'forged' }
+            if ($kind -eq 'actor') { $attempt.ExternalActorEvidence[0].Sha256 = '0' * 64 }
+            if ($kind -eq 'role') { $attempt.RoleEvidence = @() }
+            if ($kind -eq 'legacy') { $state.ActiveRoleCall.RepositoryRefs = $null }
+            $attemptPath = Join-Path $case.Root "approval-$kind.json"
+            $attempt | ConvertTo-Json -Depth 100 | Set-Content $attemptPath
+            $failure = ''
+            try { & (Get-Module CodexReviewLoop) { param($s,$p,$r,$e) Invoke-ReviewLoopExternalRefRequalification $s $p $r $e } $state $statePath $repo $attemptPath }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Not BeNullOrEmpty
+            (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+            Test-Path (Join-Path $runRoot 'repository-backups') | Should Be $false
+        }
+    }
+
+    It "ordinary resume refuses the persisted failure before initialization or models" {
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -CodexPath $fakeCodex -Json
+        $result.ExitCode | Should Be 2
+        $result.Reason | Should Match 'Unresolved Fixer repository identity violation'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "requires separately bound approval of an exact intervening delta and rejects any further ref" {
+        & git -C $repo update-ref -d refs/codex/checkpoint/new
+        & git -C $repo update-ref refs/codex/checkpoint/later $state.CurrentHead
+        $current = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        $failure = Get-Content -Raw $package.Failure.Path | ConvertFrom-Json -DateKind String
+        $laterDelta = & (Get-Module CodexReviewLoop) { param($a,$b) @(Get-ReviewLoopRefDelta $a $b) } $failure.After.Refs $current.Refs
+        $package | Add-Member ApprovedInterveningRefDelta @($laterDelta)
+        $package.Candidate = $current
+        $package | ConvertTo-Json -Depth 100 | Set-Content $packagePath
+        $unbound = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $unbound.Reason | Should Match 'Independent intervening-actor evidence'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        $actorPath = Join-Path $case.Root 'independent-later-actor.json'
+        Set-Content $actorPath '{"closedOwnerTurn":"independently-observed-later-turn"}'
+        $package | Add-Member InterveningActorEvidence @([pscustomobject]@{Path=$actorPath;Sha256=(Get-FileHash $actorPath -Algorithm SHA256).Hash})
+        $package | ConvertTo-Json -Depth 100 | Set-Content $packagePath
+        & git -C $repo update-ref refs/tags/still-unapproved $state.CurrentHead
+        $extra = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $extra.Reason | Should Match 'differs from the exact approved intervening delta'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        & git -C $repo update-ref -d refs/tags/still-unapproved
+        $approved = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $approved.Status | Should Be 'requalified'
+        @($approved.ApprovedInterveningRefDelta).Count | Should Be 2
+        (Get-FileHash $package.Failure.Path -Algorithm SHA256).Hash | Should Be $failureHash
+    }
+
+    It "does not create a missing lease in a public dry run" {
+        $lease = Join-Path $repo '.git/codex-review-loop.lock'
+        Remove-Item -LiteralPath $lease
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -RequalificationDryRun -Json
+        $result.ExitCode | Should Be 2
+        Test-Path $lease | Should Be $false
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "rejects missing or empty mandatory snapshot bindings at the shared boundary" {
+        foreach ($snapshot in @([pscustomobject]@{}, [pscustomobject]@{Head=$state.CurrentHead}, [pscustomobject]@{Head='';Fingerprint=''})) {
+            $failure = ''
+            try { & (Get-Module CodexReviewLoop) { param($r,$s) Assert-ReviewLoopRepositoryUnchanged $r $s 'mandatory snapshot' } $repo $snapshot }
+            catch { $failure = $_.Exception.Message }
+            $failure | Should Match 'complete mandatory repository snapshot'
+        }
+    }
+
+    It "recovers interruption before the atomic checkpoint write without losing the candidate" {
+        $global:RefRecoveryInterrupt = $true
+        & (Get-Module CodexReviewLoop) {
+            Set-Item Function:script:Write-ReviewLoopState -Value {
+                param($Path,$State)
+                if ($global:RefRecoveryInterrupt) { throw 'simulated before atomic write' }
+                & $global:RefRecoveryOriginalWrite -Path $Path -State $State
+            }
+        }
+        $first = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $first.ExitCode | Should Be 2
+        $first.Reason | Should Match 'simulated before atomic write'
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $stateHash
+        @((Read-ReviewLoopState $statePath).ActiveFindingIds)[0] | Should Be 'F1'
+        $global:RefRecoveryInterrupt = $false
+        $second = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $second.Status | Should Be 'requalified'
+        (Get-FileHash $package.Failure.Path -Algorithm SHA256).Hash | Should Be $failureHash
+        (Get-Content (Join-Path $repo 'new.txt')) | Should Be 'preserved untracked bytes'
+    }
+
+    It "recognizes interruption after the atomic write as acknowledged without repeating it" {
+        $global:RefRecoveryWrites = 0
+        & (Get-Module CodexReviewLoop) {
+            Set-Item Function:script:Write-ReviewLoopState -Value {
+                param($Path,$State)
+                $global:RefRecoveryWrites++
+                & $global:RefRecoveryOriginalWrite -Path $Path -State $State
+                throw 'simulated after atomic write'
+            }
+        }
+        $first = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $first.ExitCode | Should Be 2
+        $first.Reason | Should Match 'simulated after atomic write'
+        $afterHash = (Get-FileHash $statePath -Algorithm SHA256).Hash
+        $second = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $second.Status | Should Be 'already_requalified'
+        $global:RefRecoveryWrites | Should Be 1
+        (Get-FileHash $statePath -Algorithm SHA256).Hash | Should Be $afterHash
+        (Read-ReviewLoopState $statePath).RetainedCandidate.FixerResult.Success | Should Be $false
+    }
+
+    It "publicly requalifies then resumes through fresh native review, Architect, gates and clean passes" {
+        # Host gates require a clean index. Pin this successful workflow fixture
+        # after unstaging; the separate preservation case covers staged bytes.
+        & git -C $repo reset -q HEAD -- README.txt
+        $package.Candidate = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        $package | ConvertTo-Json -Depth 100 | Set-Content $packagePath
+        $gateMarker = Join-Path $case.Root 'host-gate.txt'
+        $gate = "HostGates = @(@{ Name = 'recovery-gate'; FilePath = 'pwsh'; Arguments = @('-NoProfile', '-Command', 'Set-Content -LiteralPath ''$gateMarker'' -Value checked; exit 0') })"
+        (Get-Content -Raw $case.ConfigPath).Replace('HostGates = @()', $gate).Replace('LessonsLearnedCommitThreshold = 6','LessonsLearnedCommitThreshold = 0') | Set-Content $case.ConfigPath
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -RequalifyExternalRefChange $packagePath -Json
+        $result.Status | Should Be 'requalified'
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        Test-Path $gateMarker | Should Be $false
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = Join-Path $case.Root 'plans.json'
+        $plans = @(
+            @{result='No findings.'},
+            @{result='{"schemaVersion":"3.0","summary":"Freshly assess preserved progress","approach":"Check the public contract","steps":[],"considerations":[],"orders":[],"selectedWorkIds":["W1"]}'},
+            @{result='{"schemaVersion":"3.0","summary":"Preserved contract","targetedTest":{"available":false,"executable":"","arguments":[]}}'},
+            @{result='{"schemaVersion":"2.0","accept":true,"summary":"Fresh candidate accepted","feedback":[],"commitMessage":{"subject":"Preserve contract","rationale":"Fresh review and gates","changes":["Preserve candidate"]},"newOrders":[],"workOutcomes":[{"id":"W1","status":"accepted","evidence":"Current contract checked"}],"goalComplete":true}'},
+            @{result='No findings.'}, @{result='No findings.'}
+        )
+        Write-ReliabilityJsonArray -Path $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE -Values $plans
+        $resumed = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath -ReviewerInstructions 'Prüfe A29 gemäß Paketkarte.' -CodexPath $fakeCodex -Json
+        if ($resumed.Status -ne 'completed') {
+            Write-Host ($resumed | ConvertTo-Json -Depth 20)
+            $failedState = Read-ReviewLoopState $statePath
+            Write-Host ($failedState | Select-Object Stage, Status, ExitCode, ActiveRoleCall, RoleCalls | ConvertTo-Json -Depth 30)
+        }
+        $resumed.Reason | Should Be ''
+        $resumed.Status | Should Be 'completed'
+        $resumed.CleanPasses | Should Be 2
+        $saved = Read-ReviewLoopState $statePath
+        $saved.RunId | Should Be $state.RunId
+        $saved.ArchitectWork.Orders[0].id | Should Be 'W1'
+        $saved.ArchitectWork.Orders[0].status | Should Be 'accepted'
+        $saved.RetainedCandidate | Should BeNullOrEmpty
+        $saved.CurrentHead | Should Not Be $state.CurrentHead
+        Test-Path $gateMarker | Should Be $true
+        $calls = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $calls[0].callKind | Should Be 'review'
+        @($calls | Where-Object callKind -eq review).Count | Should Be 3
+        @($calls | Where-Object schemaPath -match 'assessment-v2').Count | Should Be 1
+        $saved.ExternalRefRequalifications[0].FailedCall.CallId | Should Be 'failed-fixer'
+        (Get-FileHash $package.Failure.Path -Algorithm SHA256).Hash | Should Be $failureHash
+        @((Read-ReviewLoopLedger -Path $package.Ledger.Path -RepoPath $repo).Findings | Where-Object Id -eq F1).Count | Should Be 1
+    }
+}
+
 Describe "Unattended Git and recovery reliability boundaries" `
     -Tags @("GitSafety", "GitSafetyA") {
     BeforeEach {
@@ -1346,6 +2003,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $repo = $case.Repo
         $logRoot = $case.LogRoot
         $configPath = $case.ConfigPath
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
     }
 
     AfterEach {
@@ -1441,7 +2099,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         [string]$records[0].prompt | Should Be ""
         [string]$records[0].schemaPath | Should Be ""
         ($records[0].arguments -join " ") | Should Match "review --base HEAD"
-        ($records[0].arguments -join " ") | Should Not Match "developer_instructions="
+        ($records[0].arguments -join " ") | Should Not Match "Current shared task"
 
         $replayed = & (Get-Module CodexReviewLoop) {
             param($profile, $loopState, $loopStatePath, $loopLedger, $repository, $logs, $fake)
@@ -1705,8 +2363,9 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.callKind -eq "review" })[0]
-        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }) |
-            Should Be @('developer_instructions="Profile review guidance"')
+        $instructions = [string]@($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" })[0]
+        ($instructions.Substring("developer_instructions=".Length) | ConvertFrom-Json).StartsWith("Profile review guidance") | Should Be $true
+        $instructions | Should Not Match "Current shared task"
         [string]$reviewCall.prompt | Should Be ""
         [string]$reviewCall.schemaPath | Should Be ""
     }
@@ -1729,8 +2388,9 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.callKind -eq "review" })[0]
-        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }) |
-            Should Be @($expected)
+        $instructions = [string]@($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" })[0]
+        ($instructions.Substring("developer_instructions=".Length) | ConvertFrom-Json).StartsWith($override) | Should Be $true
+        $instructions | Should Not Match "Profile review guidance"
         (Get-Content -Raw -LiteralPath $result.StatePath) |
             Should Not Match "Prüfe Unicode"
         (Get-Content -Raw -LiteralPath (Join-Path $result.RunRoot "terminal.log")) |
@@ -1753,8 +2413,8 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $reviewCall = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.callKind -eq "review" })[0]
-        @($reviewCall.arguments | Where-Object { $_ -like "developer_instructions=*" }).Count |
-            Should Be 0
+        ($reviewCall.arguments -join " ") | Should Not Match "Current shared task"
+        ($reviewCall.arguments -join " ") | Should Not Match "Profile review guidance"
     }
 
     It "restarts an interrupted native review without a custom prompt or schema" {
@@ -1794,7 +2454,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $record.callKind | Should Be "review"
         [string]$record.prompt | Should Be ""
         [string]$record.schemaPath | Should Be ""
-        ($record.arguments -join " ") | Should Not Match "developer_instructions="
+        ($record.arguments -join " ") | Should Not Match "Current shared task"
         (Read-ReviewLoopState -Path $statePath).ActiveRoleCall | Should BeNullOrEmpty
     }
 
@@ -1972,6 +2632,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
             }
         }
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $head
             PatchFingerprint = [string]$snapshot.Fingerprint
             ExpectedTree = ""
@@ -2231,6 +2892,7 @@ Describe "Unattended Git and recovery reliability boundaries" `
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $preHead
             PatchFingerprint = $fingerprint
             ExpectedTree = ""
@@ -2325,6 +2987,7 @@ Changes:
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $preHead
             PatchFingerprint = $fingerprint
             ExpectedTree = $tree
@@ -2602,6 +3265,7 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         $repo = $case.Repo
         $logRoot = $case.LogRoot
         $configPath = $case.ConfigPath
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath "" -HostOutputEnabled $false }
     }
 
     AfterEach {
@@ -3203,6 +3867,65 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         }
     }
 
+    It "resumes the sealed pending commit with a long Unicode message on native stdin" {
+        $runRoot = Join-Path $caseRoot 'stdin-commit-run'
+        New-Item -ItemType Directory -Path $runRoot | Out-Null
+        $statePath = Join-Path $runRoot 'run-v1.json'
+        $ledgerPath = Join-Path $caseRoot 'stdin-ledger.json'
+        $preHead = & git -C $repo rev-parse HEAD
+        Set-Content (Join-Path $repo 'README.txt') 'verified Unicode change'
+        $module = Get-Module CodexReviewLoop
+        $fingerprint = & $module {param($r) Get-ReviewLoopWorktreeFingerprint -RepoPath $r} $repo
+        & git -C $repo add -A
+        $tree = & git -C $repo write-tree
+        $message = ('Reliability: Grüße Ω "quoted subject"' + "`n`n" +
+            (("Preserve 日本語, quotes `"exact`", and verified change.`n" * 40).TrimEnd()))
+        $message.Length | Should BeGreaterThan 500
+        $ledger = New-ReviewLoopLedger -RepoPath $repo
+        Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
+            -ReviewId r1 -Head $preHead | Out-Null
+        $finding = $ledger.Findings[0]
+        $finding.Status = 'fixing'
+        $finding.Verification = [pscustomobject]@{
+            accept=$true; WorkRevision=0; workOutcomes=@(); goalComplete=$false;
+            summary='Verified tree and native checks agree'
+        }
+        Write-ReviewLoopLedger -Path $ledgerPath -Ledger $ledger | Out-Null
+        $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard -RunRoot $runRoot
+        $state.CurrentHead = $preHead
+        $state.ActiveClusterId = $finding.ClusterId
+        $state.ActiveFindingIds = @($finding.Id)
+        $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification; PreHead = $preHead; PatchFingerprint = $fingerprint;
+            ExpectedTree = $tree; Message = $message; NeedsCurrentGates = $false
+        }
+        Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+        $profile = Import-PowerShellDataFile -LiteralPath $configPath
+        $profile.AutoCommit = $false
+        $complete = {
+            param($c,$s,$sp,$l,$lp,$r,$logs)
+            Complete-ReviewLoopPendingCommit -Config $c -State $s -StatePath $sp `
+                -Ledger $l -LedgerPath $lp -RepoPath $r -RunRoot $logs
+        }
+        $blocked = $null
+        try { & $module $complete $profile $state $statePath $ledger $ledgerPath $repo $runRoot }
+        catch { $blocked = $_ }
+        $blocked.Exception.Message | Should Match 'AutoCommit is disabled'
+        (& git -C $repo rev-parse HEAD) | Should Be $preHead
+        $saved = Read-ReviewLoopState $statePath
+        $saved.PendingCommit.Message | Should Be $message
+        $saved.PendingCommit.ExpectedTree | Should Be $tree
+        $profile.AutoCommit = $true
+        (& $module $complete $profile $saved $statePath $ledger $ledgerPath $repo $runRoot) | Should Be $true
+        (& git -C $repo show -s --format=%T HEAD) | Should Be $tree
+        (& git -C $repo show -s --format=%P HEAD) | Should Be $preHead
+        $actual = & $module {param($r) Get-ReviewLoopGitValue -RepoPath $r -Arguments @('show','-s','--format=%B','HEAD')} $repo
+        $actual | Should Be $message
+        (Read-ReviewLoopState $statePath).PendingCommit | Should BeNullOrEmpty
+        (& git -C $repo status --porcelain) | Should BeNullOrEmpty
+        (& $module $complete $profile $saved $statePath $ledger $ledgerPath $repo $runRoot) | Should Be $false
+    }
+
     It "does not treat an unrelated concurrent commit as the pending verified commit" {
         $runRoot = Join-Path $caseRoot "concurrent-commit-run"
         New-Item -ItemType Directory -Path $runRoot | Out-Null
@@ -3234,6 +3957,7 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $preHead
             PatchFingerprint = $verifiedFingerprint
             ExpectedTree = $verifiedTree
@@ -3295,6 +4019,7 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $preHead
             PatchFingerprint = $verifiedFingerprint
             ExpectedTree = $verifiedTree
@@ -3449,15 +4174,15 @@ exit 0
             & (Get-Module CodexReviewLoop) {
                 param(
                     $profile, $loopState, $loopStatePath, $loopLedger, $loopLedgerPath,
-                    $loopFinding, $fixer, $repository, $logs
+                    $loopFinding, $fixer, $repository, $logs, $cliPath
                 )
                 Invoke-ReviewLoopAttemptAssessment -Config $profile `
                     -State $loopState -StatePath $loopStatePath `
                     -Ledger $loopLedger -LedgerPath $loopLedgerPath `
                     -Findings @($loopFinding) -FixerCall $fixer -Attempt 1 `
-                    -RepoPath $repository -Speed standard -RunRoot $logs
+                    -RepoPath $repository -Speed standard -RunRoot $logs -CodexPath $cliPath
             } $config `
-                $state $statePath $ledger $ledgerPath $finding $fixerCall $repo $runRoot | Out-Null
+                $state $statePath $ledger $ledgerPath $finding $fixerCall $repo $runRoot $fakeCodex | Out-Null
         }
         catch {
             $failure = $_
@@ -3541,6 +4266,7 @@ exit 0
         & git -C $repo -c commit.gpgsign=false commit -q -m $message
         $committedHead = & git -C $repo rev-parse HEAD
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $baseHead
             PatchFingerprint = $fingerprint
             ExpectedTree = $tree
@@ -3595,6 +4321,7 @@ exit 0
         $state.ActiveClusterId = $finding.ClusterId
         $state.ActiveFindingIds = @($finding.Id)
         $state.PendingCommit = [pscustomobject]@{
+            Verification = $finding.Verification
             PreHead = $preHead
             PatchFingerprint = $fingerprint
             ExpectedTree = $tree
@@ -3637,7 +4364,7 @@ exit 0
             Should Be "resolved"
     }
 
-    It "invalidates a clean pass when a CLI ReviewerInstructions override is omitted" {
+    It "requalifies failed reviewing with concise new ReviewerInstructions on normal resume" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $paths = & (Get-Module CodexReviewLoop) {
             param($profile, $repository)
@@ -3650,12 +4377,13 @@ exit 0
         $previousFingerprint = & (Get-Module CodexReviewLoop) {
             param($path)
             Get-ReviewLoopExecutionFingerprint `
-                -ConfigPath $path -ReviewerInstructions "previous CLI guidance"
+                -ConfigPath $path -ReviewerInstructions ('historical long guidance '*200)
         } $configPath
         $state = New-ReviewLoopState -RepoPath $repo -ReviewBase HEAD -Speed standard `
             -RunRoot $paths.RunRoot -ReviewBaseCommit $head `
             -ExecutionFingerprint $previousFingerprint
-        $state.Stage = "clean_review"
+        $state.Status = "failed"
+        $state.Stage = "reviewing"
         $state.ReviewCycle = 1
         $state.CleanPasses = 1
         $state.CleanHead = $head
@@ -3670,15 +4398,19 @@ exit 0
         $env:CODEX_REVIEW_LOOP_FAKE_RESULT_SEQUENCE = $sequence
 
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
-            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+            -ReviewerInstructions 'Prüfe A29 gemäß Paketkarte.' -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
 
         $result.Status | Should Be "completed"
         $result.CleanPasses | Should Be 2
-        $result.ReviewCycles | Should Be 3
+        # Resume finishes the already started cycle before advancing to the next.
+        $result.ReviewCycles | Should Be 2
         $reviewCalls = @(Get-Content -LiteralPath $env:CODEX_REVIEW_LOOP_FAKE_LOG |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.callKind -eq "review" })
         $reviewCalls.Count | Should Be 2
+        (Read-ReviewLoopState $statePath).RunId | Should Be $state.RunId
+        ($reviewCalls[0].arguments -join ' ') | Should Match 'Prüfe A29'
+        ($reviewCalls[0].arguments -join ' ') | Should Not Match 'historical long guidance|Current shared task'
     }
 
     It "never resurrects an older failed run after a newer run completed" {
@@ -4143,4 +4875,94 @@ exit 0
         }
     }
 
+}
+
+Describe "Bounded native transport and concise role context" -Tags @("Process") {
+    AfterEach { Clear-ReliabilityTestCase }
+
+    It "matches actual Windows quoting including Unicode backslashes quotes and empty arguments" {
+        $info=[Diagnostics.ProcessStartInfo]::new()
+        $info.FileName=Join-Path $PSHOME 'pwsh.exe'
+        @('', 'simple', 'a b', '你好😀', 'quoted"value', 'trail slash\', 'slash\\"quote') | ForEach-Object { [void]$info.ArgumentList.Add($_) }
+        $native=[Diagnostics.ProcessStartInfo].GetMethod('BuildArguments',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($info,@())
+        $actual=& (Get-Module CodexReviewLoop) { param($i) Get-ReviewLoopProcessCommandLine $i } $info
+        $actual | Should Be ('"'+$info.FileName+'" '+$native)
+    }
+
+    It "allows exactly 500 characters including final NUL and rejects 501 before start" {
+        $info=[Diagnostics.ProcessStartInfo]::new()
+        $info.FileName=Join-Path $PSHOME 'pwsh.exe'
+        $info.Arguments='x'*(499-$info.FileName.Length-4)
+        & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info
+        $info.Arguments+='x'
+        & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info
+        $info.Arguments+='x'
+        { & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info } | Should Throw '501 UTF-16'
+    }
+
+    It "rejects a Windows-overlong native Reviewer before any fake child starts" {
+        $case=New-ReliabilityTestCase
+        $call=Invoke-CodexCliRole -Role Reviewer -RepoPath $case.Repo -Model fake -Thinking high -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -DeveloperInstructions ('x'*40000) -LogRoot $case.LogRoot -MaxAttempts 1 -CodexPath $fakeCodex
+        $call.Success | Should Be $false
+        $call.FailureReason | Should Match 'maximum is 500'
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+
+    It "keeps short native review guidance and base without state or Critic serialization" {
+        $case=New-ReliabilityTestCase
+        $config=Import-PowerShellDataFile $case.ConfigPath
+        $config.ReviewerInstructions='Prüfe A29 gemäß Paketkarte.'
+        $state=New-ReviewLoopState -RepoPath $case.Repo -ReviewBase HEAD -Speed standard -RunRoot $case.LogRoot -ReviewBaseCommit (& git -C $case.Repo rev-parse HEAD)
+        $state.RetainedCandidate=[pscustomobject]@{Snapshot=[pscustomobject]@{Refs=@('DO_NOT_SERIALIZE'*5000)}}
+        $state.TaskContext='DO_NOT_SERIALIZE'
+        $call=& (Get-Module CodexReviewLoop) { param($c,$s,$r,$log,$fake) Invoke-ConfiguredCodexRole -Config $c -Role Reviewer -RepoPath $r -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -LogRoot $log -CallId review-short -State $s -StatePath (Join-Path $log 'run-v1.json') -CodexPath $fake } $config $state $case.Repo $case.LogRoot $fakeCodex
+        $call.Success | Should Be $true
+        $record=Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ConvertFrom-Json
+        ($record.arguments -join ' ') | Should Match 'review --base HEAD'
+        ($record.arguments -join ' ') | Should Match 'Prüfe A29'
+        ($record.arguments -join ' ') | Should Not Match 'DO_NOT_SERIALIZE'
+        $record.prompt | Should Be ''
+    }
+
+    It "passes structured exec and resume result schema and repository through equivalent short paths" {
+        $case=New-ReliabilityTestCase
+        $schema=Join-Path $root 'schemas/architecture-advice-v3.schema.json'
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT='{"schemaVersion":"3.0","summary":"ok","approach":"ok","steps":[],"considerations":[],"orders":[],"selectedWorkIds":[]}'
+        $callId='C-fbd6b50629c73f09-c2-architect-assess-full-stable-call-identity'
+        $stem=& (Get-Module CodexReviewLoop) {param($id) Get-ReviewLoopRoleArtifactStem -CallId $id -Role Architect} $callId
+        foreach($mode in @('Exec','Resume')) {
+            $call=Invoke-CodexCliRole -Role Architect -CallId $callId -RepoPath $case.Repo -Model fake -Thinking high -Speed standard -Mode $mode -ThreadId fake-thread -Prompt 'Current concise task' -SchemaPath $schema -LogRoot $case.LogRoot -CodexPath $fakeCodex
+            $call.Success | Should Be $true
+            $call.CallId | Should Be $callId
+            $leaf=if($mode-eq'Exec'){"$stem.result.json"}else{"$stem-run2.result.json"}
+            [IO.Path]::GetFileName($call.ResultPath) | Should Be $leaf
+            (Get-Content $call.ResultPath -Raw|ConvertFrom-Json).summary | Should Be 'ok'
+            if($mode-eq'Exec') {$firstPath=$call.ResultPath;$firstHash=(Get-FileHash $firstPath).Hash}
+        }
+        (Get-FileHash $firstPath).Hash | Should Be $firstHash
+        $calls=@(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG|ForEach-Object{$_|ConvertFrom-Json})
+        $calls[1].callKind | Should Be 'resume'
+        foreach($record in $calls) {
+            $record.prompt | Should Be 'Current concise task'
+            $record.schemaPath | Should Not BeNullOrEmpty
+            [IO.Path]::IsPathRooted($record.resultPath) | Should Be $false
+        }
+    }
+
+    It "excludes snapshots history and outcome evidence and emits each active objective once" {
+        $case=New-ReliabilityTestCase
+        $s=New-ReviewLoopState -RepoPath $case.Repo -ReviewBase HEAD -Speed standard -RunRoot $case.LogRoot -ReviewBaseCommit (& git -C $case.Repo rev-parse HEAD)
+        $s.ArchitectWork.Goal=[pscustomobject]@{statement='CURRENT_GOAL';sources=@('PRIVATE_TECHNICAL_EVIDENCE');uncertainties=@()}
+        $s.ArchitectWork.OrientationRequired=$false
+        & (Get-Module CodexReviewLoop) { param($state) Merge-ReviewLoopWorkOrders -State $state -Orders @([pscustomobject]@{id='W-1';objective='CURRENT_OBJECTIVE';rationale='PRIVATE_TECHNICAL_EVIDENCE';doneWhen='CURRENT_DONE';evidence=@('PRIVATE_TECHNICAL_EVIDENCE')}) } $s
+        $s.ActiveWorkIds=@('W-1')
+        foreach($role in @('Architect','Fixer')) {
+            $text=& (Get-Module CodexReviewLoop) { param($state,$repo,$role) Get-ReviewLoopSharedContextInstructions -State $state -RepoPath $repo -Role $role } $s $case.Repo $role
+            foreach($token in @('CURRENT_GOAL','CURRENT_OBJECTIVE','CURRENT_DONE')) { [regex]::Matches($text,$token).Count | Should Be 1 }
+            $text | Should Not Match 'PRIVATE_TECHNICAL_EVIDENCE|RetainedCandidate|outcomeEvidence|Refs'
+        }
+        foreach($role in @('Reviewer','Critic','LessonsLearned')) {
+            (& (Get-Module CodexReviewLoop) { param($state,$repo,$role) Get-ReviewLoopSharedContextInstructions -State $state -RepoPath $repo -Role $role } $s $case.Repo $role) | Should Be ''
+        }
+    }
 }

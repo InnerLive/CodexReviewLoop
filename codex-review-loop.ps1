@@ -37,6 +37,12 @@ profile for this invocation. Auto conservatively detects an evidenced parent
 branch and otherwise uses the normal main/master fallback. When omitted while
 resuming, the checkpoint keeps its recorded review base.
 
+.PARAMETER TaskContext
+Optional original assignment shared with all working roles. Without one, the
+Architect reconstructs it from repository evidence. Resume inherits the saved
+value; an explicit replacement, including an empty string, reclarifies the task
+and invalidates dependent acceptance and review evidence.
+
 .PARAMETER ReviewerInstructions
 Optional supplemental developer instructions for the native Reviewer. An
 explicit command-line value wins over the profile, including an empty string
@@ -134,6 +140,15 @@ Shows the full command help.
 .NOTES
 The ledger, checkpoints, and role logs are stored under the profile's LogRoot.
 AutoCommit and HostGates are controlled by the profile as well.
+
+.PARAMETER RequalifyExternalRefChange
+Path to an operator-approved exact external-ref-change evidence package.
+Acknowledges only that delta and preserves the failed candidate for a fresh
+review. This operation exits without running models or repository gates.
+
+.PARAMETER RequalificationDryRun
+Validate the evidence and report the exact candidate and checkpoint pins without
+writing a transition. Requires RequalifyExternalRefChange. See docs/operations.md.
 #>
 [CmdletBinding()]
 param(
@@ -146,12 +161,18 @@ param(
     [AllowEmptyString()]
     [string]$ReviewerInstructions = "",
 
+    [AllowEmptyString()][string]$TaskContext = "",
+
     [ValidateSet("standard", "fast")]
     [string]$Speed = "standard",
 
     [string]$CodexPath = "",
 
     [switch]$NewRun,
+
+    [string]$RequalifyExternalRefChange = "",
+
+    [switch]$RequalificationDryRun,
 
     [ValidateSet("compact", "balanced", "detailed")]
     [string]$OutputMode = "compact",
@@ -208,6 +229,8 @@ Import-Module $modulePath -Force
 $arguments = @{
     RepoPath = $RepoPath
     NewRun = $NewRun
+    RequalifyExternalRefChange = $RequalifyExternalRefChange
+    RequalificationDryRun = $RequalificationDryRun
     OutputMode = $OutputMode
     HeartbeatSeconds = $HeartbeatSeconds
     ColorMode = $ColorMode
@@ -224,6 +247,9 @@ if ($PSBoundParameters.ContainsKey("ReviewBase")) {
 }
 if ($PSBoundParameters.ContainsKey("ReviewerInstructions")) {
     $arguments.ReviewerInstructions = $ReviewerInstructions
+}
+if ($PSBoundParameters.ContainsKey("TaskContext")) {
+    $arguments.TaskContext = $TaskContext
 }
 if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
     $arguments.CodexPath = $CodexPath

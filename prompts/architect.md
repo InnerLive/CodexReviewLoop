@@ -1,10 +1,8 @@
-Provide advice for the current finding cluster.
+Plan a solution for current findings and necessary architecture work. Select
+existing or new work by stable ID; omission does not withdraw open work.
 
 Current findings:
 {{FINDINGS}}
 
-Current repository context:
+Repository scope:
 {{REPOSITORY_CONTEXT}}
-
-Additional history (`[]` when already established in this thread):
-{{HISTORY}}

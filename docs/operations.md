@@ -2,6 +2,93 @@
 
 [Back to the README](../README.md)
 
+Every native process start is limited to 500 UTF-16 characters, including the
+quoted executable, Windows argument quoting and final NUL. An overlong command
+fails before starting. Use concise Reviewer guidance; native review already uses
+the pinned base and repository instructions. Shared state, ref inventories and
+history are not Reviewer instructions. Structured roles receive the current
+task and relevant open work once through stdin, without technical snapshots.
+The adapter uses equivalent short flags and paths, retaining model, reasoning,
+service tier, authentication, repository scope, schema and result identity.
+Artifact basenames use a deterministic CallId digest and role; durable calls retain
+the complete CallId and actual file paths, including paths saved before this change.
+Changing Reviewer guidance on ordinary resume requalifies the existing run;
+it does not turn previous failure or an old clean pass into review success.
+
+## Explicit external ref-change requalification
+
+Ordinary resume stops on a persisted Fixer repository-identity failure before
+recovery or initialization writes. All refs remain protected, including desktop
+metadata refs. A namespace is never evidence that a change is safe.
+
+When an operator has independently established and approved one exact external
+ref delta, `-RequalifyExternalRefChange <package.json>` provides an explicit
+requalification boundary. It supports only State 2.0 failed pending Fixers with
+complete original Before/After inventories. It cannot reconstruct legacy rows,
+acknowledge HEAD/HeadRef changes, restore refs, or make an old role successful.
+Use an existing explicit `-ConfigPath`; `-NewRun` is incompatible.
+
+The JSON package has these fields (SHA256 file bindings use uppercase hex):
+
+| Field | Exact binding |
+|---|---|
+| `SchemaVersion` | `"1.0"` |
+| `OperatorApproved` | Boolean `true`, approving only the literal delta |
+| `RepoPath`, `RunId`, `CallId`, `ReviewBaseCommit` | Failed checkpoint identity and pinned base |
+| `StateSha256` | SHA256 of the checkpoint before transition |
+| `Failure` | `{ "Path": "...", "Sha256": "..." }` matching the checkpoint's public failure binding |
+| `ApprovedRefDelta` | Complete ordered `{ "Change": "Removed" or "Added", "Row": "..." }` array from that failure, with exact spaces preserved |
+| `ApprovedInterveningRefDelta` | Optional exact ordered delta from `Failure.After` to the approved current inventory; defaults to empty |
+| `InterveningActorEvidence` | Nonempty independent file bindings required when approving an intervening delta |
+| `ExternalActorEvidence` | Nonempty array of independently established actor/approval evidence file bindings |
+| `RoleEvidence` | Nonempty array of closed role trace/result/raw-proof file bindings |
+| `Ledger` | File binding for the run's shared `ledger-v2.json` |
+| `Candidate` | Complete current snapshot: `Head`, `Fingerprint`, `Branch`, `HeadRef`, `RefsFingerprint`, `IndexFingerprint`, `Refs` |
+
+The explicit operation is the operator's acknowledgement of those bound files
+and rows. It does not infer causation from their names or automatically verify
+a particular vendor's metadata format. The operator must review actual actor,
+process-closure, role and candidate evidence before invoking it.
+
+An intervening delta uses the same operation and requires its own independent
+actor bindings and literal-row approval. The original failure and original
+approved delta remain unchanged. Every current ref must match those two exact
+transitions; missing approval means an empty intervening delta. This is not a
+namespace exception or a general event-chain mechanism.
+
+First use `-RequalificationDryRun -Json` with the package. During preparation
+only, `Candidate` may be null and `StateSha256` empty: the dry run reports exact
+prospective pins, not approval of them. Review and fill those pins, then repeat
+the dry run with the final package. A dry run performs no checkpoint, ledger,
+candidate or ref transition and invokes no model or repository gate.
+It opens only an existing lease, exclusively and read-only. A missing lease is
+refused without creating a file.
+
+```powershell
+pwsh -NoProfile -File .\codex-review-loop.ps1 -RepoPath C:\dev\Project `
+    -ConfigPath C:\profiles\Project.psd1 -RequalifyExternalRefChange C:\proof\package.json `
+    -RequalificationDryRun -Json
+```
+
+Omit only `-RequalificationDryRun` to acknowledge the approved package. Under the
+exclusive lease, the operation checks every current ref against the captured
+After inventory plus the explicitly approved intervening delta, the original
+pending role and failure, candidate bytes/index,
+checkpoint, finding ledger, all supplied evidence, branch and base. It rechecks
+before the single atomic state transition. Failed checks preserve the candidate
+and checkpoint; unconsumed public receipts/backups after an interruption are
+not acknowledgement. Repeating an acknowledged package at the unchanged fresh
+review boundary is a no-op. Any further ref, file, index or proof change stops.
+
+The successful operation exits `requalified`/0 without models, gates, staging
+or commits. It keeps original failed-role evidence, finding/work identities and
+candidate backup; resets clean passes and previous assessment/review evidence;
+and places that candidate at the existing fresh native-review boundary. Run the
+ordinary command separately to obtain fresh native review, current Architect
+acceptance, configured host gates and unchanged-HEAD clean passes. Old tests or
+the acknowledgement itself are never completion evidence. Prevent further
+external ref writers; each later boundary continues to protect all refs.
+
 ## Before starting
 
 Use a dedicated branch and verify that:
@@ -25,6 +112,7 @@ pwsh -File C:\Tools\CodexReviewLoop\codex-review-loop.ps1 `
 | `-RepoPath` | Required | Repository to review and fix; may be positional |
 | `-ConfigPath` | Auto-discovered | Select or create a specific profile |
 | `-ReviewBase` | Profile or checkpoint value | Override with a Git revision or use conservative `Auto` detection |
+| `-TaskContext` | Optional; inherited on resume | Shared original assignment; without one, the Architect reconstructs it from repository evidence |
 | `-ReviewerInstructions` | Profile value or empty | Override supplemental native Reviewer developer instructions; an explicit empty string disables the profile value |
 | `-Speed` | `standard` (default), `fast` | Global Codex service tier |
 | `-CodexPath` | Auto-detected | Use a specific Codex CLI executable |
@@ -96,6 +184,14 @@ does not repeat successful criticism.
 An interrupted Fixer with a resumable thread keeps its unfinished patch after a
 tool update. Its resumed result must pass the current Architect assessment,
 tests, and commit gates before it can be accepted.
+Before resuming that thread, its recorded HEAD, symbolic HEAD ref, and complete
+ref fingerprint must still match. A known unresolved Fixer identity violation
+stops again without changing the candidate, even after a tool update. The
+public `*-repository-identity-failure.json` records the changed identity fields,
+exact captured ref inventories, and their added/removed rows; the checkpoint
+binds this evidence by SHA256. Older calls without captured inventory rows
+report that inventory as unavailable rather than reconstructing it. Changing
+the execution fingerprint does not authorize rebasing an unknown old ref state.
 
 Use the same resume command and existing Reviewer-instruction override as
 before. No special Critic switch or `-NewRun` is needed. An already interrupted
@@ -146,7 +242,7 @@ Interrupted fixer work resumes from its recorded thread when possible. If a
 Fixer changed files before a resumable thread ID was available, the loop first
 preserves that complete Git diff and gives one fresh Fixer the same semantic
 attempt. If that recovery also fails, the latest diff is retained as evidence,
-the clean checkpoint is restored, and native review starts again. A changed
+the owned candidate is retained, and native review starts again. A changed
 tool or execution-affecting profile fingerprint resets
 clean-pass evidence and starts a fresh native review when the repository is
 clean. `MaxReviewCycles`, `MaxFixAttempts`, role settings, targeted-test
@@ -188,7 +284,7 @@ worktree resume checks. Its durable checkpoint restores the branch or detached
 fresh native review starts. A small locator in the repository's Git directory
 allows this checkpoint to be found even if the Reviewer switched branches.
 Successful cleanup is intentionally absent from terminal output. A cleanup
-that cannot reproduce the exact clean checkpoint stops safely and remains
+that cannot reproduce the exact checkpoint stops safely and remains
 idempotently resumable. Other local refs, ignored files, and modified submodule
 worktrees are not cleaned automatically.
 
@@ -209,6 +305,24 @@ requires a clean worktree, respects the repository lock, and keeps compatible
 finding history. It is not needed to refresh an exhausted Fixer round because
 that happens automatically.
 
+## State upgrade and coordinated tool updates
+
+State version 2.0 keeps the existing `run-v1.json` filename and run references.
+A version 1.0 run can upgrade only at a clean, inactive cycle boundary, after
+the previous process has actually exited. No active role, Critic, gate recovery,
+partial recovery, cleanup, or commit transaction may remain. The old state is
+backed up as `run-v1.json.before-work-state-2.0.json`; run identity, review base,
+findings, history, and sessions survive. Initial goal clarification runs again
+and old completion evidence is invalidated. Older tools cannot read version 2.0.
+
+For a running productive loop, let its operator limit the live review budget and
+finish the entire active round with the old tool. Confirm process exit, exit
+code, repository cleanliness, locks, and transaction state before changing the
+tool checkout. Requalify wrapper bindings while preserving the profile, base,
+Reviewer instructions, role settings, and service tier, then resume the same run.
+Archived patches are evidence, not automatically accepted work. A completed and
+integrated task must not be reopened for the upgrade.
+
 ## Outcomes
 
 | Status | Exit code | Meaning |
@@ -219,12 +333,12 @@ that happens automatically.
 | `limit_reached` | `4` | The configured per-invocation review budget was used; run the same command to continue |
 
 Rejected solutions and exhausted Fixer rounds are not terminal outcomes. After
-`MaxFixAttempts` unsuccessful Fixer calls, the loop writes a binary Git patch,
-copies untracked files, and records hashes under the run directory. It then
-restores only the exact captured Fixer changes, verifies a clean worktree, and
-starts another native review. A changed `HEAD`, unexpected paths or contents,
+`MaxFixAttempts` unsuccessful Fixer calls, the loop saves file contents, new files,
+the complete index and provenance in a repository backup with a manifest.
+It retains the full owned candidate, verifies its file, index, and ref fingerprints, and starts
+another native review against the same base. A changed `HEAD`, unexpected paths or contents,
 damaged artifacts, submodules, or reparse points are genuine technical failures
-and stop cleanup without deleting uncertain state.
+and stop the run without deleting uncertain state.
 
 `MaxReviewCycles` is deliberately different: it lets a user cap one unattended
 script invocation for token or time control. Every new invocation resets only
@@ -233,8 +347,8 @@ checkpoint resumable, does not mark any finding blocked, and the same command
 continues with a fresh budget.
 
 The lessons-learned phase does not consume `MaxReviewCycles`. If its Fixer
-round reaches `MaxFixAttempts`, the rejected patch is preserved and restored
-through the normal cleanup path, the phase stays open, and native review
+round reaches `MaxFixAttempts`, the candidate is preserved for review,
+the phase stays open, and native review
 continues. By default, an accepted lessons-learned solution is the final cycle.
 With `ReviewAfterLessonsLearnedCommit = $true`, a real lessons-learned commit
 resets clean passes and requires the configured native clean reviews again.

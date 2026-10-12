@@ -34,6 +34,10 @@ Codex uses the current task to prepare the review and finds the tool through
 the installed skill. You do not need to provide a path, name the skill, or
 write a command. Existing compatible runs resume automatically.
 
+The Architect keeps the overall goal and necessary work in view across rounds.
+You can also start without describing a task: it first examines the changes,
+commit messages and project documentation to clarify what the branch should achieve.
+
 > [!WARNING]
 > The loop runs unattended with approval and sandbox checks bypassed. It can
 > change files and create commits. Start a new run on a dedicated branch with

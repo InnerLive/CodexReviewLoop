@@ -8,8 +8,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $testsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path (Split-Path -Parent $testsRoot) 'src/Common.ps1')
 $mainSuite = Join-Path $testsRoot "CodexReviewLoop.Tests.ps1"
 $reliabilitySuite = Join-Path $testsRoot "Reliability.Tests.ps1"
+$architectureSuite = Join-Path $testsRoot "ArchitectureWork.Tests.ps1"
 $laneWorker = Join-Path $testsRoot "Invoke-PesterLane.ps1"
 $resultRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
     ("codex-review-loop-tests-" + [Guid]::NewGuid().ToString("N"))
@@ -76,11 +78,12 @@ function Invoke-TestLaneGroup {
         $startInfo.FileName = (Get-Command pwsh.exe -ErrorAction Stop |
             Select-Object -First 1).Source
         $startInfo.UseShellExecute = $false
+        $startInfo.WorkingDirectory = $resultRoot
         foreach ($argument in @(
             "-NoLogo", "-NoProfile", "-NonInteractive", "-File", $laneWorker,
             "-Script", [string]$lane.Script,
-            "-ResultPath", $resultPath,
-            "-LogPath", $logPath
+            "-ResultPath", [System.IO.Path]::GetFileName($resultPath),
+            "-LogPath", [System.IO.Path]::GetFileName($logPath)
         )) {
             [void]$startInfo.ArgumentList.Add($argument)
         }
@@ -94,6 +97,7 @@ function Invoke-TestLaneGroup {
         }
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
+        Assert-ReviewLoopProcessCommandLine -StartInfo $startInfo
         if (-not $process.Start()) {
             throw "Could not start test lane '$($lane.Name)'."
         }
@@ -184,12 +188,13 @@ else {
     )
 
     $results += Invoke-TestLaneGroup -Parallel -Lanes @(
+        New-TestLane -Name "architecture-work" -Script $architectureSuite -Tag "FullLocal"
         New-TestLane -Name "fast-static" -Script $mainSuite -Tag "FullLocal"
         New-TestLane -Name "main-process" -Script $mainSuite -Tag "Process"
         New-TestLane -Name "reliability-process" -Script $reliabilitySuite -Tag "Process"
     )
 
-    $declared = Get-DeclaredTestCount -Path @($mainSuite, $reliabilitySuite)
+    $declared = Get-DeclaredTestCount -Path @($mainSuite, $reliabilitySuite, $architectureSuite)
     $executed = [int](($results | Measure-Object -Property Total -Sum).Sum)
     if ($executed -ne $declared) {
         Remove-Item -LiteralPath $resultRoot -Recurse -Force `

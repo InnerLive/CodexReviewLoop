@@ -434,7 +434,7 @@ function New-ReviewLoopState {
         $ReviewBaseSetting = $ReviewBase
     }
     return [pscustomobject][ordered]@{
-        SchemaVersion = "1.0"
+        SchemaVersion = "2.0"
         RunId = Split-Path -Leaf $RunRoot
         RunRoot = Resolve-ReviewLoopPath -Path $RunRoot
         RepoPath = $repo
@@ -471,6 +471,13 @@ function New-ReviewLoopState {
         ActiveRoleCall = $null
         ActiveCriticCall = $null
         ActiveStrategy = $null
+        TaskContext = ""
+        CompletionRequalificationRequired = $false
+        ArchitectWork = New-ReviewLoopArchitectWork
+        ActiveWorkIds = @()
+        ActiveFixAttempt = 0
+        RetainedCandidate = $null
+        LastReview = $null
         LastFixerResult = $null
         PartialFixRecovery = $null
         PendingCommit = $null
@@ -486,8 +493,31 @@ function New-ReviewLoopState {
 function Test-ReviewLoopState {
     param([Parameter(Mandatory = $true)][object]$State)
 
-    if ([string]$State.SchemaVersion -ne "1.0") {
+    if ([string]$State.SchemaVersion -notin @("1.0", "2.0")) {
         throw "Unknown state version: $($State.SchemaVersion)"
+    }
+    if ([string]$State.SchemaVersion -eq "2.0") {
+        foreach ($name in @("TaskContext", "ArchitectWork", "ActiveWorkIds", "ActiveFixAttempt",
+            "RetainedCandidate", "LastReview", "CompletionRequalificationRequired")) {
+            if ($State.PSObject.Properties.Name -notcontains $name) { throw "State 2.0 is missing '$name'." }
+        }
+        $work = $State.ArchitectWork
+        foreach ($name in @("Revision", "OrientationRequired", "Goal", "Orders", "OverallAssessment")) {
+            if ($null -eq $work -or $work.PSObject.Properties.Name -notcontains $name) {
+                throw "State 2.0 architecture work is missing '$name'."
+            }
+        }
+        if ([int]$work.Revision -lt 0 -or (-not $work.OrientationRequired -and
+            ($null -eq $work.Goal -or [string]::IsNullOrWhiteSpace([string]$work.Goal.statement)))) {
+            throw "State 2.0 has an invalid goal revision or missing clarified goal."
+        }
+        $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($order in @($work.Orders)) {
+            if ([string]::IsNullOrWhiteSpace([string]$order.id) -or -not $ids.Add([string]$order.id) -or
+                $order.status -notin @("open", "accepted", "withdrawn")) {
+                throw "State 2.0 has invalid architecture work."
+            }
+        }
     }
     if ([string]$State.Status -notin @(
         "running",
@@ -601,6 +631,8 @@ function Add-ReviewLoopRoleCall {
         ExecutionFingerprint = [string](Get-ReviewLoopObjectProperty `
             -Object $Call -Name "ExecutionFingerprint" -Default "")
         CriticId = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "CriticId" -Default "")
+        WorkRevision = [int](Get-ReviewLoopObjectProperty -Object $Call -Name "WorkRevision" -Default -1)
+        RepositorySnapshot = Get-ReviewLoopObjectProperty -Object $Call -Name RepositorySnapshot
         CoveredReviewCount = [int](Get-ReviewLoopObjectProperty -Object $Call -Name "CoveredReviewCount" -Default 0)
         RepositoryHead = [string](Get-ReviewLoopObjectProperty `
             -Object $Call -Name "RepositoryHead" -Default "")
@@ -610,6 +642,238 @@ function Add-ReviewLoopRoleCall {
     }
     $State.RoleCalls = @($State.RoleCalls) + @($record)
     return $State
+}
+
+function New-ReviewLoopArchitectWork {
+    return [pscustomobject][ordered]@{
+        Revision = 0
+        OrientationRequired = $true
+        Goal = $null
+        Orders = @()
+        OverallAssessment = $null
+    }
+}
+
+function Get-ReviewLoopOpenWork {
+    param([Parameter(Mandatory = $true)][object]$State)
+    return @($State.ArchitectWork.Orders | Where-Object { $_.status -eq "open" })
+}
+
+function Merge-ReviewLoopWorkOrders {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Orders
+    )
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $changed = $false
+    foreach ($order in $Orders) {
+        if (-not $seen.Add([string]$order.id)) { throw "Duplicate architecture work ID '$($order.id)'." }
+        $existing = @($State.ArchitectWork.Orders | Where-Object { $_.id -ceq $order.id })
+        if ($existing.Count -gt 0 -and $existing[0].status -ne "open") {
+            throw "Architecture work '$($order.id)' is already closed; use a new ID for new work."
+        }
+        $value = [pscustomobject][ordered]@{
+            id = [string]$order.id
+            objective = [string]$order.objective
+            rationale = [string]$order.rationale
+            doneWhen = [string]$order.doneWhen
+            evidence = @($order.evidence)
+            status = "open"
+            outcomeEvidence = ""
+        }
+        if ($existing.Count -eq 0) {
+            $State.ArchitectWork.Orders = @($State.ArchitectWork.Orders) + @($value)
+            $changed = $true
+        }
+        elseif ((ConvertTo-ReviewLoopJsonCompact $existing[0]) -ne
+                (ConvertTo-ReviewLoopJsonCompact $value)) {
+            $State.ArchitectWork.Orders = @($State.ArchitectWork.Orders | ForEach-Object {
+                if ($_.id -ceq $order.id) { $value } else { $_ }
+            })
+            $changed = $true
+        }
+    }
+    if ($changed) {
+        $State.ArchitectWork.Revision++
+        $State.ArchitectWork.OverallAssessment = $null
+    }
+}
+
+function Set-ReviewLoopWorkSelection {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Ids
+    )
+    $open = @(Get-ReviewLoopOpenWork -State $State | ForEach-Object { [string]$_.id })
+    if (@($Ids | Select-Object -Unique).Count -ne $Ids.Count -or
+        @($Ids | Where-Object { $_ -cnotin $open }).Count -gt 0) {
+        throw "Architect selected duplicate or unknown open work IDs."
+    }
+    $State.ActiveWorkIds = @($Ids)
+}
+
+function Register-ReviewLoopOrientation {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Result
+    )
+    $preview = [pscustomobject]@{ ArchitectWork = $State.ArchitectWork.PSObject.Copy() }
+    $preview.ArchitectWork.Goal = $Result.goal
+    $preview.ArchitectWork.Revision++
+    $preview.ArchitectWork.OverallAssessment = $null
+    Merge-ReviewLoopWorkOrders -State $preview -Orders @($Result.orders)
+    $preview.ArchitectWork.OrientationRequired = $false
+    $State.ArchitectWork = $preview.ArchitectWork
+}
+
+function Register-ReviewLoopWorkPlan {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Result,
+        [switch]$RequireSelection
+    )
+    $preview = [pscustomobject]@{
+        ArchitectWork = $State.ArchitectWork.PSObject.Copy()
+        ActiveWorkIds = @($State.ActiveWorkIds)
+    }
+    Merge-ReviewLoopWorkOrders -State $preview -Orders @($Result.orders)
+    Set-ReviewLoopWorkSelection -State $preview -Ids @($Result.selectedWorkIds)
+    if ($RequireSelection -and $preview.ActiveWorkIds.Count -eq 0) {
+        throw "Architect must select necessary open work when no native findings require implementation."
+    }
+    $State.ArchitectWork = $preview.ArchitectWork
+    $State.ActiveWorkIds = @($preview.ActiveWorkIds)
+}
+
+function Register-ReviewLoopWorkAssessment {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Result,
+        [switch]$RequireGoalDecision
+    )
+    # Validate the complete assessment without changing authoritative work.
+    $preview = [pscustomobject]@{ ArchitectWork = $State.ArchitectWork.PSObject.Copy() }
+    Merge-ReviewLoopWorkOrders -State $preview -Orders @($Result.newOrders)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $openIds = @(Get-ReviewLoopOpenWork -State $preview | ForEach-Object { [string]$_.id })
+    foreach ($outcome in @($Result.workOutcomes)) {
+        if (-not $seen.Add([string]$outcome.id) -or $outcome.id -cnotin $openIds) {
+            throw "Architect assessed duplicate or unknown open work '$($outcome.id)'."
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$outcome.evidence)) {
+            throw "Architecture work outcomes require evidence."
+        }
+    }
+    if ($Result.accept -and
+        @($State.ActiveWorkIds | Where-Object { -not $seen.Contains([string]$_) }).Count -gt 0) {
+        throw "Acceptance must explicitly assess every selected architecture work item."
+    }
+    if ($Result.goalComplete -and (-not $Result.accept -or
+        @($openIds | Where-Object { -not $seen.Contains($_) }).Count -gt 0)) {
+        throw "Overall completion cannot leave architecture work open or reject the current tree."
+    }
+    if ($RequireGoalDecision -and (-not $Result.accept -or -not $Result.goalComplete) -and
+        @(Get-ReviewLoopOpenWork -State $preview).Count -eq 0) {
+        throw "Architect withheld overall completion without identifying necessary work."
+    }
+    $State.ArchitectWork = $preview.ArchitectWork
+    $Result | Add-Member -Force -NotePropertyName WorkRevision -NotePropertyValue ([int]$State.ArchitectWork.Revision)
+}
+
+function Complete-ReviewLoopArchitectureWork {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+    if ([int](Get-ReviewLoopObjectProperty -Object $Result -Name WorkRevision -Default -1) -ne
+        [int]$State.ArchitectWork.Revision) {
+        $State.ArchitectWork.OverallAssessment = $null
+        return
+    }
+    foreach ($outcome in @($Result.workOutcomes)) {
+        $order = @($State.ArchitectWork.Orders | Where-Object { $_.id -ceq $outcome.id })[0]
+        $order.status = [string]$outcome.status
+        $order.outcomeEvidence = [string]$outcome.evidence
+    }
+    if (@($Result.workOutcomes).Count -gt 0) { $State.ArchitectWork.Revision++ }
+    $State.ArchitectWork.OverallAssessment = $null
+    if ($Result.goalComplete -and @(Get-ReviewLoopOpenWork -State $State).Count -eq 0) {
+        $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        $State.ArchitectWork.OverallAssessment = [pscustomobject]@{
+            Revision = [int]$State.ArchitectWork.Revision
+            Head = [string]$snapshot.Head
+            Fingerprint = [string]$snapshot.Fingerprint
+            IndexFingerprint = [string]$snapshot.IndexFingerprint
+            RefsFingerprint = [string]$snapshot.RefsFingerprint
+            Summary = [string]$Result.summary
+        }
+    }
+}
+
+function Test-ReviewLoopGoalAccepted {
+    param([Parameter(Mandatory = $true)][object]$State)
+    $assessment = $State.ArchitectWork.OverallAssessment
+    if ($State.ArchitectWork.OrientationRequired -or $null -eq $assessment -or
+        @(Get-ReviewLoopOpenWork -State $State).Count -gt 0 -or
+        $null -ne $State.RetainedCandidate -or $null -ne $State.PendingCommit -or
+        $null -ne $State.ActiveRoleCall -or $null -ne $State.ActiveCriticCall -or
+        $null -ne $State.ActiveHostGateRecovery -or $null -ne $State.BlockedCleanup -or
+        $null -ne $State.PartialFixRecovery) {
+        return $false
+    }
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $State.RepoPath
+    return [int]$assessment.Revision -eq [int]$State.ArchitectWork.Revision -and
+        $assessment.Head -eq $snapshot.Head -and
+        $assessment.Fingerprint -eq $snapshot.Fingerprint -and
+        $assessment.IndexFingerprint -eq $snapshot.IndexFingerprint -and
+        $assessment.RefsFingerprint -eq $snapshot.RefsFingerprint -and
+        (Test-ReviewLoopGitClean -RepoPath $State.RepoPath)
+}
+
+function ConvertTo-ReviewLoopWorkState {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+    if ([string]$State.SchemaVersion -eq "2.0") { return }
+    $inflight = @(@("ActiveRoleCall", "ActiveCriticCall", "PendingCommit",
+        "ActiveHostGateRecovery", "BlockedCleanup", "PartialFixRecovery") | Where-Object {
+        $null -ne (Get-ReviewLoopObjectProperty -Object $State -Name $_)
+    })
+    if ($inflight.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace([string]$State.ActiveClusterId) -or
+        @($State.ActiveFindingIds).Count -gt 0 -or $null -ne $State.LastFixerResult -or $null -ne $State.ActiveStrategy -or
+        (-not (Test-ReviewLoopCycleBoundary -State $State) -and $State.Status -ne "completed") -or
+        -not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
+        throw "State 1.0 requires a clean, inactive cycle boundary before upgrading. Finish the active round with the previous tool version, then resume with this version."
+    }
+    Assert-ReviewLoopResumeInvariant -State $State -RepoPath $RepoPath -ReviewBase $State.ReviewBase
+    $backup = "$StatePath.before-work-state-2.0.json"
+    if (-not (Test-Path -LiteralPath $backup)) {
+        Copy-Item -LiteralPath $StatePath -Destination $backup -ErrorAction Stop
+    }
+    $State.SchemaVersion = "2.0"
+    $State | Add-Member -NotePropertyName TaskContext -NotePropertyValue ""
+    $State | Add-Member -NotePropertyName CompletionRequalificationRequired -NotePropertyValue $true
+    $State | Add-Member -NotePropertyName ArchitectWork -NotePropertyValue (New-ReviewLoopArchitectWork)
+    $State | Add-Member -NotePropertyName ActiveWorkIds -NotePropertyValue @()
+    $State | Add-Member -NotePropertyName ActiveFixAttempt -NotePropertyValue 0
+    $State | Add-Member -NotePropertyName RetainedCandidate -NotePropertyValue $null
+    $State | Add-Member -NotePropertyName LastReview -NotePropertyValue $null
+    $State.CleanPasses = 0
+    $State.CleanHead = ""
+    $State.Stage = "initialized"
+    $State.Status = "running"
+    $State.ExitCode = 0
+    Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+}
+
+function Assert-ReviewLoopRetainedCandidate {
+    param([Parameter(Mandatory = $true)][object]$State)
+    $candidate = $State.RetainedCandidate
+    if ($null -eq $candidate) { return }
+    Assert-ReviewLoopRepositoryUnchanged -RepoPath $State.RepoPath -Snapshot $candidate.Snapshot -Operation "The retained Fixer candidate"
 }
 
 function Set-ReviewLoopCheckpoint {

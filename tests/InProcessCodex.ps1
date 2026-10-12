@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot "ArchitectureFixtures.ps1")
+
 function Get-InProcessCodexPlanValue {
     param(
         [AllowNull()][object]$Plan,
@@ -25,7 +27,7 @@ function Read-InProcessCodexSequenceValue {
     $remaining = if ($sequence.Count -gt 1) { @($sequence[1..($sequence.Count - 1)]) } else { @() }
     [System.IO.File]::WriteAllText(
         $Path,
-        (ConvertTo-Json -InputObject $remaining -Depth 30),
+        (ConvertTo-Json -InputObject @($remaining) -Depth 30),
         [System.Text.UTF8Encoding]::new($false))
     return $value
 }
@@ -107,6 +109,12 @@ function Get-InProcessCodexDefaultResult {
         "architecture-advice-v2.schema.json" {
             return '{"schemaVersion":"2.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[]}'
         }
+        "architecture-assessment-v1.schema.json" {
+            return '{"schemaVersion":"1.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        }
+        "architecture-advice-v3.schema.json" {
+            return '{"schemaVersion":"3.0","summary":"Use judgment.","approach":"Address the findings in the repository.","steps":[],"considerations":[],"orders":[],"selectedWorkIds":[]}'
+        }
         "review-classification-v1.schema.json" {
             return '{"schemaVersion":"1.0","hasFindings":false}'
         }
@@ -116,8 +124,8 @@ function Get-InProcessCodexDefaultResult {
         "fixer-result-v3.schema.json" {
             return '{"schemaVersion":"3.0","summary":"No change.","targetedTest":{"available":false,"executable":"","arguments":[]}}'
         }
-        "architecture-assessment-v1.schema.json" {
-            return '{"schemaVersion":"1.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]}}'
+        "architecture-assessment-v2.schema.json" {
+            return '{"schemaVersion":"2.0","accept":false,"summary":"More work is useful.","feedback":[],"commitMessage":{"subject":"","rationale":"","changes":[]},"newOrders":[],"workOutcomes":[],"goalComplete":false}'
         }
         default { return "No actionable findings." }
     }
@@ -139,7 +147,9 @@ function Invoke-InProcessCodexRole {
         [string]$CodexPath = "",
         [string]$CallId = "",
         [object]$State = $null,
-        [string]$StatePath = ""
+        [string]$StatePath = "",
+        [switch]$RequireWorkSelection,
+        [switch]$RequireGoalDecision
     )
 
     Update-ReviewLoopLiveConfig -Config $Config
@@ -158,7 +168,8 @@ function Invoke-InProcessCodexRole {
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -eq $CallId -and
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq $Role -and
             [string](Get-ReviewLoopObjectProperty `
-                -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint
+                -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint -and
+            [int](Get-ReviewLoopObjectProperty -Object $_ -Name WorkRevision -Default -1) -eq [int]$State.ArchitectWork.Revision
         } | Select-Object -Last 1)
         if ($completed.Count -gt 0) {
             return ConvertFrom-ReviewLoopRoleCallRecord -Record $completed[0]
@@ -174,8 +185,11 @@ function Invoke-InProcessCodexRole {
         }
     }
 
-    $plan = Read-InProcessCodexSequenceValue `
-        -Path ([Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE"))
+    $phase = Get-TestArchitecturePhase -SchemaName $SchemaName -Prompt $Prompt
+    $useDefaultPhase = Test-TestArchitectureDefaultPhase -Phase $phase -PlanPath ([Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE"))
+    $plan = if ($useDefaultPhase) { $null } else {
+        Read-InProcessCodexSequenceValue -Path ([Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE"))
+    }
     $exitCode = [int](Get-InProcessCodexPlanValue -Plan $plan -Name "exitCode" -Default 0)
     $stderr = [string](Get-InProcessCodexPlanValue -Plan $plan -Name "stderr" -Default "")
     $emitThread = [bool](Get-InProcessCodexPlanValue -Plan $plan -Name "emitThread" -Default $true)
@@ -189,7 +203,10 @@ function Invoke-InProcessCodexRole {
     $returnedThread = if ($emitThread -and $Mode -ne "Review") { $plannedThread } else { "" }
 
     $hasPlannedResult = $null -ne $plan -and $plan.PSObject.Properties.Name -contains "result"
-    $resultText = if ($hasPlannedResult) {
+    $resultText = if ($useDefaultPhase) {
+        Get-TestArchitecturePhaseResult -Phase $phase
+    }
+    elseif ($hasPlannedResult) {
         [string]$plan.result
     }
     else {
@@ -209,6 +226,7 @@ function Invoke-InProcessCodexRole {
         }
     }
 
+    $resultText = Convert-TestArchitectureResult -SchemaName $SchemaName -Text $resultText
     $mutations = @(Get-InProcessCodexPlanValue -Plan $plan -Name "mutations" -Default @())
     Invoke-InProcessCodexMutation -RepoPath $RepoPath -Mutations $mutations
     Invoke-InProcessCodexProfileMutation `
@@ -263,6 +281,13 @@ function Invoke-InProcessCodexRole {
     elseif ($effectiveMode -eq "Review") {
         $arguments += @("review", "--base", $ReviewBase)
     }
+    $developer = if ($Mode -eq "Review") { [string]$Config.ReviewerInstructions } else { Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config }
+    if ($Mode -ne 'Review' -and $null -ne $State -and $State.SchemaVersion -eq "2.0") {
+        $developer += "`n`n" + (Get-ReviewLoopSharedContextInstructions -State $State -RepoPath $RepoPath -Role $Role)
+    }
+    if ($Mode -eq 'Review') {
+        if ($developer) { $arguments += @("-c", "developer_instructions=$(ConvertTo-Json -InputObject $developer -Compress)") }
+    } else { $Prompt = $developer + "`n`n" + $Prompt }
     $schemaPath = $SchemaName
     $logPath = [Environment]::GetEnvironmentVariable("CODEX_REVIEW_LOOP_FAKE_LOG")
     if (-not [string]::IsNullOrWhiteSpace($logPath)) {
@@ -334,11 +359,16 @@ function Invoke-InProcessCodexRole {
         } else { "" }
         RepositoryHead = ""
         WorktreeFingerprint = ""
+        WorkRevision = if ($null -ne $State) { [int]$State.ArchitectWork.Revision } else { -1 }
         CoveredReviewCount = if ($Role -eq "Critic") {
             Get-ReviewLoopCompletedReviewCount -State $State
         } else { 0 }
     }
     if ($null -ne $State) {
+        $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+        $call.RepositoryHead = [string]$snapshot.Head
+        $call.WorktreeFingerprint = [string]$snapshot.Fingerprint
+        $call | Add-Member -NotePropertyName RepositorySnapshot -NotePropertyValue $snapshot
         if ($call.Success) {
             Set-ReviewLoopRoleSessionThreadId -State $State -Role $Role -ThreadId $returnedThread
         }
@@ -360,6 +390,10 @@ function Enable-InProcessCodexRoleCalls {
         param($path)
         . $path
         foreach ($name in @(
+            "Get-TestArchitecturePhase",
+            "Test-TestArchitectureDefaultPhase",
+            "Get-TestArchitecturePhaseResult",
+            "Convert-TestArchitectureResult",
             "Get-InProcessCodexPlanValue",
             "Read-InProcessCodexSequenceValue",
             "Invoke-InProcessCodexMutation",

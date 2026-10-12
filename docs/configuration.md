@@ -97,8 +97,8 @@ fix, and commit boundaries:
   lessons-learned solution the final cycle. `$true` requires normal clean
   native reviews after a real commit; accepted no-op solutions still complete
   directly.
-- `MaxFixAttempts` applies before the next Fixer call. Reaching it restores the
-  rejected round and starts another native review; it never blocks a finding.
+- `MaxFixAttempts` applies before the next Fixer call. Reaching it preserves the
+  candidate and starts another native review; it never blocks a finding.
 - `InactivityTimeoutMinutes` applies when the next role, targeted test, or host
   gate starts. It is not changed underneath an already running process.
 - `TargetedTestRepositoryChanges` applies to the next targeted test and to
@@ -130,6 +130,20 @@ when explicitly bound; an explicitly empty value disables the profile value.
 The same override must be passed again when resuming. A shadowed profile value
 does not affect the fingerprint. The instruction text is not written to the
 terminal or checkpoint; only its effect on the execution fingerprint is kept.
+
+## Shared task context
+
+`-TaskContext <text>` optionally supplies the original assignment to all working
+roles. It is a CLI input, not a profile setting. A new run without it asks the
+Architect to reconstruct the goal from repository evidence. The raw text and
+clarified goal are persisted with architecture work in the run checkpoint.
+
+Resume without the parameter inherits the saved text. An explicit replacement,
+including an empty string, requires new orientation and invalidates dependent
+review and acceptance evidence. Existing orders, including previously closed ones,
+are reevaluated explicitly and never silently deleted.
+`ReviewerInstructions` remains Reviewer-specific and keeps its existing override
+and fingerprint behavior.
 
 ## Targeted tests
 

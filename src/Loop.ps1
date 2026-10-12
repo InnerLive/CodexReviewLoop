@@ -310,8 +310,8 @@ function Initialize-ReviewLoopCommitHistory {
         throw "Legacy checkpoint cannot reconstruct loop commits because its HEAD range is incomplete."
     }
 
-    & git -C $RepoPath merge-base --is-ancestor $startHead $currentHead 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'merge-base', '--is-ancestor', $startHead, $currentHead)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Legacy checkpoint cannot reconstruct loop commits because saved HEAD is not descended from StartHead."
     }
     $history = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
@@ -390,13 +390,26 @@ function Assert-ReviewLoopHostGatePreflight {
     }
 }
 
+function Get-ReviewLoopRefDelta {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Before,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$After)
+    foreach ($row in $Before) {
+        if ($row -cnotin $After) { [pscustomobject]@{ Change = 'Removed'; Row = $row } }
+    }
+    foreach ($row in $After) {
+        if ($row -cnotin $Before) { [pscustomobject]@{ Change = 'Added'; Row = $row } }
+    }
+}
+
 function Get-ReviewLoopRepositorySnapshot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $headRef = (& git -C $RepoPath symbolic-ref --quiet HEAD 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -notin @(0, 1)) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'symbolic-ref', '--quiet', 'HEAD')
+    $headRef = $gitResult.Stdout.Trim()
+    if ($gitResult.ExitCode -notin @(0, 1)) {
         throw "Git could not inspect the symbolic HEAD reference."
     }
+    $refs = Get-ReviewLoopGitRefsSnapshot -RepoPath $RepoPath
     return [pscustomobject]@{
         Head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
         Fingerprint = Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath
@@ -404,7 +417,8 @@ function Get-ReviewLoopRepositorySnapshot {
             "branch", "--show-current"
         )
         HeadRef = $headRef
-        RefsFingerprint = Get-ReviewLoopGitRefsFingerprint -RepoPath $RepoPath
+        RefsFingerprint = $refs.Fingerprint
+        Refs = $refs.Rows
         IndexFingerprint = Get-ReviewLoopGitIndexFingerprint -RepoPath $RepoPath
     }
 }
@@ -412,20 +426,31 @@ function Get-ReviewLoopRepositorySnapshot {
 function Get-ReviewLoopGitRefsFingerprint {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $refs = @(& git -C $RepoPath for-each-ref `
-        "--format=%(refname) %(objectname)" 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    return (Get-ReviewLoopGitRefsSnapshot -RepoPath $RepoPath).Fingerprint
+}
+
+function Get-ReviewLoopGitRefsSnapshot {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'for-each-ref', "--format=%(refname) %(objectname) %(symref)")
+    $refs = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not inspect repository refs."
     }
-    return Get-ReviewLoopSha256 (@($refs | Sort-Object) -join "`n")
+    # Keep the existing two-field hash representation and ordering unchanged.
+    $hashRows = @($refs | ForEach-Object { ($_ -split ' ', 3)[0..1] -join ' ' })
+    return [pscustomobject]@{
+        Rows = $refs
+        Fingerprint = Get-ReviewLoopSha256 (@($hashRows | Sort-Object) -join "`n")
+    }
 }
 
 function Get-ReviewLoopGitIndexFingerprint {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $entries = @(& git -C $RepoPath -c core.quotepath=false `
-        ls-files --stage -v 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, '-c', 'core.quotepath=false', 'ls-files', '--stage', '-v')
+    $entries = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not inspect the repository index."
     }
     return Get-ReviewLoopSha256 (@($entries) -join "`n")
@@ -591,13 +616,13 @@ function Restore-ReviewLoopReviewerRepository {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($baselineHeadRef)) {
-        & git -C $RepoPath check-ref-format $baselineHeadRef 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'check-ref-format', $baselineHeadRef)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Reviewer cleanup baseline HEAD reference is invalid: $baselineHeadRef"
         }
-        $currentRefValue = (& git -C $RepoPath show-ref --verify --hash $baselineHeadRef `
-            2>$null | Out-String).Trim()
-        if ($LASTEXITCODE -notin @(0, 1)) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'show-ref', '--verify', '--hash', $baselineHeadRef)
+        $currentRefValue = $gitResult.Stdout.Trim()
+        if ($gitResult.ExitCode -notin @(0, 1)) {
             throw "Git could not inspect the Reviewer cleanup branch reference."
         }
         if ($currentRefValue -ne $baselineHead) {
@@ -607,30 +632,34 @@ function Restore-ReviewLoopReviewerRepository {
             else {
                 $currentRefValue
             }
-            $output = @(& git -C $RepoPath update-ref $baselineHeadRef `
-                $baselineHead $oldValue 2>&1)
-            if ($LASTEXITCODE -ne 0) {
+            $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'update-ref', $baselineHeadRef, $baselineHead, $oldValue)
+            $output = @($gitResult.Output)
+            if ($gitResult.ExitCode -ne 0) {
                 throw "Git could not restore the Reviewer branch reference: $($output -join ' ')"
             }
         }
-        $output = @(& git -C $RepoPath symbolic-ref HEAD $baselineHeadRef 2>&1)
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'symbolic-ref', 'HEAD', $baselineHeadRef)
+        $output = @($gitResult.Output)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Git could not restore the Reviewer symbolic HEAD: $($output -join ' ')"
         }
     }
     else {
-        $output = @(& git -C $RepoPath checkout --detach --force $baselineHead 2>&1)
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'checkout', '--detach', '--force', $baselineHead)
+        $output = @($gitResult.Output)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Git could not restore the detached Reviewer HEAD: $($output -join ' ')"
         }
     }
 
-    $output = @(& git -C $RepoPath reset --hard $baselineHead 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'reset', '--hard', $baselineHead)
+    $output = @($gitResult.Output)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not restore Reviewer tracked or staged changes: $($output -join ' ')"
     }
-    $output = @(& git -C $RepoPath clean -ffd 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'clean', '-ffd')
+    $output = @($gitResult.Output)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not remove Reviewer untracked paths: $($output -join ' ')"
     }
 
@@ -650,6 +679,10 @@ function Invoke-ReviewLoopReviewerRepositoryRecovery {
     )
 
     try {
+        if ($null -ne (Get-ReviewLoopObjectProperty -Object $Recovery -Name "RepositoryBackup")) {
+            Invoke-ReviewLoopCriticRepositoryRecovery -RepoPath $RepoPath -Recovery $Recovery
+            return
+        }
         Restore-ReviewLoopReviewerRepository `
             -RepoPath $RepoPath -Recovery $Recovery -State $State
     }
@@ -688,14 +721,14 @@ function Complete-ReviewLoopInterruptedReviewerRecovery {
     return $true
 }
 
-function New-ReviewLoopCriticRepositoryBackup {
+function New-ReviewLoopRepositoryBackup {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [object]$Snapshot = (Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath)
     )
 
-    $root = Join-Path (Join-Path $LogRoot "critic-recovery") ([Guid]::NewGuid().ToString("N"))
+    $root = Join-Path (Join-Path $LogRoot "repository-backups") ([Guid]::NewGuid().ToString("N"))
     [System.IO.Directory]::CreateDirectory($root) | Out-Null
     $entries = @(
         foreach ($path in @(Get-ReviewLoopChangedPaths -RepoPath $RepoPath)) {
@@ -722,18 +755,20 @@ function New-ReviewLoopCriticRepositoryBackup {
     if (-not [System.IO.Path]::IsPathRooted($indexPath)) { $indexPath = Join-Path $RepoPath $indexPath }
     $savedIndex = Join-Path $root "index"
     [System.IO.File]::Copy($indexPath, $savedIndex)
-    $refs = @(& git -C $RepoPath for-each-ref "--format=%(refname) %(objectname) %(symref)" 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw "Git could not preserve Critic checkpoint refs." }
+    $refs = @($Snapshot.Refs)
     $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
     if ((ConvertTo-ReviewLoopJsonCompact $Snapshot) -ne (ConvertTo-ReviewLoopJsonCompact $current)) {
         throw "The repository changed while preserving the Critic checkpoint."
     }
-    return [pscustomobject]@{
+    $backup = [pscustomobject]@{
         Root = $root
+        ManifestPath = Join-Path $root "manifest.json"
         IndexSha256 = (Get-FileHash -LiteralPath $savedIndex -Algorithm SHA256).Hash
         Entries = $entries
         Refs = $refs
     }
+    Write-ReviewLoopAtomicJson -Path $backup.ManifestPath -Value $backup
+    return $backup
 }
 
 function Invoke-ReviewLoopCriticRepositoryRecovery {
@@ -819,8 +854,9 @@ function Invoke-ReviewLoopCriticRepositoryRecovery {
             $name, $value, $target = ([string]$line).Split(' ', 3)
             $baselineRefs[$name] = [pscustomobject]@{ Value = $value; Target = $target }
         }
-        $currentRefs = @(& git -C $RepoPath for-each-ref "--format=%(refname) %(objectname)" 2>$null)
-        if ($LASTEXITCODE -ne 0) { throw "Git could not inspect Critic recovery refs." }
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'for-each-ref', "--format=%(refname) %(objectname)")
+        $currentRefs = @($gitResult.Lines)
+        if ($gitResult.ExitCode -ne 0) { throw "Git could not inspect Critic recovery refs." }
         foreach ($line in $currentRefs) {
             $name, $value = ([string]$line).Split(' ', 2)
             if (-not $baselineRefs.ContainsKey($name)) {
@@ -869,9 +905,20 @@ function Assert-ReviewLoopRepositoryUnchanged {
         [Parameter(Mandatory = $true)][string]$Operation
     )
 
+    foreach ($name in @('Head', 'Fingerprint')) {
+        if ($null -eq $Snapshot.PSObject.Properties[$name] -or
+            [string]::IsNullOrWhiteSpace([string]$Snapshot.$name)) {
+            Stop-ReviewLoopBlocked -Message "$Operation has no complete mandatory repository snapshot."
+        }
+    }
     $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-    if ([string]$current.Head -ne [string]$Snapshot.Head -or
-        [string]$current.Fingerprint -ne [string]$Snapshot.Fingerprint) {
+    $changed = @(@("Head", "Fingerprint", "Branch", "HeadRef", "IndexFingerprint", "RefsFingerprint") | Where-Object {
+        $null -ne $Snapshot.PSObject.Properties[$_] -and
+            [string]$current.$_ -cne [string]$Snapshot.$_
+    })
+    if ($changed.Count -gt 0 -or
+        ($null -ne $Snapshot.PSObject.Properties["Refs"] -and
+            (@($current.Refs) -join "`n") -cne (@($Snapshot.Refs) -join "`n"))) {
         Stop-ReviewLoopBlocked -Message "$Operation changed repository state; refusing to continue or commit it."
     }
 }
@@ -883,7 +930,8 @@ function Invoke-ReviewLoopHostGate {
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][string]$ClusterId,
         [Alias("TimeoutSeconds")][long]$InactivityTimeoutSeconds = 1800,
-        [long]$AbsoluteTimeoutSeconds = 0
+        [long]$AbsoluteTimeoutSeconds = 0,
+        [AllowNull()][string]$InputText = $null
     )
 
     $name = [string]$Gate.Name
@@ -903,6 +951,7 @@ function Invoke-ReviewLoopHostGate {
             -DisplayName "Host-Gate $name" `
             -StdoutPath $logPath `
             -StderrPath $stderrPath `
+            -InputText $InputText `
             -EventKind HostGate `
             -InactivityTimeoutSeconds $InactivityTimeoutSeconds `
             -AbsoluteTimeoutSeconds $AbsoluteTimeoutSeconds
@@ -1074,20 +1123,24 @@ function Invoke-ReviewLoopTargetedTests {
 function Get-ReviewLoopChangedPaths {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $tracked = @(& git -C $RepoPath diff --name-only HEAD -- 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--name-only', 'HEAD', '--')
+    $tracked = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git diff --name-only failed."
     }
-    $staged = @(& git -C $RepoPath diff --cached --name-only HEAD -- 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--cached', '--name-only', 'HEAD', '--')
+    $staged = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git diff --cached --name-only failed."
     }
-    $unstaged = @(& git -C $RepoPath diff --name-only -- 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--name-only', '--')
+    $unstaged = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git diff --name-only for unstaged changes failed."
     }
-    $untracked = @(& git -C $RepoPath ls-files --others --exclude-standard 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-files', '--others', '--exclude-standard')
+    $untracked = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "git ls-files --others failed."
     }
     return @(
@@ -1152,8 +1205,9 @@ function Get-ReviewLoopTrackedPathPatchHash {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $lines = @(& git -C $RepoPath diff --binary --full-index $Head -- $Path 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--binary', '--full-index', $Head, '--', $Path)
+    $lines = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not capture the blocked patch for '$Path'."
     }
     return Get-ReviewLoopSha256 ($lines -join [Environment]::NewLine)
@@ -1165,11 +1219,11 @@ function Test-ReviewLoopGitDiffPresent {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    & git -C $RepoPath diff --quiet @Arguments 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments (@('-C', $RepoPath, 'diff', '--quiet') + $Arguments)
+    if ($gitResult.ExitCode -eq 0) {
         return $false
     }
-    if ($LASTEXITCODE -eq 1) {
+    if ($gitResult.ExitCode -eq 1) {
         return $true
     }
     throw "Git could not compare the blocked fixer path."
@@ -1183,7 +1237,7 @@ function Write-ReviewLoopGitBinaryPatch {
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = "git"
+    $startInfo.FileName = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
@@ -1200,6 +1254,7 @@ function Write-ReviewLoopGitBinaryPatch {
     $stream = $null
     $started = $false
     try {
+        Assert-ReviewLoopProcessCommandLine -StartInfo $startInfo
         if (-not $process.Start()) {
             throw "Git could not start while creating the blocked fixer patch."
         }
@@ -1252,8 +1307,9 @@ function Get-ReviewLoopHostGatePathDescriptor {
     )
 
     $normalized = $Path.Replace("\", "/")
-    $headEntry = @(& git -C $RepoPath ls-tree $Head -- $normalized 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-tree', $Head, '--', $normalized)
+    $headEntry = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not classify host-gate path '$normalized'."
     }
     if ($headEntry.Count -gt 0) {
@@ -1319,8 +1375,9 @@ function Get-ReviewLoopHostGateHeadDescriptor {
     )
 
     $normalized = $Path.Replace("\", "/")
-    $headEntry = @(& git -C $RepoPath ls-tree $Head -- $normalized 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-tree', $Head, '--', $normalized)
+    $headEntry = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Git could not classify saved host-gate path '$normalized'."
     }
     if ($headEntry.Count -eq 0) {
@@ -1377,11 +1434,11 @@ function Assert-ReviewLoopHostGateRepositoryIdentity {
         [string]$snapshot.RefsFingerprint -ne [string]$Manifest.RefsFingerprint) {
         throw "HEAD, branch, or repository refs changed during host-gate recovery; automatic restoration was not attempted."
     }
-    & git -C $RepoPath diff --cached --quiet ([string]$Manifest.Head) -- 2>$null
-    if ($LASTEXITCODE -gt 1) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--cached', '--quiet', ([string]$Manifest.Head), '--')
+    if ($gitResult.ExitCode -gt 1) {
         throw "Git could not inspect the index during host-gate recovery."
     }
-    if ($LASTEXITCODE -eq 1) {
+    if ($gitResult.ExitCode -eq 1) {
         throw "The Git index changed during the host gate; automatic restoration was not attempted."
     }
     if ([string]$snapshot.IndexFingerprint -ne [string]$Manifest.IndexFingerprint) {
@@ -1400,11 +1457,11 @@ function New-ReviewLoopHostGateRecovery {
     )
 
     $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-    & git -C $RepoPath diff --cached --quiet ([string]$snapshot.Head) -- 2>$null
-    if ($LASTEXITCODE -gt 1) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--cached', '--quiet', ([string]$snapshot.Head), '--')
+    if ($gitResult.ExitCode -gt 1) {
         throw "Git could not inspect the index before host gate '$($Gate.Name)'."
     }
-    if ($LASTEXITCODE -eq 1) {
+    if ($gitResult.ExitCode -eq 1) {
         throw "Host gate '$($Gate.Name)' cannot start because the verified patch is already staged; the orchestrator requires a clean index."
     }
 
@@ -1722,8 +1779,9 @@ function Restore-ReviewLoopHostGateBaseline {
 
     $trackedPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($path in $restorePaths) {
-        $headEntry = @(& git -C $RepoPath ls-tree ([string]$Manifest.Head) -- $path 2>$null)
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-tree', ([string]$Manifest.Head), '--', $path)
+        $headEntry = @($gitResult.Lines)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Git could not inspect host-gate recovery path '$path'."
         }
         if ($headEntry.Count -gt 0) {
@@ -1741,9 +1799,9 @@ function Restore-ReviewLoopHostGateBaseline {
         }
     }
     if ($trackedPaths.Count -gt 0) {
-        $output = @(& git -C $RepoPath restore "--source=$($Manifest.Head)" `
-            --staged --worktree -- @($trackedPaths) 2>&1)
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments (@('-C', $RepoPath, 'restore', "--source=$($Manifest.Head)", '--staged', '--worktree', '--') + @($trackedPaths))
+        $output = @($gitResult.Output)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Git could not reset host-gate paths: $($output -join ' ')"
         }
     }
@@ -1759,8 +1817,9 @@ function Restore-ReviewLoopHostGateBaseline {
             $applyArguments += "--include=$pattern"
         }
         $applyArguments += @("--", $patchPath)
-        $output = @(& git -C $RepoPath @applyArguments 2>&1)
-        if ($LASTEXITCODE -ne 0) {
+        $gitResult = Invoke-ReviewLoopGitProcess -Arguments (@('-C', $RepoPath) + $applyArguments)
+        $output = @($gitResult.Output)
+        if ($gitResult.ExitCode -ne 0) {
             throw "Git could not reapply the verified pre-gate patch: $($output -join ' ')"
         }
     }
@@ -2008,12 +2067,14 @@ function Get-ReviewLoopBlockedArtifact {
                 -RelativePath $path `
                 -Description "Automatic blocked-patch cleanup"
 
-            $stage = @(& git -C $RepoPath ls-files --stage -- $path 2>$null)
-            if ($LASTEXITCODE -ne 0) {
+            $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-files', '--stage', '--', $path)
+            $stage = @($gitResult.Lines)
+            if ($gitResult.ExitCode -ne 0) {
                 throw "Git could not classify blocked-patch path '$path'."
             }
-            $headEntry = @(& git -C $RepoPath ls-tree ([string]$snapshot.Head) -- $path 2>$null)
-            if ($LASTEXITCODE -ne 0) {
+            $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'ls-tree', ([string]$snapshot.Head), '--', $path)
+            $headEntry = @($gitResult.Lines)
+            if ($gitResult.ExitCode -ne 0) {
                 throw "Git could not inspect the saved HEAD entry for '$path'."
             }
             $trackedGitEntries = @($stage) + @($headEntry)
@@ -2212,10 +2273,10 @@ function Restore-ReviewLoopBlockedWorktree {
 
     $trackedPaths = @($manifest.Tracked | ForEach-Object { [string]$_.Path })
     if ($trackedPaths.Count -gt 0) {
-        $output = @(& git -C $RepoPath restore "--source=$head" --staged --worktree -- @trackedPaths 2>&1)
-        if ($LASTEXITCODE -ne 0) {
-            throw "Git could not restore the tracked blocked-patch paths: $($output -join ' ')"
-        }
+        Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
+            'restore', "--source=$head", '--staged', '--worktree',
+            '--pathspec-from-file=-', '--pathspec-file-nul'
+        ) -InputText ([string]::Join([char]0, $trackedPaths) + [char]0) | Out-Null
     }
     foreach ($entry in @($manifest.Untracked)) {
         $absolute = Resolve-ReviewLoopRepositoryRelativePath `
@@ -2235,7 +2296,7 @@ function Complete-ReviewLoopBlockedCluster {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][int]$Attempt,
@@ -2353,7 +2414,7 @@ function Get-ReviewLoopOpenFindings {
 
 function Set-ReviewLoopFindingsStatus {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$Status,
         [string]$Reason = ""
     )
@@ -2382,6 +2443,8 @@ function Clear-ReviewLoopActiveCluster {
     $State.ActiveReviewText = ""
     $State.ActiveStrategy = $null
     $State.LastFixerResult = $null
+    $State.ActiveWorkIds = @()
+    $State.ActiveFixAttempt = 0
     if ($State.PSObject.Properties.Name -contains "PartialFixRecovery") {
         $State.PartialFixRecovery = $null
     }
@@ -2403,7 +2466,7 @@ function Complete-ReviewLoopResolution {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][object]$VerificationResult,
         [Parameter(Mandatory = $true)][string]$Commit
     )
@@ -2423,6 +2486,8 @@ function Complete-ReviewLoopResolution {
         Add-ReviewLoopVerifiedCommit -State $State -Commit $Commit
     }
     $State.CurrentHead = $Commit
+    Complete-ReviewLoopArchitectureWork -State $State -Result $VerificationResult -RepoPath $State.RepoPath
+    $State.RetainedCandidate = $null
     if ($isLessonsLearned) {
         $State.LessonsLearned.Status = "completed"
         $State.LessonsLearned.CompletedHead = $Commit
@@ -2437,7 +2502,8 @@ function Invoke-ReviewLoopGitStep {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
-        [Parameter(Mandatory = $true)][string]$ClusterId
+        [Parameter(Mandatory = $true)][string]$ClusterId,
+        [AllowNull()][string]$InputText = $null
     )
 
     $result = Invoke-ReviewLoopHostGate -RepoPath $RepoPath -Gate @{
@@ -2445,7 +2511,7 @@ function Invoke-ReviewLoopGitStep {
         FilePath = "git"
         Arguments = $Arguments
     } -RunRoot $RunRoot -ClusterId $ClusterId `
-        -InactivityTimeoutSeconds 0 -AbsoluteTimeoutSeconds 300
+        -InactivityTimeoutSeconds 0 -AbsoluteTimeoutSeconds 300 -InputText $InputText
     if (-not $result.Success) {
         $excerpt = @(Get-ReviewLoopTextExcerpt -Text $result.Output -MaxLines 6) -join " "
         throw "$Name failed with exit code $($result.ExitCode): $excerpt"
@@ -2461,11 +2527,11 @@ function Assert-ReviewLoopVerifiedWorktreeIsFullyStaged {
         [Parameter(Mandatory = $true)][string]$StagedTree
     )
 
-    & git -C $RepoPath diff --quiet --ignore-submodules=none -- 2>$null
-    if ($LASTEXITCODE -gt 1) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--quiet', '--ignore-submodules=none', '--')
+    if ($gitResult.ExitCode -gt 1) {
         throw "Git could not verify whether the worktree is fully staged."
     }
-    if ($LASTEXITCODE -eq 1) {
+    if ($gitResult.ExitCode -eq 1) {
         Stop-ReviewLoopBlocked -Message "The verified worktree contains changes that Git cannot stage completely, such as a dirty submodule."
     }
     $untrackedText = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @(
@@ -2495,11 +2561,11 @@ function Restore-ReviewLoopVerifiedPatchToCleanIndex {
         [Parameter(Mandatory = $true)][string]$ClusterId
     )
 
-    & git -C $RepoPath diff --cached --quiet HEAD -- 2>$null
-    if ($LASTEXITCODE -gt 1) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--cached', '--quiet', 'HEAD', '--')
+    if ($gitResult.ExitCode -gt 1) {
         throw "Git could not inspect the staged fixer patch before requalification."
     }
-    if ($LASTEXITCODE -eq 0) {
+    if ($gitResult.ExitCode -eq 0) {
         return $false
     }
 
@@ -2538,8 +2604,8 @@ function Restore-ReviewLoopVerifiedPatchToCleanIndex {
         [string]$restored.RefsFingerprint -ne [string]$snapshot.RefsFingerprint) {
         throw "The repository changed while restoring the clean index for fix requalification."
     }
-    & git -C $RepoPath diff --cached --quiet $ExpectedHead -- 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'diff', '--cached', '--quiet', $ExpectedHead, '--')
+    if ($gitResult.ExitCode -ne 0) {
         throw "Fix requalification did not restore the required clean index."
     }
     return $true
@@ -2646,7 +2712,7 @@ function Get-ReviewLoopPendingCommitCheck {
 function New-ReviewLoopCommitMessage {
     param(
         [Parameter(Mandatory = $true)][string]$Prefix,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [AllowNull()][object]$FixerResult,
         [AllowNull()][object]$VerificationResult,
         [AllowEmptyCollection()][object[]]$GateResults = @()
@@ -2794,7 +2860,8 @@ function Complete-ReviewLoopPendingCommit {
     }
     $ids = @($State.ActiveFindingIds | ForEach-Object { [string]$_ })
     $findings = @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
-    if ($findings.Count -ne $ids.Count -or $findings.Count -eq 0) {
+    if ($findings.Count -ne $ids.Count -or ($findings.Count -eq 0 -and @($State.ActiveWorkIds).Count -eq 0 -and
+        $null -eq $State.RetainedCandidate)) {
         throw "Pending commit cannot be completed because active findings are missing."
     }
 
@@ -2843,8 +2910,9 @@ function Complete-ReviewLoopPendingCommit {
                 )
         }
         $commitObject = Invoke-ReviewLoopGitStep -Name "Commit object" -Arguments @(
-            "commit-tree", $tree, "-p", $preHead, "-m", [string]$pending.Message
-        ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId
+            "commit-tree", $tree, "-p", $preHead
+        ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId `
+            -InputText ([string]$pending.Message)
         $candidate = @(
             ([string]$commitObject.Output) -split "\r?\n" |
                 ForEach-Object { $_.Trim() } |
@@ -2892,7 +2960,7 @@ function Complete-ReviewLoopPendingCommit {
     Write-ReviewLoopStatus -Message "Committed $shortCommit · $subject" -Kind Success
     Complete-ReviewLoopResolution -State $State -StatePath $StatePath `
         -Ledger $Ledger -LedgerPath $LedgerPath -Findings $findings `
-        -VerificationResult $findings[0].Verification -Commit $head
+        -VerificationResult $pending.Verification -Commit $head
     return $true
 }
 
@@ -2903,7 +2971,7 @@ function Complete-ReviewLoopFix {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][object]$Verification,
         [AllowNull()][object]$FixerResult = $null,
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -2957,6 +3025,7 @@ function Complete-ReviewLoopFix {
         ExpectedCommit = ""
         Message = $message
         NeedsCurrentGates = $false
+        Verification = $Verification.Result
     })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_preparing"
     Write-ReviewLoopStatus -Message "Preparing the verified commit." -Kind Progress
@@ -2972,7 +3041,7 @@ function Invoke-ReviewLoopAttemptAssessment {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][object]$FixerCall,
         [Parameter(Mandatory = $true)][int]$Attempt,
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -2981,6 +3050,7 @@ function Invoke-ReviewLoopAttemptAssessment {
         [string]$CodexPath = ""
     )
 
+    Invoke-ReviewLoopOrientation -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
     $changedPaths = @(Update-ReviewLoopFixerResultFromWorktree `
         -FixerResult $FixerCall.StructuredResult `
         -RepoPath $RepoPath)
@@ -2993,6 +3063,7 @@ function Invoke-ReviewLoopAttemptAssessment {
             -NotePropertyValue ([string]$worktreeSnapshot.Fingerprint)
         $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
             -NotePropertyValue ([string]$worktreeSnapshot.Head)
+        $State.LastFixerResult | Add-Member -Force -NotePropertyName RepositorySnapshot -NotePropertyValue $worktreeSnapshot
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     }
     Write-ReviewLoopStatus `
@@ -3083,7 +3154,7 @@ function Restart-ReviewLoopReviewRound {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][int]$Attempt,
@@ -3093,26 +3164,32 @@ function Restart-ReviewLoopReviewRound {
     try {
         if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
             $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
-            if ($null -eq $State.LastFixerResult) {
-                $State.LastFixerResult = [pscustomobject]@{}
-            }
+            $recordedSnapshot = Get-ReviewLoopObjectProperty -Object $State.LastFixerResult -Name RepositorySnapshot
+            if ($null -eq $recordedSnapshot) { throw "The Fixer candidate has no complete ownership snapshot." }
+            Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $recordedSnapshot -Operation "The rejected Fixer candidate"
             $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeFingerprint `
                 -NotePropertyValue ([string]$snapshot.Fingerprint)
             $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
                 -NotePropertyValue ([string]$snapshot.Head)
             Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
-            $artifact = Get-ReviewLoopBlockedArtifact `
-                -State $State -RepoPath $RepoPath -RunRoot $RunRoot `
-                -ClusterId "$($State.ActiveClusterId)-c$($State.ReviewCycle)-restart" `
-                -Attempt $Attempt
-            if ($null -ne $artifact) {
-                Restore-ReviewLoopBlockedWorktree -RepoPath $RepoPath -Cleanup $artifact
+            $artifact = New-ReviewLoopRepositoryBackup -RepoPath $RepoPath -LogRoot $RunRoot -Snapshot $snapshot
+            $State.RetainedCandidate = [pscustomobject]@{
+                Snapshot = $snapshot
+                Artifact = $artifact
+                ClusterId = [string]$State.ActiveClusterId
+                WorkIds = @($State.ActiveWorkIds)
+                FindingIds = @($State.ActiveFindingIds)
+                FixerResult = $State.LastFixerResult
+                Strategy = $State.ActiveStrategy
+                Attempt = $Attempt
+                Feedback = $Reason
             }
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         }
     }
     catch {
         throw (New-ReviewLoopFailureException `
-            -Message "The rejected fixer round could not be reset to its saved Git checkpoint: $($_.Exception.Message)" `
+            -Message "The rejected Fixer candidate could not be preserved safely: $($_.Exception.Message)" `
             -NextSteps @(
                 "Inspect the current Git state and the preserved round artifact before changing either one."
                 "Restore a clean repository state, then run the same command again."
@@ -3206,7 +3283,7 @@ function Invoke-ReviewLoopFixWorkflow {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$Speed,
         [Parameter(Mandatory = $true)][string]$RunRoot,
@@ -3216,7 +3293,8 @@ function Invoke-ReviewLoopFixWorkflow {
 
     $attempt = [int](@($Findings | ForEach-Object { [int]$_.FixAttempts } |
         Measure-Object -Maximum).Maximum)
-    $threadId = [string]$Findings[0].FixerThreadId
+    $attempt = [Math]::Max($attempt, [int]$State.ActiveFixAttempt)
+    $threadId = if ($Findings.Count -gt 0) { [string]$Findings[0].FixerThreadId } else { "" }
     if ([string]::IsNullOrWhiteSpace($threadId)) {
         $threadId = Get-ReviewLoopRoleSessionThreadId -State $State -Role "Fixer"
     }
@@ -3329,6 +3407,7 @@ function Invoke-ReviewLoopFixWorkflow {
                     -RepoPath $RepoPath -RunRoot $RunRoot -Attempt $attempt
             }
             $attempt++
+            $State.ActiveFixAttempt = $attempt
             $technicalCorrections = 0
             foreach ($finding in $Findings) {
                 $finding.Status = "fixing"
@@ -3356,7 +3435,9 @@ function Invoke-ReviewLoopFixWorkflow {
             $threadId = [string]$fixer.ThreadId
             foreach ($finding in $Findings) { $finding.FixerThreadId = $threadId }
         }
+        $State.RetainedCandidate = $null
         $State.LastFixerResult = [pscustomobject]@{
+            CallId = [string]$fixer.CallId
             Success = [bool]$fixer.Success
             FailureKind = [string]$fixer.FailureKind
             StructuredResult = $fixer.StructuredResult
@@ -3369,6 +3450,7 @@ function Invoke-ReviewLoopFixWorkflow {
             -NotePropertyValue ([string]$fixerSnapshot.Fingerprint)
         $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeHead `
             -NotePropertyValue ([string]$fixerSnapshot.Head)
+        $State.LastFixerResult | Add-Member -Force -NotePropertyName RepositorySnapshot -NotePropertyValue $fixerSnapshot
         Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage $(if ($fixer.Success) {
             "fix_attempted"
@@ -3429,14 +3511,17 @@ function Invoke-ReviewLoopCluster {
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][object]$Ledger,
         [Parameter(Mandatory = $true)][string]$LedgerPath,
-        [Parameter(Mandatory = $true)][object[]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Findings,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$Speed,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [string]$CodexPath = ""
     )
 
-    $clusterKey = @($Findings | ForEach-Object { [string]$_.Id } | Sort-Object) -join "`n"
+    $clusterKey = @(@($Findings | ForEach-Object { [string]$_.Id }) +
+        @(Get-ReviewLoopOpenWork -State $State | ForEach-Object { [string]$_.id }) | Sort-Object) -join "`n"
+    $State.ActiveFixAttempt = 0
+    $State.LastFixerResult = $null
     $State.ActiveClusterId = "C-" + (Get-ReviewLoopSha256 $clusterKey).Substring(0, 16)
     $State.ActiveFindingIds = @($Findings | ForEach-Object { [string]$_.Id })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "cluster_selected"
@@ -3456,6 +3541,47 @@ function Invoke-ReviewLoopCluster {
         -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath | Out-Null
 }
 
+function Invoke-ReviewLoopRetainedAssessment {
+    param(
+        [hashtable]$Config, [object]$State, [string]$StatePath,
+        [object]$Ledger, [string]$LedgerPath, [string]$RepoPath,
+        [string]$Speed, [string]$RunRoot, [string]$CodexPath = ""
+    )
+    $candidate = $State.RetainedCandidate
+    if ($null -eq $candidate -or $null -eq $State.LastReview -or
+        -not $State.LastReview.Clean -or @(Get-ReviewLoopOpenFindings -Ledger $Ledger).Count -gt 0) {
+        return $false
+    }
+    Assert-ReviewLoopRetainedCandidate -State $State
+    Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $State.LastReview.Snapshot -Operation "The candidate review evidence"
+    if ($candidate.FixerResult.Success -and $null -ne $candidate.FixerResult.StructuredResult) {
+        $State.ActiveClusterId = [string]$candidate.ClusterId
+        $State.ActiveWorkIds = @($candidate.WorkIds | Where-Object {
+            $_ -cin @(Get-ReviewLoopOpenWork -State $State | ForEach-Object { $_.id })
+        })
+        $State.ActiveFindingIds = @()
+        $State.ActiveStrategy = $candidate.Strategy
+        $State.LastFixerResult = $candidate.FixerResult
+        $State.ActiveFixAttempt = [int]$candidate.Attempt
+        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fix_attempted"
+        $fixer = [pscustomobject]@{
+            Success = $true
+            CallId = [string](Get-ReviewLoopObjectProperty -Object $candidate.FixerResult -Name CallId -Default "")
+            StructuredResult = $candidate.FixerResult.StructuredResult
+        }
+        $assessment = Invoke-ReviewLoopAttemptAssessment -Config $Config -State $State -StatePath $StatePath `
+            -Ledger $Ledger -LedgerPath $LedgerPath -Findings @() -FixerCall $fixer `
+            -Attempt ([int]$candidate.Attempt) -RepoPath $RepoPath -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
+        if ($assessment.Completed) { return $true }
+        $candidate.Feedback = [string]$assessment.Feedback
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
+    Invoke-ReviewLoopCluster -Config $Config -State $State -StatePath $StatePath `
+        -Ledger $Ledger -LedgerPath $LedgerPath -Findings @() -RepoPath $RepoPath `
+        -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath
+    return $true
+}
+
 function Invoke-ReviewLoopOpenClusters {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -3470,7 +3596,7 @@ function Invoke-ReviewLoopOpenClusters {
     )
 
     $findings = @(Get-ReviewLoopOpenFindings -Ledger $Ledger)
-    if ($findings.Count -gt 0) {
+    if ($findings.Count -gt 0 -or @(Get-ReviewLoopOpenWork -State $State).Count -gt 0) {
         Invoke-ReviewLoopCluster `
             -Config $Config -State $State -StatePath $StatePath `
             -Ledger $Ledger -LedgerPath $LedgerPath `
@@ -3496,7 +3622,7 @@ function Resume-ReviewLoopInterruptedFix {
         "cluster_selected", "strategy_ready", "fixing", "fix_attempted",
         "fixer_partial_captured", "testing", "tested", "test_failed", "verified", "gate_failed"
     ) -or
-        @($State.ActiveFindingIds).Count -eq 0) {
+        (@($State.ActiveFindingIds).Count -eq 0 -and @($State.ActiveWorkIds).Count -eq 0)) {
         return $false
     }
 
@@ -3546,7 +3672,7 @@ function Restart-ReviewLoopAfterInactivity {
     else {
         @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
     }
-    if ($findings.Count -gt 0) {
+    if ($findings.Count -gt 0 -or @($State.ActiveWorkIds).Count -gt 0) {
         $attempt = [int](@($findings | ForEach-Object { [int]$_.FixAttempts } |
             Measure-Object -Maximum).Maximum)
         Restart-ReviewLoopReviewRound `
@@ -3556,8 +3682,9 @@ function Restart-ReviewLoopAfterInactivity {
             -Reason $Reason | Out-Null
         return
     }
-    if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath)) {
-        Stop-ReviewLoopBlocked -Message "$Reason The worktree changed without an active Fixer finding."
+    Assert-ReviewLoopRetainedCandidate -State $State
+    if (-not (Test-ReviewLoopGitClean -RepoPath $RepoPath) -and $null -eq $State.RetainedCandidate) {
+        Stop-ReviewLoopBlocked -Message "$Reason The worktree changed without owned Fixer work."
     }
     if ([string]$State.LessonsLearned.Status -eq "analyzing") {
         $State.LessonsLearned.Status = "pending"
@@ -3602,8 +3729,8 @@ function Get-ReviewLoopLessonsLearnedEligibility {
         }
     }
     $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
-    & git -C $RepoPath cat-file -e "$head`:AGENTS.md" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'cat-file', '-e', "$head`:AGENTS.md")
+    if ($gitResult.ExitCode -ne 0) {
         return [pscustomobject]@{
             Eligible = $false
             CompletionAllowed = $true
@@ -3620,7 +3747,8 @@ function Get-ReviewLoopLessonsLearnedEligibility {
 function Get-ReviewLoopLessonsLearnedFinalCompletion {
     param([Parameter(Mandatory = $true)][object]$State)
 
-    if ([string]$State.LessonsLearned.Status -ne "completed") {
+    if ([bool](Get-ReviewLoopObjectProperty -Object $State -Name CompletionRequalificationRequired -Default $false) -or
+        [string]$State.LessonsLearned.Status -ne "completed") {
         return [pscustomobject]@{
             CompletionAllowed = $false
             Evidence = ""
@@ -3702,8 +3830,9 @@ function Get-ReviewLoopDiffStatistics {
     }
 
     $arguments = @("diff", "--numstat", $From, $To, "--")
-    $lines = @(& git -C $RepoPath @arguments)
-    if ($LASTEXITCODE -ne 0) {
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments (@('-C', $RepoPath) + $arguments)
+    $lines = @($gitResult.Lines)
+    if ($gitResult.ExitCode -ne 0) {
         throw "Could not calculate retrospective diff statistics for $From..$To."
     }
     $files = 0
@@ -3995,12 +4124,16 @@ function Invoke-ReviewLoopCriticGate {
     if ($unfinished) {
         $active = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
         $recorded = Get-ReviewLoopObjectProperty -Object $State -Name "LastFixerResult"
-        $owned = @($State.ActiveFindingIds).Count -gt 0 -and (
+        $owned = (@($State.ActiveFindingIds).Count -gt 0 -or @($State.ActiveWorkIds).Count -gt 0) -and (
             ($null -ne $active -and $active.RepositoryHead -eq $snapshot.Head -and (
                 $active.Role -eq "Fixer" -or $active.WorktreeFingerprint -eq $snapshot.Fingerprint)) -or
             ($null -ne $recorded -and
                 (Get-ReviewLoopObjectProperty -Object $recorded -Name "WorktreeHead") -eq $snapshot.Head -and
                 (Get-ReviewLoopObjectProperty -Object $recorded -Name "WorktreeFingerprint") -eq $snapshot.Fingerprint))
+        if ($null -ne $State.RetainedCandidate) {
+            Assert-ReviewLoopRetainedCandidate -State $State
+            $owned = $true
+        }
         if (-not $owned) {
             throw "Critic cannot inspect uncommitted changes outside a resumable Fixer checkpoint."
         }
@@ -4162,6 +4295,10 @@ function Complete-ReviewLoopRun {
         [string]$CompletionEvidence = ""
     )
 
+    if (-not (Test-ReviewLoopGoalAccepted -State $State) -or
+        @(Get-ReviewLoopOpenFindings -Ledger (Read-ReviewLoopLedger -Path $LedgerPath -RepoPath $State.RepoPath)).Count -gt 0) {
+        throw "Overall completion requires current Architect acceptance and no open native findings or architecture work."
+    }
     $State.Status = "completed"
     $State.ExitCode = 0
     Set-ReviewLoopCheckpoint `
@@ -4184,6 +4321,196 @@ function Complete-ReviewLoopRun {
     }
 }
 
+function Invoke-ReviewLoopExternalRefRequalification {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$EvidencePath,
+        [switch]$DryRun
+    )
+
+    # This is an explicit acknowledgement of exact, independently evidenced rows.
+    # No ref namespace or historical role result grants permission to recover.
+    $evidenceSha = (Get-FileHash -LiteralPath $EvidencePath -Algorithm SHA256).Hash
+    $evidence = Get-Content -Raw -LiteralPath $EvidencePath | ConvertFrom-Json -DateKind String
+    $stateSha = (Get-FileHash -LiteralPath $StatePath -Algorithm SHA256).Hash
+    $acks = @(Get-ReviewLoopObjectProperty -Object $State -Name ExternalRefRequalifications -Default @())
+    $ack = @($acks | Where-Object { $_.EvidenceSha256 -ceq $evidenceSha })
+    if ($ack.Count -gt 1) { throw "Duplicate external-ref acknowledgement." }
+    if ($ack.Count -eq 1 -and ($State.Stage -cne 'review_round_requested' -or $null -ne $State.ActiveRoleCall)) {
+        throw "The acknowledged candidate has advanced beyond its fresh-review boundary."
+    }
+    $active = if ($ack.Count -eq 1) { $ack[0].FailedCall } else { $State.ActiveRoleCall }
+    $failureBinding = Get-ReviewLoopObjectProperty -Object $active -Name RepositoryIdentityFailure
+    if ([string]$State.SchemaVersion -cne "2.0" -or $null -eq $failureBinding -or
+        [string]$active.Role -cne "Fixer" -or
+        ($ack.Count -eq 0 -and [string]$State.Status -cne "failed")) {
+        throw "External-ref requalification requires a failed State 2.0 pending Fixer with bound failure evidence."
+    }
+    if ([string]$evidence.SchemaVersion -cne "1.0" -or
+        $evidence.OperatorApproved -isnot [bool] -or -not $evidence.OperatorApproved -or
+        [string]$evidence.RepoPath -cne $RepoPath -or
+        [string]$evidence.RunId -cne [string]$State.RunId -or
+        [string]$evidence.CallId -cne [string]$active.CallId -or
+        [string]$evidence.ReviewBaseCommit -cne [string]$State.ReviewBaseCommit -or
+        [string]::IsNullOrWhiteSpace([string]$evidence.ReviewBaseCommit) -or
+        [string]$evidence.Failure.Path -cne [string]$failureBinding.Path -or
+        [string]$evidence.Failure.Sha256 -cne [string]$failureBinding.Sha256) {
+        throw "External-ref approval does not bind this exact repository, base, run, call and failure."
+    }
+    foreach ($name in @("ActiveCriticCall", "ActiveHostGateRecovery", "PendingCommit", "BlockedCleanup", "PartialFixRecovery")) {
+        if ($null -ne (Get-ReviewLoopObjectProperty -Object $State -Name $name)) {
+            throw "External-ref requalification cannot bypass pending $name."
+        }
+    }
+    if ($ack.Count -eq 0 -and [string]$evidence.StateSha256 -cne $stateSha -and
+        -not ($DryRun -and [string]::IsNullOrWhiteSpace([string]$evidence.StateSha256))) {
+        throw "The approved checkpoint changed; refusing external-ref requalification."
+    }
+    $interveningApproval = @(Get-ReviewLoopObjectProperty -Object $evidence -Name ApprovedInterveningRefDelta -Default @())
+    $interveningActor = @(Get-ReviewLoopObjectProperty -Object $evidence -Name InterveningActorEvidence -Default @())
+    if ($interveningApproval.Count -gt 0 -and $interveningActor.Count -eq 0) {
+        throw "Independent intervening-actor evidence is required for the exact additional delta."
+    }
+    $bindings = @($failureBinding) + @($evidence.ExternalActorEvidence) + $interveningActor + @($evidence.RoleEvidence) + @($evidence.Ledger)
+    if (@($evidence.ExternalActorEvidence).Count -eq 0) {
+        throw "Independent external-actor evidence is required."
+    }
+    $ledgerPath = Join-Path (Split-Path -Parent $State.RunRoot) 'ledger-v2.json'
+    if (@($evidence.RoleEvidence).Count -eq 0 -or $null -eq $evidence.Ledger -or
+        [string]$evidence.Ledger.Path -cne $ledgerPath) {
+        throw "Closed role evidence and the exact finding ledger binding are required."
+    }
+    if ($ack.Count -eq 1) { $bindings += $ack[0].Receipt }
+    foreach ($binding in $bindings) {
+        if ([string]$binding.Sha256 -cnotmatch '^[A-F0-9]{64}$' -or
+            (Get-FileHash -LiteralPath ([string]$binding.Path) -Algorithm SHA256).Hash -cne [string]$binding.Sha256) {
+            throw "External-ref evidence binding changed: $($binding.Path)"
+        }
+    }
+    $failure = Get-Content -Raw -LiteralPath $failureBinding.Path | ConvertFrom-Json -DateKind String
+    if ([string]$failure.CallId -cne [string]$active.CallId -or
+        $failure.BeforeInventoryAvailable -ne $true -or $failure.AfterInventoryAvailable -ne $true -or
+        $null -eq $failure.Before.Refs -or $null -eq $failure.After.Refs -or
+        @($failure.ChangedFields).Count -eq 0 -or
+        @($failure.ChangedFields | Where-Object { $_ -cnotin @('RefsFingerprint', 'Refs') }).Count -gt 0 -or
+        [string]$failure.Before.Head -cne [string]$failure.After.Head -or
+        [string]$failure.Before.HeadRef -cne [string]$failure.After.HeadRef -or
+        [string]$active.RepositoryHead -cne [string]$failure.Before.Head -or
+        [string]$active.RepositoryHeadRef -cne [string]$failure.Before.HeadRef -or
+        [string]$active.RefsFingerprint -cne [string]$failure.Before.RefsFingerprint -or
+        (@($active.RepositoryRefs) -join "`n") -cne (@($failure.Before.Refs) -join "`n")) {
+        throw "The failed role has no consistent complete original ref identity; legacy reconstruction is forbidden."
+    }
+    foreach ($inventory in @($failure.Before, $failure.After)) {
+        $rows = @($inventory.Refs)
+        $names = @()
+        foreach ($row in $rows) {
+            if ($row -isnot [string] -or $row -cnotmatch '^refs/[^ ]+ [a-f0-9]{40,64} (refs/[^ ]+)?$') {
+                throw "Malformed exact ref inventory row."
+            }
+            $names += ($row -split ' ', 3)[0]
+        }
+        if (@($names | Select-Object -Unique).Count -ne $names.Count) { throw "Duplicate ref inventory name." }
+        # Preserve the established fingerprint representation, including its sorting.
+        $hashRows = @($rows | ForEach-Object { ($_ -split ' ', 3)[0..1] -join ' ' })
+        if ((Get-ReviewLoopSha256 (@($hashRows | Sort-Object) -join "`n")) -cne $inventory.RefsFingerprint) {
+            throw "Ref inventory fingerprint does not match captured rows."
+        }
+    }
+    $delta = @(Get-ReviewLoopRefDelta -Before @($failure.Before.Refs) -After @($failure.After.Refs))
+    $deltaJson = ConvertTo-Json -InputObject $delta -Depth 10 -Compress
+    foreach ($approved in @($failure.RefDelta, $evidence.ApprovedRefDelta)) {
+        $normalized = @($approved | Select-Object Change, Row)
+        if ($delta.Count -eq 0 -or (ConvertTo-Json -InputObject $normalized -Depth 10 -Compress) -cne $deltaJson) {
+            throw "Exact ref delta differs from the captured or operator-approved rows."
+        }
+    }
+    $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    $interveningDelta = @(Get-ReviewLoopRefDelta -Before @($failure.After.Refs) -After @($snapshot.Refs))
+    $approvedIntervening = @($interveningApproval | Select-Object Change, Row)
+    if ((ConvertTo-Json -InputObject $interveningDelta -Depth 10 -Compress) -cne
+        (ConvertTo-Json -InputObject $approvedIntervening -Depth 10 -Compress)) {
+        throw "Current full repository identity differs from the exact approved intervening delta."
+    }
+    if ($snapshot.Head -cne $failure.After.Head -or $snapshot.HeadRef -cne $failure.After.HeadRef -or
+        $snapshot.Branch -cne $State.Branch -or $snapshot.Head -cne $State.CurrentHead -or
+        (Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @('rev-parse', '--verify', "$($State.ReviewBase)^{commit}")) -cne $State.ReviewBaseCommit) {
+        throw "Current full repository identity differs from the approved failure end or pinned base."
+    }
+    $candidate = $evidence.Candidate
+    if ($null -eq $candidate -and -not $DryRun) { throw "An exact approved candidate snapshot is required." }
+    if ($null -ne $candidate) {
+        foreach ($name in @("Head", "Fingerprint", "Branch", "HeadRef", "RefsFingerprint", "IndexFingerprint", "Refs")) {
+            if ($null -eq $candidate.PSObject.Properties[$name]) { throw "Approved candidate is missing $name." }
+        }
+        Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $candidate -Operation 'The approved external-ref candidate'
+    }
+    if ($ack.Count -eq 1) {
+        Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $ack[0].Candidate -Operation 'The acknowledged external-ref candidate'
+    }
+    $plan = [pscustomobject]@{
+        Status = if ($ack.Count -eq 1) { 'already_requalified' } elseif ($DryRun) { 'requalification_ready' } else { 'requalified' }
+        ExitCode = 0; RunRoot = $State.RunRoot; StatePath = $StatePath
+        EvidenceSha256 = $evidenceSha; StateSha256 = $stateSha; Candidate = $snapshot
+        Failure = $failureBinding; ApprovedRefDelta = $delta; ApprovedInterveningRefDelta = $interveningDelta
+        DryRun = [bool]$DryRun; CandidateApproved = $null -ne $candidate
+        QualificationClaim = $false
+    }
+    if ($DryRun -or $ack.Count -eq 1) { return $plan }
+
+    # Preserve the owned candidate using the existing round-requalification path.
+    # Do not promote the failed role result to a completed/successful Fixer call.
+    $next = $State | ConvertTo-Json -Depth 100 | ConvertFrom-Json -DateKind String
+    $artifact = New-ReviewLoopRepositoryBackup -RepoPath $RepoPath -LogRoot $State.RunRoot -Snapshot $snapshot
+    $receiptPath = Join-Path $State.RunRoot "external-ref-requalification-$evidenceSha.json"
+    $receipt = [pscustomobject]@{
+        EvidenceSha256 = $evidenceSha; PreviousStateSha256 = $stateSha
+        Failure = $failureBinding; FailedCall = $active; Candidate = $snapshot
+        ApprovedRefDelta = $delta; ExternalActorEvidence = @($evidence.ExternalActorEvidence)
+        ApprovedInterveningRefDelta = $interveningDelta; InterveningActorEvidence = $interveningActor
+        RoleEvidence = @($evidence.RoleEvidence); Ledger = $evidence.Ledger
+        FindingIds = @($State.ActiveFindingIds); WorkIds = @($State.ActiveWorkIds)
+        QualificationClaim = $false; HistoricalRoleSuccess = $false
+    }
+    if (Test-Path -LiteralPath $receiptPath) {
+        $existing = Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json -DateKind String
+        if ((ConvertTo-Json $existing -Depth 100 -Compress) -cne (ConvertTo-Json $receipt -Depth 100 -Compress)) {
+            throw "Conflicting unconsumed external-ref acknowledgement receipt."
+        }
+    } else { Write-ReviewLoopAtomicJson -Path $receiptPath -Value $receipt }
+    $next.RetainedCandidate = [pscustomobject]@{
+        Snapshot = $snapshot; Artifact = $artifact
+        ClusterId = $State.ActiveClusterId; WorkIds = @($State.ActiveWorkIds); FindingIds = @($State.ActiveFindingIds)
+        FixerResult = [pscustomobject]@{ Success = $false; StructuredResult = $null }
+        Strategy = $State.ActiveStrategy; Attempt = $State.ActiveFixAttempt
+        Feedback = "Explicit external-ref requalification; fresh native review and current gates required."
+    }
+    $next | Add-Member -Force -NotePropertyName ExternalRefRequalifications -NotePropertyValue @($acks + [pscustomobject]@{
+        EvidenceSha256 = $evidenceSha; Candidate = $snapshot; FailedCall = $active
+        Receipt = [pscustomobject]@{ Path = $receiptPath; Sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash }
+    })
+    $next.ActiveRoleCall = $null
+    $next.ActiveClusterId = ''; $next.ActiveFindingIds = @(); $next.ActiveWorkIds = @()
+    $next.ActiveFindingSource = ''; $next.ActiveReviewText = ''; $next.ActiveStrategy = $null
+    $next.ActiveFixAttempt = 0; $next.LastFixerResult = $null; $next.LastReview = $null
+    $next.ArchitectWork.OverallAssessment = $null
+    $next.CompletionRequalificationRequired = $true; $next.CleanPasses = 0; $next.CleanHead = ''
+    $next.Stage = 'review_round_requested'; $next.Status = 'running'; $next.ExitCode = 0; $next.BlockedReason = ''
+    foreach ($binding in @($bindings) + @([pscustomobject]@{ Path = $EvidencePath; Sha256 = $evidenceSha })) {
+        if ((Get-FileHash -LiteralPath $binding.Path -Algorithm SHA256).Hash -cne $binding.Sha256) {
+            throw "Evidence changed before external-ref transition."
+        }
+    }
+    if ((Get-FileHash -LiteralPath $StatePath -Algorithm SHA256).Hash -cne $stateSha) {
+        throw "Checkpoint changed before external-ref transition."
+    }
+    Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $snapshot -Operation 'External-ref transition'
+    Write-ReviewLoopState -Path $StatePath -State $next | Out-Null
+    return $plan
+}
+
 function Invoke-ReviewLoopCore {
     [CmdletBinding()]
     param(
@@ -4191,15 +4518,26 @@ function Invoke-ReviewLoopCore {
         [string]$ConfigPath = "",
         [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = "",
+        [AllowEmptyString()][string]$TaskContext = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",
         [switch]$NewRun,
+        [string]$RequalifyExternalRefChange = "",
+        [switch]$RequalificationDryRun,
         [ValidateSet("compact", "balanced", "detailed")][string]$OutputMode = "compact",
         [ValidateRange(0, 3600)][int]$HeartbeatSeconds = 30,
         [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host",
         [switch]$Json
     )
 
+    if (($RequalificationDryRun -and [string]::IsNullOrWhiteSpace($RequalifyExternalRefChange)) -or
+        ($NewRun -and -not [string]::IsNullOrWhiteSpace($RequalifyExternalRefChange))) {
+        throw "External-ref requalification requires an evidence package and cannot use -NewRun."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RequalifyExternalRefChange) -and
+        ([string]::IsNullOrWhiteSpace($ConfigPath) -or -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf))) {
+        throw "External-ref requalification requires an explicit existing -ConfigPath."
+    }
     $speedExplicitlyBound = $PSBoundParameters.ContainsKey("Speed")
     $reviewBaseOverrideBound = $PSBoundParameters.ContainsKey("ReviewBase")
     $previousSpeed = ""
@@ -4333,7 +4671,36 @@ function Invoke-ReviewLoopCore {
     else {
         $currentResolvedReviewBase
     }
+    if (-not [string]::IsNullOrWhiteSpace($RequalifyExternalRefChange)) {
+        if ($null -eq $state) { throw "No resumable failed checkpoint exists for external-ref requalification." }
+        return Invoke-ReviewLoopExternalRefRequalification -State $state -StatePath $statePath `
+            -RepoPath $repo -EvidencePath $RequalifyExternalRefChange -DryRun:$RequalificationDryRun
+    }
+    $activeCall = Get-ReviewLoopObjectProperty -Object $state -Name ActiveRoleCall
+    $identityFailure = Get-ReviewLoopObjectProperty -Object $activeCall -Name RepositoryIdentityFailure
+    if ($null -ne $identityFailure) {
+        throw "Unresolved Fixer repository identity violation; candidate preserved. Evidence: $($identityFailure.Path)"
+    }
+    if ($null -ne $state) {
+        ConvertTo-ReviewLoopWorkState -State $state -StatePath $statePath -RepoPath $repo
+    }
+    $taskContextChanged = $false
+    if ($null -ne $state) {
+        if (-not $PSBoundParameters.ContainsKey("TaskContext")) {
+            $TaskContext = [string]$state.TaskContext
+        }
+        $taskContextChanged = [string]$state.TaskContext -cne $TaskContext
+        if ($taskContextChanged) {
+            $state.TaskContext = $TaskContext
+            foreach ($order in @($state.ArchitectWork.Orders)) { $order.status = "open" }
+            $state.ArchitectWork.Revision++
+            $state.ArchitectWork.OrientationRequired = $true
+            $state.ArchitectWork.OverallAssessment = $null
+        }
+    }
+    $config["__TaskContext"] = $TaskContext
     $fingerprintArguments = @{
+        TaskContext = $TaskContext
         ConfigPath = $resolvedConfigPath
         ReviewBase = $reviewBaseSetting
     }
@@ -4369,6 +4736,7 @@ function Invoke-ReviewLoopCore {
             -ExecutionFingerprint $executionFingerprint `
             -Speed $Speed `
             -RunRoot $paths.RunRoot
+        $state.TaskContext = $TaskContext
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
     else {
@@ -4416,8 +4784,23 @@ function Invoke-ReviewLoopCore {
             -Object $state -Name "ExecutionFingerprint" -Default "")
         $executionChanged = $storedFingerprint -ne $executionFingerprint
         if ($executionChanged) {
+            $state.CompletionRequalificationRequired = $true
             $state.CleanPasses = 0
             $state.CleanHead = ""
+            $state.ArchitectWork.OverallAssessment = $null
+            $pendingAnalysis = $state.ActiveRoleCall
+            if ($null -ne $pendingAnalysis -and $pendingAnalysis.Role -in @("Architect", "LessonsLearned", "ReviewClassifier")) {
+                $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $repo
+                foreach ($binding in @(
+                    @("RepositoryHead", "Head"), @("RepositoryHeadRef", "HeadRef"),
+                    @("WorktreeFingerprint", "Fingerprint"), @("IndexFingerprint", "IndexFingerprint"),
+                    @("RefsFingerprint", "RefsFingerprint"))) {
+                    if ([string](Get-ReviewLoopObjectProperty -Object $pendingAnalysis -Name $binding[0] -Default "") -cne [string]$snapshot.($binding[1])) {
+                        throw "Interrupted analysis no longer matches the exact repository checkpoint."
+                    }
+                }
+                $state.ActiveRoleCall = $null
+            }
             if ([string]$state.LessonsLearned.Status -eq "analyzing") {
                 $state.LessonsLearned.Status = "pending"
             }
@@ -4437,7 +4820,8 @@ function Invoke-ReviewLoopCore {
         }
         $state | Add-Member -Force -NotePropertyName ExecutionFingerprint `
             -NotePropertyValue $executionFingerprint
-        if ($executionChanged -and @($state.ActiveFindingIds).Count -gt 0) {
+        if ($executionChanged -and (@($state.ActiveFindingIds).Count -gt 0 -or @($state.ActiveWorkIds).Count -gt 0 -or
+            $null -ne $state.PendingCommit -or $null -ne $state.RetainedCandidate)) {
             $pendingCommit = Get-ReviewLoopObjectProperty -Object $state -Name "PendingCommit"
             $hadPendingCommit = $null -ne $pendingCommit
             $hasCompletedFixer = $null -ne $state.LastFixerResult -and
@@ -4470,7 +4854,7 @@ function Invoke-ReviewLoopCore {
             $state.Stage = [string](Get-ReviewLoopObjectProperty `
                 -Object $activeRoleCall -Name "CheckpointStage" -Default "reviewing")
         }
-        elseif ([string]$state.Stage -eq "stopped" -and @($state.ActiveFindingIds).Count -gt 0) {
+        elseif ([string]$state.Stage -eq "stopped" -and (@($state.ActiveFindingIds).Count -gt 0 -or @($state.ActiveWorkIds).Count -gt 0)) {
             $state.Stage = if (
                 $null -ne $state.LastFixerResult -and
                 $null -ne $state.LastFixerResult.StructuredResult
@@ -4609,39 +4993,63 @@ function Invoke-ReviewLoopCore {
             Invoke-ReviewLoopCriticGate -Config $config -State $state -StatePath $statePath `
                 -Ledger $ledger -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         }
+        Invoke-ReviewLoopOrientation -Config $config -State $state -StatePath $statePath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         $resumedCluster = Resume-ReviewLoopInterruptedFix `
             -Config $config -State $state -StatePath $statePath `
             -Ledger $ledger -LedgerPath $paths.LedgerPath `
             -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         if (-not $resumedBlockedCleanup -and -not $resumedCluster -and $resumed -and
             [string]$state.Stage -eq "reviewed" -and
-            @(Get-ReviewLoopOpenFindings -Ledger $ledger).Count -gt 0) {
-            Write-ReviewLoopStatus -Message "Continuing the reviewed findings without spending another review call." -Kind Warning
+            (@(Get-ReviewLoopOpenFindings -Ledger $ledger).Count -gt 0 -or
+                @(Get-ReviewLoopOpenWork -State $state).Count -gt 0 -or $null -ne $state.RetainedCandidate)) {
+            Write-ReviewLoopStatus -Message "Continuing reviewed work without spending another review call." -Kind Warning
+            if (-not (Invoke-ReviewLoopRetainedAssessment -Config $config -State $state -StatePath $statePath -Ledger $ledger -LedgerPath $paths.LedgerPath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath)) {
             Invoke-ReviewLoopOpenClusters `
                 -Config $config -State $state -StatePath $statePath `
                 -Ledger $ledger -LedgerPath $paths.LedgerPath `
                 -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
         }
+        }
         while ($true) {
             Assert-ReviewLoopExecutionUnchanged -Config $config
-            $finalLessonsCompletion =
-                Get-ReviewLoopLessonsLearnedFinalCompletion -State $state
-            if ($finalLessonsCompletion.CompletionAllowed) {
-                return Complete-ReviewLoopRun `
-                    -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
-                    -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
-                    -CleanPassesRequired ([int]$config.CleanPassesRequired) `
-                    -CompletionEvidence $finalLessonsCompletion.Evidence
-            }
-            if ([string]$state.Stage -in @(
-                "lessons_learned_analyzing", "lessons_learned_completed"
-            )) {
+            $finalLessonsCompletion = Get-ReviewLoopLessonsLearnedFinalCompletion -State $state
+            $cleanGateReady = [int]$state.CleanPasses -ge [int]$config.CleanPassesRequired -and
+                [string]$state.CleanHead -eq [string]$state.CurrentHead
+            if ($cleanGateReady -or $finalLessonsCompletion.CompletionAllowed -or
+                (-not $state.CompletionRequalificationRequired -and
+                    [string]$state.Stage -in @("lessons_learned_analyzing", "lessons_learned_completed"))) {
+                Assert-ReviewLoopRetainedCandidate -State $state
+                if (@(Get-ReviewLoopOpenFindings -Ledger $ledger).Count -gt 0 -or
+                    @(Get-ReviewLoopOpenWork -State $state).Count -gt 0 -or
+                    $null -ne $state.RetainedCandidate) {
+                    Invoke-ReviewLoopOpenClusters -Config $config -State $state -StatePath $statePath -Ledger $ledger -LedgerPath $paths.LedgerPath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+                    continue
+                }
+                if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
+                    throw "Completion requires the accepted clean repository tree."
+                }
+                if ($cleanGateReady) { $state.CompletionRequalificationRequired = $false }
                 try {
                     $lessonsGate = Invoke-ReviewLoopLessonsLearnedGate `
                         -Config $config -State $state -StatePath $statePath `
                         -Ledger $ledger -LedgerPath $paths.LedgerPath `
                         -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot `
                         -CodexPath $CodexPath
+                    if ($lessonsGate.CompletionAllowed) {
+                        if (-not (Invoke-ReviewLoopGoalAssessment -Config $config -State $state -StatePath $statePath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath)) {
+                            $state.CleanPasses = 0
+                            $state.CleanHead = ""
+                            Write-ReviewLoopState -Path $statePath -State $state | Out-Null
+                            Invoke-ReviewLoopOpenClusters -Config $config -State $state -StatePath $statePath -Ledger $ledger -LedgerPath $paths.LedgerPath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+                            continue
+                        }
+                        return Complete-ReviewLoopRun `
+                            -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
+                            -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
+                            -CleanPassesRequired ([int]$config.CleanPassesRequired) `
+                            -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
+                                -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
+                    }
                 }
                 catch {
                     if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
@@ -4649,18 +5057,10 @@ function Invoke-ReviewLoopCore {
                             -State $state -StatePath $statePath `
                             -Ledger $ledger -LedgerPath $paths.LedgerPath `
                             -RepoPath $repo -RunRoot $paths.RunRoot `
-                            -Reason "The lessons-learned role remained inactive after its technical recovery attempts."
+                            -Reason "The completion role remained inactive after its technical recovery attempts."
                         continue
                     }
                     throw
-                }
-                if ($lessonsGate.CompletionAllowed) {
-                    return Complete-ReviewLoopRun `
-                        -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
-                        -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
-                        -CleanPassesRequired ([int]$config.CleanPassesRequired) `
-                        -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
-                            -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
                 }
                 continue
             }
@@ -4695,7 +5095,8 @@ function Invoke-ReviewLoopCore {
                     CleanPasses = $state.CleanPasses
                 }
             }
-            if (-not (Test-ReviewLoopGitClean -RepoPath $repo)) {
+            Assert-ReviewLoopRetainedCandidate -State $state
+            if (-not (Test-ReviewLoopGitClean -RepoPath $repo) -and $null -eq $state.RetainedCandidate) {
                 if ($resumed -and [string]$state.Stage -eq "cluster_blocked") {
                     $changedPathCount = @(Get-ReviewLoopChangedPaths -RepoPath $repo).Count
                     $repoLiteral = ConvertTo-ReviewLoopPowerShellLiteral $repo
@@ -4764,13 +5165,12 @@ function Invoke-ReviewLoopCore {
             Write-ReviewLoopLedger -Path $paths.LedgerPath -Ledger $ledger | Out-Null
             Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage "reviewed"
             Update-ReviewLoopLiveConfig -Config $config
-            if ((Get-ReviewLoopGitValue -RepoPath $repo -Arguments @("rev-parse", "HEAD")) -ne
-                [string]$review.Head -or -not (Test-ReviewLoopGitClean -RepoPath $repo)) {
-                Stop-ReviewLoopBlocked -Message "Repository state changed after review and before its result could be applied."
-            }
+            Assert-ReviewLoopRepositoryUnchanged -RepoPath $repo -Snapshot $review.Snapshot -Operation "Applying the native review result"
 
+            if (Invoke-ReviewLoopRetainedAssessment -Config $config -State $state -StatePath $statePath -Ledger $ledger -LedgerPath $paths.LedgerPath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath) { continue }
             $open = @(Get-ReviewLoopOpenFindings -Ledger $ledger)
-            if ($open.Count -eq 0 -and @($review.Result.findings).Count -eq 0) {
+            if ($open.Count -eq 0 -and @($review.Result.findings).Count -eq 0 -and
+                @(Get-ReviewLoopOpenWork -State $state).Count -eq 0 -and $null -eq $state.RetainedCandidate) {
                 if ([string]$state.CleanHead -eq [string]$review.Head) {
                     $state.CleanPasses = [int]$state.CleanPasses + 1
                 }
@@ -4782,35 +5182,6 @@ function Invoke-ReviewLoopCore {
                 $reviewHead = [string]$review.Head
                 $cleanShortHead = if ($reviewHead.Length -gt 10) { $reviewHead.Substring(0, 10) } else { $reviewHead }
                 Write-ReviewLoopStatus -Message "Clean pass $($state.CleanPasses)/$($config.CleanPassesRequired) on unchanged HEAD $cleanShortHead" -Kind Success
-                if ([int]$state.CleanPasses -ge [int]$config.CleanPassesRequired) {
-                    try {
-                        $lessonsGate = Invoke-ReviewLoopLessonsLearnedGate `
-                            -Config $config -State $state -StatePath $statePath `
-                            -Ledger $ledger -LedgerPath $paths.LedgerPath `
-                            -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot `
-                            -CodexPath $CodexPath
-                    }
-                    catch {
-                        if (Test-ReviewLoopRestartReviewException -Exception $_.Exception) {
-                            Restart-ReviewLoopAfterInactivity `
-                                -State $state -StatePath $statePath `
-                                -Ledger $ledger -LedgerPath $paths.LedgerPath `
-                                -RepoPath $repo -RunRoot $paths.RunRoot `
-                                -Reason "The lessons-learned role remained inactive after its technical recovery attempts."
-                            continue
-                        }
-                        throw
-                    }
-                    if ($lessonsGate.CompletionAllowed) {
-                        return Complete-ReviewLoopRun `
-                            -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
-                            -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
-                            -CleanPassesRequired ([int]$config.CleanPassesRequired) `
-                            -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
-                                -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
-                    }
-                    continue
-                }
                 continue
             }
 
@@ -4943,9 +5314,12 @@ function Invoke-CodexReviewLoop {
         [string]$ConfigPath = "",
         [string]$ReviewBase = "",
         [AllowEmptyString()][string]$ReviewerInstructions = "",
+        [AllowEmptyString()][string]$TaskContext = "",
         [ValidateSet("standard", "fast")][string]$Speed = "standard",
         [string]$CodexPath = "",
         [switch]$NewRun,
+        [string]$RequalifyExternalRefChange = "",
+        [switch]$RequalificationDryRun,
         [ValidateSet("compact", "balanced", "detailed")][string]$OutputMode = "compact",
         [ValidateRange(0, 3600)][int]$HeartbeatSeconds = 30,
         [ValidateSet("Host", "Ansi", "Always", "Auto", "Never")][string]$ColorMode = "Host",
@@ -4969,12 +5343,20 @@ function Invoke-CodexReviewLoop {
         if (-not [System.IO.Path]::IsPathRooted($lockPath)) {
             $lockPath = Join-Path $repo $lockPath
         }
+        if ($RequalificationDryRun -and -not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+            throw "External-ref dry run requires an existing lease; no lock file was created."
+        }
         try {
-            $lock = [System.IO.FileStream]::new(
-                $lockPath,
-                [System.IO.FileMode]::OpenOrCreate,
-                [System.IO.FileAccess]::ReadWrite,
-                [System.IO.FileShare]::None)
+            if ($RequalificationDryRun) {
+                $lock = [System.IO.FileStream]::new(
+                    $lockPath, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+            }
+            else {
+                $lock = [System.IO.FileStream]::new(
+                    $lockPath, [System.IO.FileMode]::OpenOrCreate,
+                    [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            }
         }
         catch {
             throw (New-ReviewLoopFailureException `
@@ -4984,7 +5366,7 @@ function Invoke-CodexReviewLoop {
                     "After that process exits, run this command again. Do not delete the lock file manually."
                 ))
         }
-        $awakeGuardActive = Start-ReviewLoopAwakeGuard
+        if (-not $RequalificationDryRun) { $awakeGuardActive = Start-ReviewLoopAwakeGuard }
         return Invoke-ReviewLoopCore @PSBoundParameters
     }
     catch {
