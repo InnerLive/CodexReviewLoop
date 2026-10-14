@@ -432,7 +432,10 @@ function Get-ReviewLoopGitRefsFingerprint {
 function Get-ReviewLoopGitRefsSnapshot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
-    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'for-each-ref', "--format=%(refname) %(objectname) %(symref)")
+    $gitResult = Invoke-ReviewLoopGitProcess -Arguments @(
+        '-C', $RepoPath, 'for-each-ref', '--format=%(refname) %(objectname) %(symref)',
+        '--exclude=refs/codex/turn-diffs/**'
+    )
     $refs = @($gitResult.Lines)
     if ($gitResult.ExitCode -ne 0) {
         throw "Git could not inspect repository refs."
@@ -854,11 +857,9 @@ function Invoke-ReviewLoopCriticRepositoryRecovery {
             $name, $value, $target = ([string]$line).Split(' ', 3)
             $baselineRefs[$name] = [pscustomobject]@{ Value = $value; Target = $target }
         }
-        $gitResult = Invoke-ReviewLoopGitProcess -Arguments @('-C', $RepoPath, 'for-each-ref', "--format=%(refname) %(objectname)")
-        $currentRefs = @($gitResult.Lines)
-        if ($gitResult.ExitCode -ne 0) { throw "Git could not inspect Critic recovery refs." }
+        $currentRefs = @((Get-ReviewLoopGitRefsSnapshot -RepoPath $RepoPath).Rows)
         foreach ($line in $currentRefs) {
-            $name, $value = ([string]$line).Split(' ', 2)
+            $name, $value, $target = ([string]$line).Split(' ', 3)
             if (-not $baselineRefs.ContainsKey($name)) {
                 Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("update-ref", "--no-deref", "-d", $name, $value) | Out-Null
             }

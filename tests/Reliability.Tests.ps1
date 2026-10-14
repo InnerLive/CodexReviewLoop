@@ -596,6 +596,8 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         & git -C $repo commit -q -m 'disposable critic commit'
         & git -C $repo switch -q -c critic-other
         & git -C $repo tag critic-tag
+        & git -C $repo update-ref refs/codex/turn-diffs/captures/test/base HEAD
+        $turnHead = (& git -C $repo rev-parse HEAD)
         & git -C $repo symbolic-ref refs/remotes/origin/HEAD refs/heads/critic-other
         & git -C $repo update-index --assume-unchanged README.txt
         $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath -CodexPath $fakeCodex -Json
@@ -604,6 +606,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (& git -C $repo branch --show-current) | Should Be $branch
         (& git -C $repo rev-parse HEAD) | Should Be $state.CurrentHead
         (& git -C $repo for-each-ref --format='%(refname)' | Out-String) | Should Not Match 'critic-other|critic-tag'
+        (& git -C $repo rev-parse refs/codex/turn-diffs/captures/test/base) | Should Be $turnHead
         (& git -C $repo ls-files -v README.txt) | Should Be 'H README.txt'
         (& git -C $repo symbolic-ref refs/remotes/origin/HEAD) | Should Be "refs/heads/$branch"
         # Inspect the ordinary role sequence; task clarification and overall judgment are covered separately.
@@ -712,7 +715,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
 
     It "retains unknown legacy user and technical refs without cleaning files" {
         $pending = New-CriticTestPendingCall $state $repo Critic critic-0010
-        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/turn-diffs/captures/test/base')) {
+        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/other-metadata')) {
             & git -C $repo update-ref $ref $state.CurrentHead
             Set-Content (Join-Path $repo 'README.txt') 'preserved concurrent bytes'
             & (Get-Module CodexReviewLoop) {
@@ -1543,7 +1546,7 @@ Describe "Fixer ref identity evidence and resume" -Tags @("GitSafety", "GitSafet
 
     It "rejects HEAD, symbolic HEAD, user branch, tag and technical ref changes with exact public deltas" {
         Set-Content (Join-Path $repo 'README.txt') 'preserved fixer candidate'
-        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/turn-diffs/captures/test/base')) {
+        foreach ($ref in @('refs/heads/user-branch', 'refs/tags/user-tag', 'refs/codex/other-metadata')) {
             $before = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
             & git -C $repo update-ref $ref $before.Head
             $after = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
@@ -3868,6 +3871,43 @@ Describe "Unattended Git and recovery reliability boundaries 2" `
         (Get-Content -Raw -LiteralPath (Join-Path $repo "README.txt")) |
             Should Match "gate value"
         (Test-Path -LiteralPath (Join-Path $repo "generated.txt")) | Should Be $true
+    }
+
+    It "ignores Codex turn-diff refs in identity checks while still detecting repository refs" {
+        $scenarioRepo = New-ReliabilityRepo -Path (Join-Path $caseRoot "host-gate-codex-refs-repo")
+        $module = Get-Module CodexReviewLoop
+        $before = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $scenarioRepo
+
+        & git -C $scenarioRepo update-ref `
+            refs/codex/turn-diffs/captures/test/base HEAD
+        $LASTEXITCODE | Should Be 0
+        $afterCodexRef = & $module {
+            param($repository)
+            Get-ReviewLoopRepositorySnapshot -RepoPath $repository
+        } $scenarioRepo
+        $afterCodexRef.RefsFingerprint | Should Be $before.RefsFingerprint
+        ($afterCodexRef.Refs -join "`n") | Should Be ($before.Refs -join "`n")
+        & $module {
+            param($repository, $snapshot, $logs)
+            Assert-ReviewLoopRepositoryUnchanged -RepoPath $repository -Snapshot $snapshot -Operation Test
+            Assert-ReviewLoopFixerRepositoryIdentity -Before $snapshot `
+                -After (Get-ReviewLoopRepositorySnapshot -RepoPath $repository) -LogRoot $logs -CallId turn-ref
+        } $scenarioRepo $before $logRoot
+
+        foreach ($ref in @('refs/tags/gate-mutated-ref', 'refs/codex/turn-diffs-other/base')) {
+            & git -C $scenarioRepo update-ref $ref HEAD
+            $LASTEXITCODE | Should Be 0
+            $afterRef = & $module {
+                param($repository)
+                Get-ReviewLoopGitRefsFingerprint -RepoPath $repository
+            } $scenarioRepo
+            $afterRef | Should Not Be $before.RefsFingerprint
+            & git -C $scenarioRepo update-ref -d $ref
+            $LASTEXITCODE | Should Be 0
+        }
     }
 
     It "refuses index and ref mutations without automatic restoration" {

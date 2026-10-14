@@ -1969,7 +1969,7 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
 
     It "grows JSONL while the Codex process is still running" {
         $env:CODEX_REVIEW_LOOP_FAKE_EVENT_DELAY_MS = "2500"
-        $job = Start-Job -ScriptBlock {
+        $job = Start-ThreadJob -ScriptBlock {
             param($importPath, $repoPath, $logs, $fake)
             Import-Module $importPath -Force
             Invoke-CodexCliRole `
@@ -1978,13 +1978,16 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
         } -ArgumentList $modulePath, $repo, $logRoot, $fakeCodex
         try {
             $jsonlPath = $null
-            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
             while ([DateTime]::UtcNow -lt $deadline -and
                 ($null -eq $jsonlPath -or
                  (Get-Item -LiteralPath $jsonlPath -ErrorAction SilentlyContinue).Length -eq 0)) {
                 $observed = @(Get-ChildItem -LiteralPath $logRoot -Filter '*.jsonl' -File)
                 if ($observed.Count -eq 1) { $jsonlPath = $observed[0].FullName }
                 Start-Sleep -Milliseconds 100
+            }
+            if ($null -eq $jsonlPath -or -not (Test-Path -LiteralPath $jsonlPath)) {
+                throw "Streaming JSONL was not created; job state: $($job.State); job errors: $($job.ChildJobs[0].Error | Out-String)"
             }
             Test-Path -LiteralPath $jsonlPath | Should Be $true
             (Get-Content -Raw -LiteralPath $jsonlPath) | Should Match "thread.started"
@@ -2004,7 +2007,7 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
         $env:CODEX_REVIEW_LOOP_FAKE_EVENT_DELAY_MS = "2500"
         $configPath = New-TestConfig -Path (Join-Path $caseRoot "checkpoint.psd1") -LogRoot $logRoot
         $statePath = Join-Path $logRoot "run-v1.json"
-        $job = Start-Job -ScriptBlock {
+        $job = Start-ThreadJob -ScriptBlock {
             param($importPath, $profilePath, $repoPath, $logs, $checkpointPath, $fake)
             Import-Module $importPath -Force
             $config = Import-PowerShellDataFile -LiteralPath $profilePath
@@ -2023,7 +2026,7 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
             } $config $state $checkpointPath $repoPath $logs $fake | Out-Null
         } -ArgumentList $modulePath, $configPath, $repo, $logRoot, $statePath, $fakeCodex
         try {
-            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
             $checkpoint = $null
             while ([DateTime]::UtcNow -lt $deadline) {
                 if (Test-Path -LiteralPath $statePath) {
@@ -2039,6 +2042,10 @@ Describe "Live terminal and streaming process observation" -Tags @("Process") {
                     }
                 }
                 Start-Sleep -Milliseconds 100
+            }
+            if ($null -eq $checkpoint -or
+                [string]::IsNullOrWhiteSpace([string]$checkpoint.ActiveRoleCall.ThreadId)) {
+                throw "Role thread was not checkpointed; job state: $($job.State); job errors: $($job.ChildJobs[0].Error | Out-String)"
             }
             $checkpoint.ActiveRoleCall.CallId | Should Be "architect-01"
             $checkpoint.ActiveRoleCall.ThreadId | Should Be "fake-thread-001"

@@ -20,8 +20,11 @@ it does not turn previous failure or an old clean pass into review success.
 ## Explicit external ref-change requalification
 
 Ordinary resume stops on a persisted Fixer repository-identity failure before
-recovery or initialization writes. All refs remain protected, including desktop
-metadata refs. A namespace is never evidence that a change is safe.
+recovery or initialization writes. Repository identity checks and automatic ref
+restoration exclude only `refs/codex/turn-diffs/**`, the Codex desktop's internal
+turn snapshots. Branches, tags, and all other refs remain protected. Saved
+identity failures remain failures; this exception does not acknowledge an old
+failure or authorize rewriting its captured evidence.
 
 When an operator has independently established and approved one exact external
 ref delta, `-RequalifyExternalRefChange <package.json>` provides an explicit
@@ -89,7 +92,8 @@ and places that candidate at the existing fresh native-review boundary. Run the
 ordinary command separately to obtain fresh native review, current Architect
 acceptance, configured host gates and unchanged-HEAD clean passes. Old tests or
 the acknowledgement itself are never completion evidence. Prevent further
-external ref writers; each later boundary continues to protect all refs.
+external ref writers; each later boundary continues to protect repository refs
+outside the internal turn-snapshot namespace.
 
 ## Before starting
 
