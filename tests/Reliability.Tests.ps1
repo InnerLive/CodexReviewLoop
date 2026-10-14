@@ -2573,6 +2573,59 @@ Describe "Unattended Git and recovery reliability boundaries" `
             Should Match "newer unstaged version"
     }
 
+    It "resumes interrupted assessment with the original cached Fixer call identity" {
+        $plans=Join-Path $caseRoot 'assessment-interruption.json'
+        Write-ReliabilityJsonArray -Path $plans -Values @(
+            @{result='- [P1] preserve dependency (README.txt:1): current defect'},
+            @{},
+            @{mutations=@(@{path='README.txt';content='verified fix'})})
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE=$plans
+        $env:CODEX_REVIEW_LOOP_FAKE_INTERRUPT_ASSESSMENT='1'
+        Mock Invoke-CodexCliRole -ModuleName CodexReviewLoop -ParameterFilter {
+            $SchemaPath -match 'architecture-assessment' -and
+                $env:CODEX_REVIEW_LOOP_FAKE_INTERRUPT_ASSESSMENT -eq '1'
+        } -MockWith {
+            & $OnThreadStarted $env:CODEX_REVIEW_LOOP_FAKE_THREAD
+            throw 'Simulated interruption after the assessment thread checkpoint.'
+        }
+        $first=Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+        $first.Status|Should Be 'failed'
+        $first.Reason|Should Match 'Simulated interruption'
+        $saved=Read-ReviewLoopState $first.StatePath
+        $pendingId=$saved.ActiveRoleCall.CallId
+        $pendingThread=$saved.ActiveRoleCall.ThreadId
+        $fixerId=$saved.LastFixerResult.CallId
+        $pendingId|Should Match 'architect-assess-'
+        $fixerId|Should Not BeNullOrEmpty
+        $expectedKey=& (Get-Module CodexReviewLoop) {param($id)(Get-ReviewLoopSha256 $id).Substring(0,12)} $fixerId
+        $pendingId|Should Match $expectedKey
+        $pendingThread|Should Not BeNullOrEmpty
+        (Get-Content (Join-Path $repo 'README.txt'))|Should Be 'verified fix'
+        $accepted='{"schemaVersion":"2.0","accept":true,"summary":"Preserved fix assessed","feedback":[],"commitMessage":{"subject":"Preserve dependency","rationale":"Verified fix","changes":["Fix dependency"]},"newOrders":[],"workOutcomes":[],"goalComplete":false}'
+        Write-ReliabilityJsonArray -Path $plans -Values @(
+            @{result=$accepted}, @{result='No findings.'}, @{result='No findings.'})
+        $env:CODEX_REVIEW_LOOP_FAKE_INTERRUPT_ASSESSMENT=''
+        $resumed=Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $configPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+        $resumed.Status|Should Be 'completed'
+        $resumed.RunRoot|Should Be $first.RunRoot
+        $state=Read-ReviewLoopState $resumed.StatePath
+        $state.RunId|Should Be $saved.RunId
+        $assessment=@($state.RoleCalls|Where-Object {$_.CallId -eq $pendingId -and $_.Success})
+        $assessment.Count|Should Be 1
+        $assessment[0].ThreadId|Should Be $pendingThread
+        @($state.RoleCalls|Where-Object {$_.Role -eq 'Fixer' -and $_.Success}).Count|Should Be 1
+        $state.ActiveRoleCall|Should BeNullOrEmpty
+        $state.CleanPasses|Should Be 2
+        (& git -C $repo status --porcelain)|Should BeNullOrEmpty
+        (Get-Content (Join-Path $repo 'README.txt'))|Should Be 'verified fix'
+        $calls=@(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG|ForEach-Object{$_|ConvertFrom-Json})
+        $assessmentCalls=@($calls|Where-Object schemaPath -match 'architecture-assessment')
+        $assessmentCalls[-1].callKind|Should Be 'resume'
+        $assessmentCalls[-1].resumeThreadId|Should Be $pendingThread
+    }
+
     It "requalifies a staged commit checkpoint through completion" {
         $config = Import-PowerShellDataFile -LiteralPath $configPath
         $paths = & (Get-Module CodexReviewLoop) {
@@ -4889,22 +4942,33 @@ Describe "Bounded native transport and concise role context" -Tags @("Process") 
         $actual | Should Be ('"'+$info.FileName+'" '+$native)
     }
 
-    It "allows exactly 500 characters including final NUL and rejects 501 before start" {
+    It "allows the Windows limit including final NUL and rejects 32768 before start" {
         $info=[Diagnostics.ProcessStartInfo]::new()
         $info.FileName=Join-Path $PSHOME 'pwsh.exe'
-        $info.Arguments='x'*(499-$info.FileName.Length-4)
+        $info.Arguments='x'*(506-$info.FileName.Length-4)
+        & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info
+        $info.Arguments='x'*(32766-$info.FileName.Length-4)
         & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info
         $info.Arguments+='x'
         & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info
         $info.Arguments+='x'
-        { & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info } | Should Throw '501 UTF-16'
+        { & (Get-Module CodexReviewLoop) { param($i) Assert-ReviewLoopProcessCommandLine $i } $info } | Should Throw '32768 UTF-16'
+    }
+
+    It "starts a native Reviewer with valid guidance beyond the former 500-character cap" {
+        $case=New-ReliabilityTestCase
+        $guidance='x'*1200
+        $call=Invoke-CodexCliRole -Role Reviewer -RepoPath $case.Repo -Model fake -Thinking high -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -DeveloperInstructions $guidance -LogRoot $case.LogRoot -MaxAttempts 1 -CodexPath $fakeCodex
+        $call.Success | Should Be $true
+        $record=Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ConvertFrom-Json
+        ($record.arguments -join ' ') | Should Match $guidance
     }
 
     It "rejects a Windows-overlong native Reviewer before any fake child starts" {
         $case=New-ReliabilityTestCase
         $call=Invoke-CodexCliRole -Role Reviewer -RepoPath $case.Repo -Model fake -Thinking high -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -DeveloperInstructions ('x'*40000) -LogRoot $case.LogRoot -MaxAttempts 1 -CodexPath $fakeCodex
         $call.Success | Should Be $false
-        $call.FailureReason | Should Match 'maximum is 500'
+        $call.FailureReason | Should Match 'maximum is 32767'
         Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
     }
 

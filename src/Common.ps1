@@ -1450,7 +1450,8 @@ function ConvertTo-ReviewLoopProcessPath {
 function Assert-ReviewLoopProcessCommandLine {
     param([Parameter(Mandatory = $true)][System.Diagnostics.ProcessStartInfo]$StartInfo)
 
-    $limit = 500
+    # CreateProcessW counts the complete UTF-16 command line, including NUL.
+    $limit = 32767
     $length = (Get-ReviewLoopProcessCommandLine -StartInfo $StartInfo).Length + 1
     if ($length -gt $limit) {
         throw "Process command line has $length UTF-16 characters including executable, Windows quoting and final NUL; maximum is $limit. Use concise instructions and equivalent short paths. Process was not started."

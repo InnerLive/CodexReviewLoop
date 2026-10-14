@@ -3362,6 +3362,7 @@ function Invoke-ReviewLoopFixWorkflow {
                 -ExpectedFingerprint $storedFingerprint `
                 -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
             $lastFixer = [pscustomobject]@{
+                CallId = [string](Get-ReviewLoopObjectProperty -Object $State.LastFixerResult -Name "CallId" -Default "")
                 Success = $true
                 StructuredResult = $State.LastFixerResult.StructuredResult
                 ThreadId = $threadId
