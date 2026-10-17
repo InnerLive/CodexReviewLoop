@@ -30,6 +30,13 @@ turn snapshots. Branches, tags, and all other refs remain protected. Saved
 identity failures remain failures; this exception does not acknowledge an old
 failure or authorize rewriting its captured evidence.
 
+An inactive retained candidate captured before this exclusion can resume normally.
+The comparison first validates its complete captured ref inventory against its
+original fingerprint, then compares the protected refs under the current policy.
+The captured snapshot remains unchanged. An old hash without its inventory is
+not reinterpreted. Changed protected refs, files, HEAD or index still stop continuation; existing recorded identity
+failures still require their explicit recovery path.
+
 When an operator has independently established and approved one exact external
 ref delta, `-RequalifyExternalRefChange <package.json>` provides an explicit
 requalification boundary. It supports only State 2.0 failed pending Fixers with

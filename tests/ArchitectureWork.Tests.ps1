@@ -77,6 +77,74 @@ function New-WorkTestFix {
     $plan
 }
 
+Describe "Legacy retained ref inventory compatibility" -Tags @("FullLocal") {
+    BeforeEach {
+        $arguments = New-WorkTestCase
+        $repo = $arguments.RepoPath
+        & git -C $repo update-ref refs/codex/turn-diffs/captures/old/base HEAD
+        $snapshot = & (Get-Module CodexReviewLoop) { param($r) Get-ReviewLoopRepositorySnapshot $r } $repo
+        $snapshot.Refs = @(& git -C $repo for-each-ref '--format=%(refname) %(objectname) %(symref)')
+        $snapshot.RefsFingerprint = & (Get-Module CodexReviewLoop) {
+            param($rows)
+            Get-ReviewLoopSha256 (@($rows | ForEach-Object { ($_ -split ' ',3)[0..1] -join ' ' } | Sort-Object) -join "`n")
+        } $snapshot.Refs
+        $assert = {
+            & (Get-Module CodexReviewLoop) {
+                param($r,$s)
+                Assert-ReviewLoopRepositoryUnchanged -RepoPath $r -Snapshot $s -Operation 'Legacy candidate'
+            } $repo $snapshot
+        }
+    }
+    AfterEach { Get-ChildItem Env:CODEX_REVIEW_LOOP_FAKE_* | Remove-Item }
+
+    It "compares protected identity without rewriting the captured snapshot" {
+        $captured = $snapshot | ConvertTo-Json -Depth 8 -Compress
+        & git -C $repo update-ref -d refs/codex/turn-diffs/captures/old/base
+        & git -C $repo update-ref refs/codex/turn-diffs/captures/new/base HEAD
+        & $assert
+        ($snapshot | ConvertTo-Json -Depth 8 -Compress) | Should Be $captured
+    }
+
+    It "rejects an inconsistent captured fingerprint" {
+        $snapshot.RefsFingerprint = '0' * 64
+        { & $assert } | Should Throw 'fingerprint'
+    }
+
+    It "validates excluded captured rows before discarding them for comparison" {
+        $snapshot.Refs = @($snapshot.Refs | ForEach-Object {
+            if ($_ -cmatch '^refs/codex/turn-diffs/') { $_ -replace ' [a-f0-9]{40} ', (' ' + ('0' * 40) + ' ') } else { $_ }
+        })
+        { & $assert } | Should Throw 'fingerprint'
+    }
+
+    It "does not reinterpret an old hash without its captured inventory" {
+        $snapshot.PSObject.Properties.Remove('Refs')
+        { & $assert } | Should Throw 'changed repository state'
+    }
+
+    It "still rejects changes to tags and similarly named technical refs" {
+        foreach ($ref in @('refs/tags/concurrent','refs/codex/turn-diffs-other/base')) {
+            & git -C $repo update-ref $ref HEAD
+            try { { & $assert } | Should Throw 'changed repository state' }
+            finally { & git -C $repo update-ref -d $ref }
+        }
+    }
+
+    It "still rejects changed candidate bytes new files and index metadata" {
+        $readme = Join-Path $repo 'README.md'
+        $original = [IO.File]::ReadAllText($readme)
+        Set-Content -LiteralPath $readme 'concurrent edit'
+        { & $assert } | Should Throw 'changed repository state'
+        [IO.File]::WriteAllText($readme,$original)
+        $newFile = Join-Path $repo 'unexpected.txt'
+        Set-Content -LiteralPath $newFile 'concurrent new file'
+        { & $assert } | Should Throw 'changed repository state'
+        Remove-Item -LiteralPath $newFile
+        & git -C $repo update-index --assume-unchanged README.md
+        { & $assert } | Should Throw 'changed repository state'
+    }
+}
+
 Describe "Shared architecture work" -Tags @("FullLocal") {
     BeforeEach {
         Enable-InProcessCodexRoleCalls -Module (Get-Module CodexReviewLoop) -HelperPath (Join-Path $here "InProcessCodex.ps1")
@@ -161,6 +229,41 @@ Describe "Shared architecture work" -Tags @("FullLocal") {
         @((Get-WorkTestCalls) | Where-Object schemaPath -Match "fixer").Count | Should Be 1
         Set-WorkTestPlans @(@{result="No findings."})
         (Invoke-CodexReviewLoop @arguments).Status | Should Be "completed"
+    }
+
+    It "resumes a retained pre-exclusion ref inventory after a tool and Reviewer guidance update" {
+        & git -C $arguments.RepoPath update-ref refs/codex/turn-diffs/captures/old/base HEAD
+        Set-WorkTestPlans @(
+            (New-WorkTestOrientation @((New-WorkTestOrder))),
+            @{result="No findings."}, (New-WorkTestAdvice), (New-WorkTestFix $true), (New-WorkTestAssessment $false))
+        $first = Invoke-CodexReviewLoop @arguments
+        $first.Status | Should Be 'limit_reached'
+        $state = Read-ReviewLoopState $first.StatePath
+        $legacy = $state.RetainedCandidate.Snapshot
+        $legacy.Refs = @(& git -C $arguments.RepoPath for-each-ref '--format=%(refname) %(objectname) %(symref)')
+        $legacy.RefsFingerprint = & (Get-Module CodexReviewLoop) {
+            param($rows)
+            Get-ReviewLoopSha256 (@($rows | ForEach-Object { ($_ -split ' ',3)[0..1] -join ' ' } | Sort-Object) -join "`n")
+        } $legacy.Refs
+        $captured = $legacy | ConvertTo-Json -Depth 8 -Compress
+        $state.ExecutionFingerprint = 'previous-tool-with-all-refs'
+        Write-ReviewLoopState -Path $first.StatePath -State $state | Out-Null
+        & git -C $arguments.RepoPath update-ref -d refs/codex/turn-diffs/captures/old/base
+        & git -C $arguments.RepoPath update-ref refs/codex/turn-diffs/captures/new/base HEAD
+        $beforeCalls = @(Get-WorkTestCalls).Count
+        Set-WorkTestPlans @(@{result='No findings.'}, (New-WorkTestAssessment))
+        $second = Invoke-CodexReviewLoop @arguments -ReviewerInstructions 'Inspect the original contract.'
+        $second.Status | Should Be 'limit_reached'
+        $calls = @(Get-WorkTestCalls)
+        $calls[$beforeCalls].callKind | Should Be 'review'
+        $accepted = Read-ReviewLoopState $second.StatePath
+        $accepted.RunId | Should Be $state.RunId
+        $accepted.ReviewBaseCommit | Should Be $state.ReviewBaseCommit
+        $accepted.RetainedCandidate | Should BeNullOrEmpty
+        $accepted.CleanPasses | Should Be 0
+        $accepted.ArchitectWork.Orders[0].status | Should Be 'accepted'
+        ($legacy | ConvertTo-Json -Depth 8 -Compress) | Should Be $captured
+        @($calls | Where-Object schemaPath -Match 'fixer').Count | Should Be 1
     }
 
     It "refuses concurrent changes to a retained candidate" {

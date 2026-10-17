@@ -429,23 +429,37 @@ function Get-ReviewLoopGitRefsFingerprint {
     return (Get-ReviewLoopGitRefsSnapshot -RepoPath $RepoPath).Fingerprint
 }
 
+function Get-ReviewLoopProtectedRefInventory {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
+        [AllowEmptyString()][string]$CapturedFingerprint
+    )
+
+    # Keep the established two-field hash representation, including its sorting.
+    $fingerprint = {
+        param([AllowEmptyCollection()][object[]]$Values)
+        $hashRows = @($Values | ForEach-Object { ($_ -split ' ', 3)[0..1] -join ' ' })
+        Get-ReviewLoopSha256 (@($hashRows | Sort-Object) -join "`n")
+    }
+    if ($PSBoundParameters.ContainsKey('CapturedFingerprint') -and
+        (& $fingerprint $Rows) -cne $CapturedFingerprint) {
+        throw 'Captured repository ref inventory fingerprint does not match its rows.'
+    }
+    $refs = @($Rows | Where-Object { $_ -cnotmatch '^refs/codex/turn-diffs/' })
+    return [pscustomobject]@{
+        Rows = $refs
+        Fingerprint = & $fingerprint $refs
+    }
+}
+
 function Get-ReviewLoopGitRefsSnapshot {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     $gitResult = Invoke-ReviewLoopGitProcess -Arguments @(
-        '-C', $RepoPath, 'for-each-ref', '--format=%(refname) %(objectname) %(symref)',
-        '--exclude=refs/codex/turn-diffs/**'
+        '-C', $RepoPath, 'for-each-ref', '--format=%(refname) %(objectname) %(symref)'
     )
-    $refs = @($gitResult.Lines)
-    if ($gitResult.ExitCode -ne 0) {
-        throw "Git could not inspect repository refs."
-    }
-    # Keep the existing two-field hash representation and ordering unchanged.
-    $hashRows = @($refs | ForEach-Object { ($_ -split ' ', 3)[0..1] -join ' ' })
-    return [pscustomobject]@{
-        Rows = $refs
-        Fingerprint = Get-ReviewLoopSha256 (@($hashRows | Sort-Object) -join "`n")
-    }
+    if ($gitResult.ExitCode -ne 0) { throw "Git could not inspect repository refs." }
+    return Get-ReviewLoopProtectedRefInventory -Rows @($gitResult.Lines)
 }
 
 function Get-ReviewLoopGitIndexFingerprint {
@@ -913,6 +927,18 @@ function Assert-ReviewLoopRepositoryUnchanged {
         }
     }
     $current = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
+    if ($null -ne $Snapshot.PSObject.Properties['Refs']) {
+        $inventoryArguments = @{ Rows = @($Snapshot.Refs) }
+        if ($null -ne $Snapshot.PSObject.Properties['RefsFingerprint']) {
+            $inventoryArguments.CapturedFingerprint = [string]$Snapshot.RefsFingerprint
+        }
+        $inventory = Get-ReviewLoopProtectedRefInventory @inventoryArguments
+        $Snapshot = $Snapshot.PSObject.Copy()
+        $Snapshot.Refs = $inventory.Rows
+        if ($null -ne $Snapshot.PSObject.Properties['RefsFingerprint']) {
+            $Snapshot.RefsFingerprint = $inventory.Fingerprint
+        }
+    }
     $changed = @(@("Head", "Fingerprint", "Branch", "HeadRef", "IndexFingerprint", "RefsFingerprint") | Where-Object {
         $null -ne $Snapshot.PSObject.Properties[$_] -and
             [string]$current.$_ -cne [string]$Snapshot.$_
