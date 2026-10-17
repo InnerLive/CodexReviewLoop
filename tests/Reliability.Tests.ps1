@@ -851,6 +851,14 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
     }
 
     It "finishes a dirty interrupted Fixer and repeated assessment after a tool update before new criticism" {
+        $state.TaskContext = 'Repair the defect while preserving the existing behavior.'
+        $state.ArchitectWork.Revision = 1
+        $state.ArchitectWork.OrientationRequired = $false
+        $state.ArchitectWork.Goal = [pscustomobject]@{
+            statement = $state.TaskContext
+            sources = @('Explicit task')
+            uncertainties = @()
+        }
         $ledger = New-ReviewLoopLedger -RepoPath $repo
         Merge-ReviewLoopFindings -Ledger $ledger -Findings @((New-ReliabilityFinding)) `
             -ReviewId review-10 -Head $state.CurrentHead | Out-Null
@@ -890,6 +898,11 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be 'fixer-result-v3.schema.json'
         $calls[0].callKind | Should Be 'resume'
         $calls[0].resumeThreadId | Should Be 'preserved-fixer-thread'
+        $fixerInstructions = & (Get-Module CodexReviewLoop) {
+            param($c)
+            Get-ReviewLoopOperationalInstructions -Role Fixer -Config $c
+        } $config
+        ([string]$calls[0].prompt).StartsWith($fixerInstructions) | Should Be $true
         [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be 'architecture-assessment-v2.schema.json'
         [IO.Path]::GetFileName($calls[2].schemaPath) | Should Be 'fixer-result-v3.schema.json'
         [IO.Path]::GetFileName($calls[3].schemaPath) | Should Be 'architecture-assessment-v2.schema.json'
@@ -898,6 +911,13 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         (Get-Content (Join-Path $repo 'README.txt')) | Should Be 'preserved unfinished work'
         (& git -C $repo status --porcelain) | Should BeNullOrEmpty
         (Read-ReviewLoopLedger -Path $paths.LedgerPath).Findings[0].Status | Should Be 'resolved'
+        $saved = Read-ReviewLoopState $statePath
+        $saved.RunId | Should Be $state.RunId
+        $saved.TaskContext | Should Be $state.TaskContext
+        $saved.ArchitectWork.Revision | Should Be 1
+        $saved.ArchitectWork.Goal.statement | Should Be $state.ArchitectWork.Goal.statement
+        $saved.ExecutionFingerprint | Should Not Be 'old-tool'
+        @($saved.RoleCalls | Where-Object CallId -Like 'orientation-w*').Count | Should Be 0
     }
 }
 
@@ -925,6 +945,47 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
             @($arguments | Where-Object { $_ -eq "--ignore-rules" }).Count | Should Be 1
             @($arguments | Where-Object { $_ -eq "--yolo" }).Count | Should Be 1
             @($arguments | Where-Object { $_ -eq "--sandbox" }).Count | Should Be 0
+        }
+    }
+
+    It "delivers the shared shell hint to every role on exec resume and native review" {
+        $config = Import-PowerShellDataFile -LiteralPath $configPath
+        $config.ReviewerInstructions = 'Preserved review guidance.'
+        $hint = & (Get-Module CodexReviewLoop) {
+            (Get-ReviewLoopPrompt -Name 'shell-command-hint.md' -Values @{}).Trim()
+        }
+        foreach ($role in @('Reviewer','Architect','Fixer','ReviewClassifier','LessonsLearned','Critic')) {
+            $config.Roles[$role] = @{ Model = 'fake'; Thinking = 'high' }
+            $modes = if ($role -eq 'Reviewer') { @('Review') } else { @('Exec','Resume') }
+            foreach ($mode in $modes) {
+                $call = & (Get-Module CodexReviewLoop) {
+                    param($c,$role,$mode,$r,$logs,$fake)
+                    Invoke-ConfiguredCodexRole -Config $c -Role $role -RepoPath $r `
+                        -Speed standard -Mode $mode -ThreadId 'hint-session' -ReviewBase HEAD `
+                        -Prompt $(if ($mode -eq 'Review') { '' } else { 'Current work.' }) `
+                        -LogRoot $logs -CodexPath $fake
+                } $config $role $mode $repo $logRoot $fakeCodex
+                $call.Success | Should Be $true
+            }
+        }
+        $records = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $records.Count | Should Be 11
+        @($records | Where-Object callKind -eq 'resume').Count | Should Be 5
+        foreach ($record in $records) {
+            if ($record.callKind -eq 'review') {
+                $value = [string]@($record.arguments | Where-Object { $_ -like 'developer_instructions=*' })[0]
+                $text = $value.Substring('developer_instructions='.Length) | ConvertFrom-Json
+                $text | Should Be ("Preserved review guidance.`n" + $hint)
+                $record.prompt | Should Be ''
+                $record.schemaPath | Should Be ''
+                ($record.arguments -join ' ') | Should Not Match '--json|--output-schema'
+            } else {
+                $text = [string]$record.prompt
+                ($record.arguments -join ' ') | Should Not Match 'developer_instructions='
+                $text | Should Not Match '\{\{SHELL_COMMAND_HINT\}\}'
+                $text | Should Match 'into files to evade command-length limits'
+            }
+            ([regex]::Matches($text,[regex]::Escape($hint))).Count | Should Be 1
         }
     }
 
@@ -1515,6 +1576,120 @@ Describe "Unattended process reliability boundaries" -Tags @("Process") {
         (Get-Item -LiteralPath $stdoutPath).Length | Should BeGreaterThan 500000
     }
 
+}
+
+Describe "Cybersecurity safeguard failures" -Tags @("Process") {
+    BeforeEach {
+        $case = New-ReliabilityTestCase
+        $repo = $case.Repo
+        $logRoot = $case.LogRoot
+        $planPath = Join-Path $case.Root 'safeguard-plans.json'
+        $notice = 'This content was flagged for possible cybersecurity risk.'
+        $callParameters = @{
+            Role = 'Test'; RepoPath = $repo; Model = 'fake'; Thinking = 'high'
+            Speed = 'standard'; Prompt = 'p'; LogRoot = $logRoot
+            CodexPath = $fakeCodex; MaxAttempts = 3
+        }
+        $env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE = $planPath
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath '' -HostOutputEnabled $false }
+    }
+    AfterEach {
+        & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath '' -HostOutputEnabled $false }
+        Clear-ReliabilityTestCase
+    }
+
+    It "stops a safeguard despite timeout and 500 in earlier command output" {
+        $events = @(
+            '{"type":"item.completed","item":{"type":"command_execution","id":"source","exit_code":0,"aggregated_output":"timeout 500"}}'
+            (ConvertTo-Json -Compress @{type='error'; message=$notice})
+            (ConvertTo-Json -Compress @{type='turn.failed'; error=@{message=$notice}})
+        )
+        Write-ReliabilityJsonArray $planPath @(
+            @{exitCode=1; rawEvents=$events; commands=@()}, @{}
+        )
+        $call = Invoke-CodexCliRole @callParameters
+        $call.Success | Should Be $false
+        $call.FailureKind | Should Be 'cyber_safeguard'
+        $call.FailureReason | Should Match 'cybersecurity risk'
+        $call.Attempts.Count | Should Be 1
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 1
+        @(Get-Content -Raw $planPath | ConvertFrom-Json).Count | Should Be 1
+    }
+
+    It "rejects a coded safeguard even with zero exit and a valid final result" {
+        Write-ReliabilityJsonArray $planPath @(
+            @{exitCode=0; result='Valid final result.'; commands=@(); rawEvents=@(
+                '{"type":"turn.failed","error":{"code":"cyber_policy","message":"Policy check blocked."}}'
+            )}, @{}
+        )
+        $call = Invoke-CodexCliRole @callParameters
+        $call.Success | Should Be $false
+        $call.ExitCode | Should Not Be 0
+        $call.FailureKind | Should Be 'cyber_safeguard'
+        $call.FinalMessage | Should Be ''
+        $call.StructuredResult | Should BeNullOrEmpty
+        $call.Attempts.Count | Should Be 1
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 1
+    }
+
+    It "retains a native Reviewer stderr safeguard after it leaves the bounded diagnostic tail" {
+        Write-ReliabilityJsonArray $planPath @(
+            @{exitCode=1; stderr="Error: $notice`n$('z'*70000) timeout 500"; commands=@()}, @{}
+        )
+        $callParameters.Role = 'Reviewer'
+        $callParameters.Mode = 'Review'
+        $callParameters.ReviewBase = 'HEAD'
+        $callParameters.Prompt = ''
+        $call = Invoke-CodexCliRole @callParameters
+        $call.Success | Should Be $false
+        $call.FailureKind | Should Be 'cyber_safeguard'
+        $call.FailureReason | Should Match 'cybersecurity risk'
+        $call.Attempts.Count | Should Be 1
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 1
+    }
+
+    It "does not treat a quoted safeguard in command output as a service decision" {
+        Write-ReliabilityJsonArray $planPath @(
+            @{commands=@(@{exitCode=0; output="$notice timeout 500 cyber_policy"})}
+        )
+        $call = Invoke-CodexCliRole @callParameters
+        $call.Success | Should Be $true
+        $call.FailureKind | Should Be 'none'
+        $call.Attempts.Count | Should Be 1
+    }
+
+    It "still retries a genuine transient connection error" {
+        Write-ReliabilityJsonArray $planPath @(
+            @{exitCode=1; stderr='connection reset 500'; commands=@()}, @{}
+        )
+        $call = Invoke-CodexCliRole @callParameters
+        $call.Success | Should Be $true
+        $call.Attempts.Count | Should Be 2
+        $call.Attempts[0].FailureKind | Should Be 'transient'
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 2
+    }
+
+    It "preserves a failed public checkpoint without starting review or acceptance" {
+        Write-ReliabilityJsonArray $planPath @(
+            @{phase='orientation'; exitCode=1; stderr='timeout 500'; commands=@(); rawEvents=@(
+                (ConvertTo-Json -Compress @{type='error'; message=$notice})
+            )}, @{}
+        )
+        $head = (& git -C $repo rev-parse HEAD | Out-String).Trim()
+        $result = Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $case.ConfigPath `
+            -CodexPath $fakeCodex -HeartbeatSeconds 0 -ColorMode Never
+        $result.Status | Should Be 'failed'
+        ($result.NextSteps -join ' ') | Should Match 'provider'
+        ($result.NextSteps -join ' ') | Should Match 'explicit retry'
+        ($result.NextSteps -join ' ') | Should Not Match 'same command|simple command'
+        $state = Read-ReviewLoopState $result.StatePath
+        $state.ReviewCycle | Should Be 0
+        $state.CleanPasses | Should Be 0
+        @($state.LoopCommits).Count | Should Be 0
+        $state.RoleCalls[0].FailureKind | Should Be 'cyber_safeguard'
+        @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG).Count | Should Be 1
+        (& git -C $repo rev-parse HEAD | Out-String).Trim() | Should Be $head
+    }
 }
 
 Describe "Fixer ref identity evidence and resume" -Tags @("GitSafety", "GitSafetyA") {

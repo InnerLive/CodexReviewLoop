@@ -50,7 +50,9 @@ function Get-ReviewLoopOperationalInstructions {
         default { "developer-analysis.md" }
     }
     $sections = @(
-        Get-ReviewLoopPrompt -Name "developer-common.md" -Values @{}
+        Get-ReviewLoopPrompt -Name "developer-common.md" -Values @{
+            SHELL_COMMAND_HINT = (Get-ReviewLoopPrompt -Name "shell-command-hint.md" -Values @{}).Trim()
+        }
     )
     if ($Role -notin @("ReviewClassifier", "Critic")) {
         $sections += Get-ReviewLoopPrompt `
@@ -579,7 +581,9 @@ function Invoke-ConfiguredCodexRole {
         $arguments.CodexPath = $CodexPath
     }
     $developerInstructions = if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
-        [string]$Config.ReviewerInstructions
+        (@([string]$Config.ReviewerInstructions,
+            (Get-ReviewLoopPrompt -Name "shell-command-hint.md" -Values @{}).Trim()) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
     }
     else {
         Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
@@ -704,6 +708,15 @@ function Invoke-ConfiguredCodexRole {
 function Assert-ReviewLoopRoleSuccess {
     param([Parameter(Mandatory = $true)][object]$Call)
 
+    if (-not $Call.Success -and [string]$Call.FailureKind -eq 'cyber_safeguard') {
+        throw (New-ReviewLoopFailureException `
+            -Message "Codex role '$($Call.Role)' stopped on a service cybersecurity safeguard: $($Call.FailureReason)" `
+            -NextSteps @(
+                'Keep the failed run and its checkpoint; inspect the captured service notice.'
+                'If the notice appears mistaken, clarify the authorized task before an explicit retry, as the service suggests; do not obscure its purpose or bypass the safeguard.'
+                'Use Codex feedback or provider support if the classification remains unclear.'
+            ))
+    }
     if (-not $Call.Success) {
         $exception = New-ReviewLoopFailureException `
             -Message "Codex role '$($Call.Role)' failed after its automatic recovery attempts ($($Call.FailureKind)): $($Call.FailureReason)" `

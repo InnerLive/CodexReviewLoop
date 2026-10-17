@@ -245,12 +245,55 @@ function Read-ReviewLoopSanitizedResult {
     return [pscustomobject]@{ Text = $safe; TooLarge = $false }
 }
 
+function Get-CodexCyberSafetyError {
+    param([AllowNull()][string]$Output, [switch]$AllowPlainText)
+
+    foreach ($line in @($Output -split "\r?\n")) {
+        $message = $line.Trim()
+        $code = ""
+        if ($message.StartsWith('{')) {
+            try { $event = $message | ConvertFrom-Json -ErrorAction Stop }
+            catch { continue }
+            $type = [string](Get-ReviewLoopObjectProperty -Object $event -Name type -Default '')
+            $serviceError = Get-ReviewLoopObjectProperty -Object $event -Name error
+            $item = Get-ReviewLoopObjectProperty -Object $event -Name item
+            if ($type -in @('error', 'turn.failed')) {
+                $message = [string](Get-ReviewLoopObjectProperty -Object $serviceError -Name message -Default (
+                    Get-ReviewLoopObjectProperty -Object $event -Name message -Default ''))
+                $code = [string](Get-ReviewLoopObjectProperty -Object $serviceError -Name code -Default (
+                    Get-ReviewLoopObjectProperty -Object $event -Name code -Default ''))
+            }
+            elseif ($type -in @('item.started', 'item.completed') -and
+                (Get-ReviewLoopObjectProperty -Object $item -Name type -Default '') -eq 'error') {
+                $message = [string](Get-ReviewLoopObjectProperty -Object $item -Name message -Default '')
+                $code = [string](Get-ReviewLoopObjectProperty -Object $item -Name code -Default '')
+            }
+            else { continue }
+        }
+        elseif (-not $AllowPlainText) { continue }
+        if ($code -eq 'cyber_policy') {
+            return $(if ($message) { $message } else { 'Codex cybersecurity safeguard blocked the request (cyber_policy).' })
+        }
+        if ($message -match '(?i)\A(?:error:\s*)?This content was flagged for possible cybersecurity risk(?:\.|\s|$)') {
+            return $message
+        }
+    }
+    return ''
+}
+
 function Get-CodexFailureKind {
     param(
         [int]$ExitCode,
-        [AllowNull()][string]$Output
+        [AllowNull()][string]$Output,
+        [string]$CyberSafetyError = ''
     )
 
+    if ([string]::IsNullOrEmpty($CyberSafetyError)) {
+        $CyberSafetyError = Get-CodexCyberSafetyError -Output $Output
+    }
+    if (-not [string]::IsNullOrEmpty($CyberSafetyError)) {
+        return 'cyber_safeguard'
+    }
     if ($ExitCode -eq 0) {
         return "none"
     }
@@ -465,6 +508,8 @@ function Update-ReviewLoopCodexActivity {
         }
     }
     elseif ($itemType -eq "error" -or $type -in @("error", "turn.failed")) {
+        $cyberSafetyError = Get-CodexCyberSafetyError -Output $Line
+        if ($cyberSafetyError) { $Activity.CyberSafetyError = $cyberSafetyError }
         $message = [string](Get-ReviewLoopObjectProperty -Object $item -Name "message" -Default "")
         if ([string]::IsNullOrWhiteSpace($message)) {
             $message = [string](Get-ReviewLoopObjectProperty -Object $event -Name "message" -Default "Codex reported an error.")
@@ -607,6 +652,7 @@ function Invoke-ReviewLoopObservedProcess {
         EventStreamLossCount = 0
         MalformedEventCount = 0
         TurnFailedCount = 0
+        CyberSafetyError = ''
         DeclinedCommandCount = 0
         FailedCommandCount = 0
         Usage = [pscustomobject]@{
@@ -701,6 +747,8 @@ function Invoke-ReviewLoopObservedProcess {
                     $stderrDone = $true
                 }
                 else {
+                    $cyberSafetyError = Get-CodexCyberSafetyError -Output $line -AllowPlainText
+                    if ($cyberSafetyError) { $activity.CyberSafetyError = $cyberSafetyError }
                     $safeLine = ConvertTo-ReviewLoopRedactedText $line
                     $stderrWriter.WriteLine($safeLine)
                     Add-ReviewLoopTextTailLine -Tail $stderrTail -Line $safeLine
@@ -805,6 +853,7 @@ function Invoke-ReviewLoopObservedProcess {
         EventStreamLossCount = [int]$activity.EventStreamLossCount
         MalformedEventCount = [int]$activity.MalformedEventCount
         TurnFailedCount = [int]$activity.TurnFailedCount
+        CyberSafetyError = ConvertTo-ReviewLoopRedactedText ([string]$activity.CyberSafetyError)
         DeclinedCommandCount = [int]$activity.DeclinedCommandCount
         FailedCommandCount = [int]$activity.FailedCommandCount
         InputWriteFailed = $inputWriteFailed
@@ -967,13 +1016,19 @@ function Invoke-CodexCliRole {
         $diagnosticOutput = (($stderr, $stdout | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_)
         }) -join [Environment]::NewLine).Trim()
-        $failureKind = Get-CodexFailureKind -ExitCode $exitCode -Output $diagnosticOutput
+        $cyberSafetyError = [string](Get-ReviewLoopObjectProperty -Object $observed -Name CyberSafetyError -Default '')
+        $failureKind = Get-CodexFailureKind -ExitCode $exitCode -Output $diagnosticOutput -CyberSafetyError $cyberSafetyError
         $failureReason = if ($exitCode -eq 0) { "" } else { (($stderr, $stdout | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_)
         }) -join [Environment]::NewLine).Trim() }
         $finalText = ""
         $structured = $null
-        if ($null -ne $observed -and [bool]$observed.InputWriteFailed) {
+        if ($failureKind -eq 'cyber_safeguard') {
+            if (-not $cyberSafetyError) { $cyberSafetyError = Get-CodexCyberSafetyError -Output $diagnosticOutput }
+            if ($exitCode -eq 0) { $exitCode = 5 }
+            $failureReason = $cyberSafetyError
+        }
+        elseif ($null -ne $observed -and [bool]$observed.InputWriteFailed) {
             $exitCode = 5
             $failureKind = "input_write_error"
             $failureReason = "Codex closed its input pipe before the role prompt was fully delivered: $($observed.InputWriteFailureReason)"

@@ -7,7 +7,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$sourceRoot = Join-Path $PSScriptRoot "skills"
+$repositoryRoot = $PSScriptRoot
+if (Test-Path -LiteralPath (Join-Path $repositoryRoot '.git') -PathType Leaf) {
+    $worktrees = @(& git -C $repositoryRoot worktree list --porcelain)
+    if ($LASTEXITCODE -ne 0 -or $worktrees.Count -eq 0 -or
+        -not $worktrees[0].StartsWith('worktree ')) {
+        throw 'Could not locate the primary ReviewLoop checkout.'
+    }
+    $repositoryRoot = [IO.Path]::GetFullPath($worktrees[0].Substring(9))
+}
+$sourceRoot = Join-Path $repositoryRoot "skills"
 $skillNames = @("prompting", "review-loop")
 
 foreach ($skillName in $skillNames) {
@@ -22,7 +31,7 @@ foreach ($skillName in $skillNames) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $skillName) `
         -Destination $SkillsPath -Recurse -Force
     if ($skillName -eq "review-loop") {
-        @{ repositoryPath = $PSScriptRoot } | ConvertTo-Json |
+        @{ repositoryPath = $repositoryRoot } | ConvertTo-Json |
             Set-Content -LiteralPath (Join-Path $SkillsPath "review-loop\installation.json") `
                 -Encoding utf8NoBOM
     }

@@ -5,7 +5,11 @@
 Loop-owned process starts are checked against the [Windows command-line limit](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw):
 32,767 UTF-16 characters, including the quoted executable, Windows argument
 quoting and final NUL. An overlong command fails before starting. This check does
-not intercept shell commands started internally by Codex. Use concise Reviewer
+not intercept shell commands started internally by Codex. All six roles receive
+the same short instruction to keep each shell call concise. Structured roles
+receive it on stdin, including resume; native review appends it to the original
+Reviewer guidance. This is guidance, without an artificial 200- or 500-character
+limit. Use concise Reviewer
 guidance; native review already uses
 the pinned base and repository instructions. Shared state, ref inventories and
 history are not Reviewer instructions. Structured roles receive the current

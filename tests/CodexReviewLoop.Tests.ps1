@@ -2302,6 +2302,47 @@ Invoke-CodexCliRole -Role Test -RepoPath '$($repo.Replace("'", "''"))' -Model mo
     }
 }
 
+Describe "Skill installation checkout selection" -Tags @("FullLocal") {
+    It "installs both skills with the primary repository path" {
+        $destination = Join-Path $TestDrive 'primary-installed-skills'
+        & (Join-Path $root 'install-skills.ps1') -SkillsPath $destination | Out-Null
+        $binding = Get-Content -Raw (Join-Path $destination 'review-loop/installation.json') | ConvertFrom-Json
+        $binding.repositoryPath | Should Be $root
+        foreach ($name in @('prompting', 'review-loop')) {
+            (Get-Content -Raw (Join-Path $destination "$name/SKILL.md")) |
+                Should Be (Get-Content -Raw (Join-Path $root "skills/$name/SKILL.md"))
+        }
+    }
+
+    It "uses primary skills and path even when launched from a linked worktree" {
+        $primary = New-TestRepo -Path (Join-Path $TestDrive 'installer-primary')
+        $linked = Join-Path $TestDrive 'installer-linked'
+        $destination = Join-Path $TestDrive 'linked-installed-skills'
+        Copy-Item (Join-Path $root 'install-skills.ps1') $primary
+        Copy-Item (Join-Path $root 'skills') $primary -Recurse
+        & git -C $primary add install-skills.ps1 skills
+        & git -C $primary commit -q -m 'installer fixture'
+        & git -C $primary worktree add -q --detach $linked HEAD
+        $LASTEXITCODE | Should Be 0
+        try {
+            Set-Content (Join-Path $linked 'skills/review-loop/SKILL.md') 'unpublished worktree skill'
+            & (Join-Path $linked 'install-skills.ps1') -SkillsPath $destination | Out-Null
+            $binding = Get-Content -Raw (Join-Path $destination 'review-loop/installation.json') | ConvertFrom-Json
+            & (Get-Module CodexReviewLoop) {
+                param($installed, $expected)
+                Test-ReviewLoopSamePath -Left $installed -Right $expected
+            } $binding.repositoryPath $primary | Should Be $true
+            (Get-Content -Raw (Join-Path $destination 'review-loop/SKILL.md')) |
+                Should Be (Get-Content -Raw (Join-Path $primary 'skills/review-loop/SKILL.md'))
+        }
+        finally {
+            & git -C $primary worktree remove --force $linked
+            if ($LASTEXITCODE -ne 0) { throw 'Could not remove the temporary installer fixture worktree.' }
+        }
+        @(& git -C $primary worktree list --porcelain | Where-Object { $_ -like 'worktree *' }).Count | Should Be 1
+    }
+}
+
 Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLocal") {
     It "parses every JSON schema" {
         $schemas = Get-ChildItem -LiteralPath (Join-Path $root "schemas") -Filter "*.json"
@@ -2348,6 +2389,7 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
             "lessons-learned.md",
             "resume-interrupted-role.md",
             "review-classifier.md",
+            "shell-command-hint.md",
             "technical-retry-fresh.md",
             "technical-retry-resume.md"
         )

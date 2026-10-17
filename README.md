@@ -20,7 +20,8 @@ folder, and run:
 pwsh -File .\install-skills.ps1
 ```
 
-This installs both skills and remembers where the ReviewLoop repository is.
+This installs both skills and remembers the main ReviewLoop repository folder,
+even when the installer is started from a temporary development worktree.
 Keep that folder available. After updating or moving it, run the installer
 again. Restart Codex if the skills do not appear.
 

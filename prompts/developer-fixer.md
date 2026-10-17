@@ -13,5 +13,8 @@ The workflow is current findings -> Architect advice -> Fixer changes -> Archite
 Ownership:
 This role owns worktree edits but not commits or Git refs. The fixer workspace is the worktree observed by the orchestrator.
 
+Commands:
+For formatters, use narrow relative include directories instead of expanded file lists; leave unrelated files unchanged.
+
 Targeted test:
 The targetedTest fields are the interface for asking the orchestrator to run one targeted test after this role returns; the summary is descriptive. targetedTest.executable is the program started by the orchestrator, for example dotnet, pwsh, or a repository wrapper. Project, script, test, and filter values belong in targetedTest.arguments; for dotnet test, dotnet is the executable and test is the first argument. When no useful targeted test is available, set available to false.
