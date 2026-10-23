@@ -38,6 +38,14 @@ function New-TestRepo {
     return $Path
 }
 
+function Get-TestActiveFiles {
+    # Exclude transient test roots before traversal; other test lanes remove them.
+    Get-ChildItem -File -LiteralPath $root
+    Get-ChildItem -Directory -LiteralPath $root |
+        Where-Object Name -NotIn @('archive','analysis','tests','eval-results','runs','profiles','.git') |
+        Get-ChildItem -Recurse -File
+}
+
 function New-TestFinding {
     param(
         [string]$Path = "src/A.cs",
@@ -2387,6 +2395,7 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
             "fixer-interrupted-attempt.md",
             "fixer-partial-recovery.md",
             "lessons-learned.md",
+            "operator-message.md",
             "resume-interrupted-role.md",
             "review-classifier.md",
             "shell-command-hint.md",
@@ -2441,9 +2450,8 @@ Describe "Schemas, prompts, and CLI-only invariants" -Tags @("Static", "FullLoca
             '{"schemaVersion":"2.0","summary":"Bad surface.","diagnosis":{"summary":"x","causes":[],"guidanceAssessment":[]},"changes":[{"title":"Bad","action":"add","surface":"plugin","targets":["AGENTS.md"],"outcome":"x","rationale":"x","futureUse":"x","evidence":[]}]}',
             '{"schemaVersion":"2.0","summary":"Incomplete.","diagnosis":{"summary":"x","causes":[],"guidanceAssessment":[]},"changes":[{"title":"Bad","action":"add","surface":"agents_md","targets":["AGENTS.md"],"outcome":"x","rationale":"x","evidence":[]}]}'
         )) {
-            (Test-Throws {
-                $invalid | Test-Json -SchemaFile $retrospectiveSchema -ErrorAction Stop
-            }) | Should Be $true
+            $invalid | Test-Json -SchemaFile $retrospectiveSchema -ErrorAction SilentlyContinue |
+                Should Be $false
         }
     }
 
@@ -2626,23 +2634,20 @@ Fixer result and targeted-test evidence:
     }
 
     It "has no direct HTTP model invocation in active code" {
-        $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+        $active = @(Get-TestActiveFiles)
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'Invoke-WebRequest|Invoke-RestMethod|/v1/responses'
     }
 
     It "has no direct API credential dependency in active code" {
-        $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+        $active = @(Get-TestActiveFiles)
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $credentialName = "OPENAI" + "_API_KEY"
         $text | Should Not Match $credentialName
     }
 
     It "does not retain legacy architecture switches" {
-        $active = Get-ChildItem -Recurse -File -LiteralPath $root |
-            Where-Object { $_.FullName -notmatch '\\archive\\|\\analysis\\|\\tests\\|\\eval-results\\|\\runs\\|\\profiles\\|\\.git\\' }
+        $active = @(Get-TestActiveFiles)
         $text = ($active | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
         $text | Should Not Match 'ArchitectureAutoApplyAll|InteractiveArchitectureGate|ArchitectureHotspot'
     }

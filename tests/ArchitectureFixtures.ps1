@@ -18,7 +18,19 @@ function Clear-TestLogRoots {
             [IO.Path]::GetFileName($absolute) -notmatch '^test-[a-f0-9]{32}$') {
             throw "Test log cleanup escaped its owned case: $absolute"
         }
-        if (Test-Path -LiteralPath $absolute) { Remove-Item -LiteralPath $absolute -Recurse -Force }
+        if (Test-Path -LiteralPath $absolute) {
+            foreach ($checkpoint in @(Get-ChildItem -LiteralPath $absolute -Filter run-v1.json -Recurse -File)) {
+                try {
+                    $mailbox = & (Get-Module CodexReviewLoop) {
+                        param($path)
+                        Get-ReviewLoopOperatorMailbox (Read-ReviewLoopState $path)
+                    } $checkpoint.FullName
+                }
+                catch { continue } # Deliberately invalid state fixtures have no mailbox.
+                if (Test-Path -LiteralPath $mailbox) { Remove-Item -LiteralPath $mailbox -Recurse -Force }
+            }
+            Remove-Item -LiteralPath $absolute -Recurse -Force
+        }
     }
     $script:OwnedTestLogCases = @()
 }

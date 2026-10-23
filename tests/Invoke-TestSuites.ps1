@@ -12,6 +12,7 @@ $testsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $mainSuite = Join-Path $testsRoot "CodexReviewLoop.Tests.ps1"
 $reliabilitySuite = Join-Path $testsRoot "Reliability.Tests.ps1"
 $architectureSuite = Join-Path $testsRoot "ArchitectureWork.Tests.ps1"
+$operatorSuite = Join-Path $testsRoot 'Operator.Tests.ps1'
 $laneWorker = Join-Path $testsRoot "Invoke-PesterLane.ps1"
 $resultRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
     ("codex-review-loop-tests-" + [Guid]::NewGuid().ToString("N"))
@@ -189,12 +190,13 @@ else {
 
     $results += Invoke-TestLaneGroup -Parallel -Lanes @(
         New-TestLane -Name "architecture-work" -Script $architectureSuite -Tag "FullLocal"
+        New-TestLane -Name 'operator' -Script $operatorSuite
         New-TestLane -Name "fast-static" -Script $mainSuite -Tag "FullLocal"
         New-TestLane -Name "main-process" -Script $mainSuite -Tag "Process"
         New-TestLane -Name "reliability-process" -Script $reliabilitySuite -Tag "Process"
     )
 
-    $declared = Get-DeclaredTestCount -Path @($mainSuite, $reliabilitySuite, $architectureSuite)
+    $declared = Get-DeclaredTestCount -Path @($mainSuite, $reliabilitySuite, $architectureSuite, $operatorSuite)
     $executed = [int](($results | Measure-Object -Property Total -Sum).Sum)
     if ($executed -ne $declared) {
         Remove-Item -LiteralPath $resultRoot -Recurse -Force `

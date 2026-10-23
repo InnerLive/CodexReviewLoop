@@ -93,6 +93,7 @@ $threadId = [string](Get-FakePlanValue -Plan $invocationPlan -Name "threadId" -D
 $emitThread = Get-FakePlanValue -Plan $invocationPlan -Name "emitThread" -Default $true
 $plannedResult = Get-FakePlanValue -Plan $invocationPlan -Name "result"
 $plannedMutations = @(Get-FakePlanValue -Plan $invocationPlan -Name "mutations" -Default @())
+$operatorMessages = @(Get-FakePlanValue -Plan $invocationPlan -Name 'operatorMessages' -Default @())
 $profileMutation = Get-FakePlanValue -Plan $invocationPlan -Name "profileMutation"
 $childPidPath = [string](Get-FakePlanValue -Plan $invocationPlan -Name "childPidPath" -Default "")
 $childSleepSeconds = [int](Get-FakePlanValue -Plan $invocationPlan -Name "childSleepSeconds" -Default 60)
@@ -296,6 +297,12 @@ if ($exitCode -eq 0 -and
             ([Guid]::NewGuid().ToString("N") + [Environment]::NewLine),
             [System.Text.UTF8Encoding]::new($false))
     }
+}
+
+foreach ($message in $operatorMessages) {
+    & (Join-Path (Split-Path -Parent $PSScriptRoot) 'operator-message.ps1') `
+        -RunRoot $message.runRoot -To $message.to -Message $message.message `
+        -RequireDelivery:([bool]$message.requireDelivery) | Out-Null
 }
 
 if ($plannedMutations.Count -gt 0) {

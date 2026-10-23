@@ -1344,6 +1344,7 @@ function Get-ReviewLoopExecutionFingerprint {
     $files = [System.Collections.Generic.List[string]]::new()
     foreach ($name in @(
         "codex-review-loop.ps1",
+        "operator-message.ps1",
         "CodexReviewLoop.psd1",
         "CodexReviewLoop.psm1"
     )) {

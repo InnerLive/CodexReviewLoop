@@ -17,6 +17,12 @@ and otherwise falls back to the normal `origin/HEAD`, main/master, `HEAD^`, or
 `HEAD` selection. A resumed run keeps the symbolic base and commit recorded in
 its checkpoint.
 
+An external supervising Operator can send one-time evidence to explicitly
+selected working roles through the [durable operator channel](operations.md#operator-messages).
+It uses the existing role contexts and acceptance path. Optional required
+delivery can return the workflow to those roles before a sealed transaction;
+the Operator never writes authoritative checkpoints or grants acceptance.
+
 ## Periodic Critic
 
 Starting after five successfully completed, distinct native reviews by default,

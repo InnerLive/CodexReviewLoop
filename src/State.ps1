@@ -536,6 +536,7 @@ function Read-ReviewLoopState {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $state = Read-ReviewLoopJson -Path $Path
+    Initialize-ReviewLoopOperator $state
     foreach ($name in @("ActiveRoleCall", "ActiveCriticCall", "PartialFixRecovery", "ActiveHostGateRecovery")) {
         if ($state.PSObject.Properties.Name -notcontains $name) {
             $state | Add-Member -NotePropertyName $name -NotePropertyValue $null
@@ -632,6 +633,8 @@ function Add-ReviewLoopRoleCall {
             -Object $Call -Name "ExecutionFingerprint" -Default "")
         CriticId = [string](Get-ReviewLoopObjectProperty -Object $Call -Name "CriticId" -Default "")
         WorkRevision = [int](Get-ReviewLoopObjectProperty -Object $Call -Name "WorkRevision" -Default -1)
+        OperatorRevision = [int](Get-ReviewLoopObjectProperty -Object $Call -Name 'OperatorRevision' -Default 0)
+        OperatorMessageIds = @((Get-ReviewLoopObjectProperty -Object $Call -Name 'OperatorMessageIds' -Default @()))
         RepositorySnapshot = Get-ReviewLoopObjectProperty -Object $Call -Name RepositorySnapshot
         CoveredReviewCount = [int](Get-ReviewLoopObjectProperty -Object $Call -Name "CoveredReviewCount" -Default 0)
         RepositoryHead = [string](Get-ReviewLoopObjectProperty `
@@ -807,6 +810,7 @@ function Complete-ReviewLoopArchitectureWork {
             IndexFingerprint = [string]$snapshot.IndexFingerprint
             RefsFingerprint = [string]$snapshot.RefsFingerprint
             Summary = [string]$Result.summary
+            OperatorRevision = [int](Get-ReviewLoopObjectProperty $Result -Name OperatorRevision -Default 0)
         }
     }
 }
@@ -814,6 +818,7 @@ function Complete-ReviewLoopArchitectureWork {
 function Test-ReviewLoopGoalAccepted {
     param([Parameter(Mandatory = $true)][object]$State)
     $assessment = $State.ArchitectWork.OverallAssessment
+    if (@(Get-ReviewLoopPendingOperatorMessages $State -Role Architect).Count -gt 0) { return $false }
     if ($State.ArchitectWork.OrientationRequired -or $null -eq $assessment -or
         @(Get-ReviewLoopOpenWork -State $State).Count -gt 0 -or
         $null -ne $State.RetainedCandidate -or $null -ne $State.PendingCommit -or
@@ -824,6 +829,7 @@ function Test-ReviewLoopGoalAccepted {
     }
     $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $State.RepoPath
     return [int]$assessment.Revision -eq [int]$State.ArchitectWork.Revision -and
+        [int](Get-ReviewLoopObjectProperty $assessment -Name OperatorRevision -Default 0) -eq [int]$State.Operator.Revisions.Architect -and
         $assessment.Head -eq $snapshot.Head -and
         $assessment.Fingerprint -eq $snapshot.Fingerprint -and
         $assessment.IndexFingerprint -eq $snapshot.IndexFingerprint -and

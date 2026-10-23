@@ -340,6 +340,38 @@ Reviewer instructions, role settings, and service tier, then resume the same run
 Archived patches are evidence, not automatically accepted work. A completed and
 integrated task must not be reopened for the upgrade.
 
+## Operator messages
+
+Use `operator-message.ps1 <RunRoot> -To Architect -Message 'New evidence'` to
+publish a one-time message to the exact observed run. `-To` accepts Reviewer,
+Architect and Fixer, individually or together. `-Id <GUID>` retries an identical
+publication; a reused ID with different content is rejected. Publication returns
+only the ID, not a delivery receipt. The loop reports delivery or rejection with
+the ID and a short reason. The checkpoint remains exclusively loop-owned.
+
+Messages normally wait for the next matching role call, including resume. Add
+`-RequireDelivery` deliberately to force the addressed roles before the next
+unsealed commit or completion; this may repeat review, fixing or assessment.
+Current roles are not interrupted and existing budgets and gates still apply.
+Messages are evidence within the existing assignment, not acceptance or a task
+replacement. The native Reviewer still uses `codex review --base`.
+
+The mailbox is under `%LOCALAPPDATA%\CodexReviewLoop\operator\<run-key>`, outside
+the reviewed worktree. Requests publish atomically and are bound to the exact
+checkpoint and run identity. The loop durably records each recipient's logical
+role-call binding and successful delivery with its role result. Interrupted
+transport may be retried as part of the same logical call; it is not a second
+application or a new permanent history entry.
+
+Before commit gates and final assessment, the loop imports published requests
+and seals their transaction boundary. Later commit-window requests wait for the
+next phase; they never retroactively change that transaction, including recovery.
+Sealed completion rejects new requests. Pending ordinary recipients without a
+further matching call are rejected at completion. Do not forward stale messages
+to another run automatically or edit checkpoints/mailboxes to repair a request.
+
+See the bundled `skills/review-loop/SKILL.md` for operator examples and selection.
+
 ## Outcomes
 
 | Status | Exit code | Meaning |

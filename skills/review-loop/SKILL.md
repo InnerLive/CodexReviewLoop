@@ -52,3 +52,49 @@ configured gates and current completion evidence remain required.
 
 Consult the tool's `docs/how-it-works.md` for workflow,
 `docs/configuration.md` for settings, and `docs/operations.md` for recovery.
+
+## Operator messages
+
+While supervising an existing run, use its reported `RunRoot` (the directory
+containing `run-v1.json`). Publish short new evidence through the tool; never edit
+checkpoints or mailbox files:
+
+```powershell
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -To Architect -Message 'Check the new counter-evidence.'
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -To Reviewer,Fixer -Message 'Recheck cancellation recovery.' -RequireDelivery
+```
+
+Explicitly select one or more recipients: Reviewer for native review evidence,
+Architect for advice or assessment, Fixer for implementation evidence. The
+supervising Operator chooses recipients from the normal flow; no routing model
+or acknowledgment evaluation runs. Messages do not replace the assignment or
+grant acceptance. Use `TaskContext` on resume for an authorized assignment change.
+
+The command returns a message ID, meaning published, not delivered. Keep that ID;
+retry an uncertain publication with the identical recipients, text and switch
+plus `-Id $messageId`. A changed request needs a new ID. The loop reports only
+the ID and a short delivery or rejection reason. Infer substantive handling from
+normal role results; do not request a separate summary or read receipt.
+
+Ordinary messages reach each selected role's next regular call, including resume.
+Already-running calls are not interrupted. Messages are delivered once per
+recipient and are not repeatedly appended to later calls. A new addressed message
+prevents reuse of an older decision at that role's next call.
+
+Use `-RequireDelivery` sparingly and deliberately: it can **force additional
+Reviewer, Architect or Fixer work** before the next unsealed commit or completion.
+It can restart native review of a preserved candidate or repeat fixing and
+assessment. Existing budgets, tests, gates and acceptance responsibilities still
+apply. Exhausted budgets leave the delivery pending for resume.
+
+The loop seals a durable request boundary before commit gates and final
+assessment. Messages published after a commit boundary apply to the next phase,
+even with `-RequireDelivery`; they cannot alter the sealed transaction on resume.
+After completion is sealed, new messages are rejected. Ordinary messages with no
+remaining matching call are rejected at completion. Mailboxes live outside the
+reviewed worktree under `%LOCALAPPDATA%\CodexReviewLoop\operator`.
+
+For a stale/wrong run or rejected request, inspect the short reason and the normal
+run output. Correct the cause and publish a new message only if still relevant.
+Never silently carry old requests into another run, change an existing message,
+or edit the checkpoint to mark it delivered. `-Help` shows the command interface.

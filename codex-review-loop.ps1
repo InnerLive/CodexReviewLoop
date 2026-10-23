@@ -140,6 +140,7 @@ Shows the full command help.
 .NOTES
 The ledger, checkpoints, and role logs are stored under the profile's LogRoot.
 AutoCommit and HostGates are controlled by the profile as well.
+Use operator-message.ps1 with the observed RunRoot to send one-time role evidence.
 
 .PARAMETER RequalifyExternalRefChange
 Path to an operator-approved exact external-ref-change evidence package.

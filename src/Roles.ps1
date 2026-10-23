@@ -123,6 +123,8 @@ function ConvertFrom-ReviewLoopRoleCallRecord {
     return [pscustomobject]@{
         Success = [bool]$Record.Success
         CallId = [string]$Record.CallId
+        OperatorRevision = [int](Get-ReviewLoopObjectProperty $Record -Name OperatorRevision -Default 0)
+        OperatorMessageIds = @((Get-ReviewLoopObjectProperty $Record -Name OperatorMessageIds -Default @()))
         Role = [string]$Record.Role
         Model = [string]$Record.Model
         Thinking = [string]$Record.Thinking
@@ -285,6 +287,13 @@ function Invoke-ConfiguredCodexRole {
         [int]$State.ArchitectWork.Revision
     } else { -1 }
     $activeCallProperty = if ($Role -eq "Critic") { "ActiveCriticCall" } else { "ActiveRoleCall" }
+    $operatorRevision = 0
+    $operatorMessages = @()
+    if ($null -ne $State -and $Role -in @('Reviewer','Architect','Fixer')) {
+        Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
+        $operatorRevision = [int]$State.Operator.Revisions.$Role
+        $operatorMessages = @(Get-ReviewLoopPendingOperatorMessages $State -Role $Role)
+    }
     $validateStructuredResult = $null
     if ($null -ne $State -and $SchemaName -in @(
         "architecture-orientation-v1.schema.json", "architecture-advice-v3.schema.json",
@@ -322,6 +331,7 @@ function Invoke-ConfiguredCodexRole {
             [string](Get-ReviewLoopObjectProperty `
                 -Object $_ -Name "ExecutionFingerprint" -Default "") -eq $executionFingerprint -and
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CriticId" -Default "") -eq $criticId -and
+            [int](Get-ReviewLoopObjectProperty -Object $_ -Name 'OperatorRevision' -Default 0) -eq $operatorRevision -and
             [int](Get-ReviewLoopObjectProperty -Object $_ -Name "WorkRevision" -Default -1) -eq $workRevision
         } | Select-Object -Last 1)
         if ($completed.Count -gt 0) {
@@ -562,6 +572,17 @@ function Invoke-ConfiguredCodexRole {
         Set-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath -StatePath $StatePath
     }
 
+    if ($null -ne $State -and $Role -in @('Reviewer','Architect','Fixer')) {
+        $State.$activeCallProperty | Add-Member -Force -NotePropertyName OperatorRevision -NotePropertyValue $operatorRevision
+        $State.$activeCallProperty | Add-Member -Force -NotePropertyName OperatorMessageIds -NotePropertyValue @($operatorMessages | ForEach-Object Id)
+        foreach ($message in $operatorMessages) {
+            foreach ($delivery in @($message.Deliveries | Where-Object { $_.Role -eq $Role -and $_.Status -eq 'pending' })) {
+                $delivery.CallId = $CallId
+            }
+        }
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    }
+
     $arguments = @{
         Role = $Role
         RepoPath = $RepoPath
@@ -601,6 +622,12 @@ function Invoke-ConfiguredCodexRole {
         }
         $developerInstructions = (@($developerInstructions, $feedback) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n"
+    }
+    if ($operatorMessages.Count -gt 0) {
+        $operatorText = Get-ReviewLoopPrompt -Name 'operator-message.md' -Values @{
+            MESSAGES = (@($operatorMessages | ForEach-Object { "$($_.Id): $($_.Message)" }) -join "`n")
+        }
+        $developerInstructions = "$developerInstructions`n`n$operatorText"
     }
     if ($Mode -eq 'Review') {
         $arguments.DeveloperInstructions = $developerInstructions
@@ -683,6 +710,8 @@ function Invoke-ConfiguredCodexRole {
             -NotePropertyValue $executionFingerprint
         $call | Add-Member -Force -NotePropertyName CriticId -NotePropertyValue $criticId
         $call | Add-Member -Force -NotePropertyName WorkRevision -NotePropertyValue $workRevision
+        $call | Add-Member -Force -NotePropertyName OperatorRevision -NotePropertyValue $operatorRevision
+        $call | Add-Member -Force -NotePropertyName OperatorMessageIds -NotePropertyValue @($operatorMessages | ForEach-Object Id)
         $call | Add-Member -Force -NotePropertyName CoveredReviewCount -NotePropertyValue (
             [int](Get-ReviewLoopObjectProperty -Object $State.$activeCallProperty -Name "CoveredReviewCount" -Default 0))
         $call | Add-Member -Force -NotePropertyName RepositoryHead `
@@ -690,6 +719,14 @@ function Invoke-ConfiguredCodexRole {
         $call | Add-Member -Force -NotePropertyName WorktreeFingerprint `
             -NotePropertyValue ([string]$roleEndSnapshot.Fingerprint)
         if ([bool]$call.Success) {
+            if ($Role -eq 'Architect' -and $SchemaName -eq 'architecture-assessment-v2.schema.json') {
+                $call.StructuredResult | Add-Member -Force -NotePropertyName OperatorRevision -NotePropertyValue $operatorRevision
+            }
+            foreach ($message in $operatorMessages) {
+                foreach ($delivery in @($message.Deliveries | Where-Object { $_.Role -eq $Role -and $_.Status -eq 'pending' })) {
+                    $delivery.Status = 'delivered'
+                }
+            }
             Set-ReviewLoopRoleSessionThreadId `
                 -State $State -Role $Role -ThreadId ([string]$call.ThreadId)
         }
@@ -698,6 +735,11 @@ function Invoke-ConfiguredCodexRole {
             $State.$activeCallProperty = $null
         }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        if ([bool]$call.Success) {
+            foreach ($message in $operatorMessages) {
+                Write-ReviewLoopStatus -Message "$($message.Id) delivered to $Role" -Kind Info
+            }
+        }
         if ($Role -eq "Reviewer" -or ($Role -eq "Critic" -and [bool]$call.Success)) {
             Clear-ReviewLoopReviewerRecoveryLocator -RepoPath $RepoPath
         }
@@ -1019,8 +1061,15 @@ function Invoke-ReviewLoopGoalAssessment {
         [hashtable]$Config, [object]$State, [string]$StatePath,
         [string]$RepoPath, [string]$Speed, [string]$RunRoot, [string]$CodexPath = ""
     )
-    if (Test-ReviewLoopGoalAccepted -State $State) { return $true }
+    Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
     if (@(Get-ReviewLoopOpenWork -State $State).Count -gt 0) { return $false }
+    $pendingRoles = @(Close-ReviewLoopOperatorBoundary -State $State -StatePath $StatePath -Kind completion -AllowRoles Architect)
+    if ($pendingRoles.Count -gt 0) {
+        $State.CompletionRequalificationRequired = $true
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        return $false
+    }
+    if (Test-ReviewLoopGoalAccepted -State $State) { return $true }
     Invoke-ReviewLoopOrientation @PSBoundParameters
     $snapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
     $prompt = Get-ReviewLoopPrompt -Name "architect-completion.md" -Values @{
@@ -1039,6 +1088,8 @@ function Invoke-ReviewLoopGoalAssessment {
     Register-ReviewLoopWorkAssessment -State $State -Result $call.StructuredResult -RequireGoalDecision
     Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     if (-not $call.StructuredResult.accept -or -not $call.StructuredResult.goalComplete) {
+        Open-ReviewLoopOperatorBoundary $State
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         Write-ReviewLoopStatus -Message "Architect: $($call.StructuredResult.summary)" -Kind Architecture
         return $false
     }
@@ -1175,7 +1226,11 @@ function Invoke-ReviewLoopArchitectAssessment {
         $fixerCallId = "a$Attempt-c$([int](Get-ReviewLoopObjectProperty `
             -Object $State.LastFixerResult -Name "Correction" -Default 0))"
     }
-    $verificationKey = (Get-ReviewLoopSha256 $fixerCallId).Substring(0, 12)
+    $fixerOperatorRevision = [int](Get-ReviewLoopObjectProperty $FixerCall -Name OperatorRevision -Default 0)
+    $verificationIdentity = if ($fixerOperatorRevision -gt 0) {
+        ConvertTo-ReviewLoopJsonCompact ([ordered]@{ CallId = $fixerCallId; OperatorRevision = $fixerOperatorRevision })
+    } else { $fixerCallId }
+    $verificationKey = (Get-ReviewLoopSha256 $verificationIdentity).Substring(0, 12)
     $call = Invoke-ReviewLoopRoleCall `
         -Config $Config -Role "Architect" -RepoPath $RepoPath -Speed $Speed `
         -Prompt $prompt -LogRoot $RunRoot -SchemaName "architecture-assessment-v2.schema.json" `

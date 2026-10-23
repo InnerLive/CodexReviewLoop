@@ -5,6 +5,7 @@ $sourceFiles = @(
     "src\Console.ps1",
     "src\Cli.ps1",
     "src\State.ps1",
+    "src\Operator.ps1",
     "src\Roles.ps1",
     "src\Loop.ps1"
 )
@@ -15,6 +16,7 @@ foreach ($sourceFile in $sourceFiles) {
 
 Export-ModuleMember -Function @(
     "Invoke-CodexReviewLoop",
+    "Send-ReviewLoopOperatorMessage",
     "Invoke-CodexCliRole",
     "New-ReviewLoopLedger",
     "Read-ReviewLoopLedger",

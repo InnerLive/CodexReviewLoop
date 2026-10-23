@@ -9,6 +9,7 @@
     PowerShellVersion = "7.0"
     FunctionsToExport = @(
         "Invoke-CodexReviewLoop",
+        "Send-ReviewLoopOperatorMessage",
         "Invoke-CodexCliRole",
         "New-ReviewLoopLedger",
         "Read-ReviewLoopLedger",

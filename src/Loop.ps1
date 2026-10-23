@@ -2462,6 +2462,7 @@ function Clear-ReviewLoopActiveCluster {
         [Parameter(Mandatory = $true)][string]$Stage
     )
 
+    Open-ReviewLoopOperatorBoundary $State
     $State.CleanPasses = 0
     $State.CleanHead = ""
     $State.ActiveClusterId = ""
@@ -2885,10 +2886,15 @@ function Complete-ReviewLoopPendingCommit {
     if ($null -eq $pending) {
         return $false
     }
+    $operatorBoundaryId = [string](Get-ReviewLoopObjectProperty $pending -Name OperatorBoundaryId -Default '')
+    if ($operatorBoundaryId -and ($null -eq $State.Operator.Boundary -or
+        $State.Operator.Boundary.Kind -ne 'commit' -or $State.Operator.Boundary.Id -cne $operatorBoundaryId)) {
+        throw 'Pending commit does not match its sealed operator boundary.'
+    }
     $ids = @($State.ActiveFindingIds | ForEach-Object { [string]$_ })
     $findings = @($Ledger.Findings | Where-Object { [string]$_.Id -in $ids })
     if ($findings.Count -ne $ids.Count -or ($findings.Count -eq 0 -and @($State.ActiveWorkIds).Count -eq 0 -and
-        $null -eq $State.RetainedCandidate)) {
+        $null -eq $State.RetainedCandidate -and $State.ActiveFindingSource -ne 'operator')) {
         throw "Pending commit cannot be completed because active findings are missing."
     }
 
@@ -3006,6 +3012,11 @@ function Complete-ReviewLoopFix {
         [Parameter(Mandatory = $true)][object]$ExpectedSnapshot
     )
 
+    $required = @(Close-ReviewLoopOperatorBoundary -State $State -StatePath $StatePath -Kind commit)
+    if ($required.Count -gt 0) {
+        $role = @('Reviewer','Fixer','Architect' | Where-Object { $_ -in $required })[0]
+        return [pscustomobject]@{ Success = $false; Retryable = $true; Feedback = 'Pending operator evidence.'; OperatorRole = $role }
+    }
     Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
     $gates = Invoke-ReviewLoopHostGates `
@@ -3019,6 +3030,8 @@ function Complete-ReviewLoopFix {
     Assert-ReviewLoopRepositoryUnchanged `
         -RepoPath $RepoPath -Snapshot $ExpectedSnapshot -Operation "A host gate"
     if (-not $gates.Success) {
+        Open-ReviewLoopOperatorBoundary $State
+        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         $excerpt = @(Get-ReviewLoopTextExcerpt -Text $gates.Failure.Output -MaxLines 6) -join " "
         return [pscustomobject]@{
             Success = $false
@@ -3053,6 +3066,7 @@ function Complete-ReviewLoopFix {
         Message = $message
         NeedsCurrentGates = $false
         Verification = $Verification.Result
+        OperatorBoundaryId = [string]$State.Operator.Boundary.Id
     })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_preparing"
     Write-ReviewLoopStatus -Message "Preparing the verified commit." -Kind Progress
@@ -3120,58 +3134,72 @@ function Invoke-ReviewLoopAttemptAssessment {
     }
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "tested"
 
-    $verification = Invoke-ReviewLoopArchitectAssessment `
-        -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
-        -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
-        -Attempt $Attempt -CodexPath $CodexPath
-    $targetedTest = $FixerCall.StructuredResult.targetedTest
-    $targetedCommand = "$($targetedTest.executable) $(@($targetedTest.arguments) -join ' ')".Trim()
-    $targetedAvailable = if ($targetedTest.PSObject.Properties.Name -contains "available") {
-        [bool]$targetedTest.available
-    }
-    else {
-        -not [string]::IsNullOrWhiteSpace([string]$targetedTest.executable)
-    }
-    $targetedState = if (-not $targetedAvailable) {
-        "not available"
-    }
-    elseif ([bool]$FixerCall.StructuredResult.testExecution.Passed) {
-        "passed"
-    }
-    else {
-        "failed"
-    }
-    Write-ReviewLoopStatus `
-        -Message "Architect assessment: $(if ($verification.Accepted) { 'accepted' } else { 'changes requested' }) · $($verification.Result.summary) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
-        -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
-    Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
-    Assert-ReviewLoopRepositoryUnchanged `
-        -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "Read-only verification"
-
-    if ($verification.Accepted) {
-        $completion = Complete-ReviewLoopFix `
-            -Config $Config -State $State -StatePath $StatePath `
-            -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
-            -Verification $verification -FixerResult $FixerCall.StructuredResult `
-            -RepoPath $RepoPath -RunRoot $RunRoot `
-            -ExpectedSnapshot $worktreeSnapshot
-        if ($completion.Success) {
-            return [pscustomobject]@{ Completed = $true; Feedback = "" }
+    :operatorAssessment while ($true) {
+        $verification = Invoke-ReviewLoopArchitectAssessment `
+            -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
+            -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
+            -Attempt $Attempt -CodexPath $CodexPath
+        $targetedTest = $FixerCall.StructuredResult.targetedTest
+        $targetedCommand = "$($targetedTest.executable) $(@($targetedTest.arguments) -join ' ')".Trim()
+        $targetedAvailable = if ($targetedTest.PSObject.Properties.Name -contains "available") {
+            [bool]$targetedTest.available
         }
-        if (-not $completion.Retryable) {
-            throw $completion.Feedback
+        else {
+            -not [string]::IsNullOrWhiteSpace([string]$targetedTest.executable)
         }
-        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "gate_failed"
-        return [pscustomobject]@{ Completed = $false; Feedback = $completion.Feedback; RetrySameAttempt = $false }
-    }
+        $targetedState = if (-not $targetedAvailable) {
+            "not available"
+        }
+        elseif ([bool]$FixerCall.StructuredResult.testExecution.Passed) {
+            "passed"
+        }
+        else {
+            "failed"
+        }
+        Write-ReviewLoopStatus `
+            -Message "Architect assessment: $(if ($verification.Accepted) { 'accepted' } else { 'changes requested' }) · $($verification.Result.summary) · Test $targetedState$(if (-not [string]::IsNullOrWhiteSpace($targetedCommand)) { ': ' + $targetedCommand } else { '' })" `
+            -Kind $(if ($verification.Accepted) { "Success" } else { "Warning" })
+        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
+        Assert-ReviewLoopRepositoryUnchanged `
+            -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "Read-only verification"
 
-    return [pscustomobject]@{
-        Completed = $false
-        RetrySameAttempt = $false
-        Feedback = @(
-            [string]$verification.Result.summary
-            @($verification.Result.feedback | ForEach-Object { [string]$_ })
-        ) -join [Environment]::NewLine
+        if ($verification.Accepted) {
+            $completion = Complete-ReviewLoopFix `
+                -Config $Config -State $State -StatePath $StatePath `
+                -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
+                -Verification $verification -FixerResult $FixerCall.StructuredResult `
+                -RepoPath $RepoPath -RunRoot $RunRoot `
+                -ExpectedSnapshot $worktreeSnapshot
+            if ($completion.Success) {
+                return [pscustomobject]@{ Completed = $true; Feedback = "" }
+            }
+            $operatorRole = [string](Get-ReviewLoopObjectProperty $completion -Name OperatorRole -Default '')
+            if ($operatorRole -eq 'Architect') { continue operatorAssessment }
+            if ($operatorRole -eq 'Reviewer') {
+                Restart-ReviewLoopReviewRound -State $State -StatePath $StatePath -Ledger $Ledger `
+                    -LedgerPath $LedgerPath -Findings $Findings -RepoPath $RepoPath -RunRoot $RunRoot `
+                    -Attempt $Attempt -Reason 'Pending operator evidence requires native review.' | Out-Null
+                return [pscustomobject]@{ Completed = $true; Feedback = '' }
+            }
+            if (-not $completion.Retryable) {
+                throw $completion.Feedback
+            }
+            Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "gate_failed"
+            return [pscustomobject]@{ Completed = $false; Feedback = $completion.Feedback; RetrySameAttempt = $false }
+        }
+
+        if ($null -ne $State.Operator.Boundary -and $State.Operator.Boundary.Kind -eq 'commit') {
+            Open-ReviewLoopOperatorBoundary $State
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        }
+        return [pscustomobject]@{
+            Completed = $false
+            RetrySameAttempt = $false
+            Feedback = @(
+                [string]$verification.Result.summary
+                @($verification.Result.feedback | ForEach-Object { [string]$_ })
+            ) -join [Environment]::NewLine
+        }
     }
 }
 
@@ -3369,7 +3397,13 @@ function Invoke-ReviewLoopFixWorkflow {
         -Object $State.LastFixerResult -Name "WorktreeFingerprint" -Default "")
     $storedHead = [string](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "WorktreeHead" -Default ([string]$State.CurrentHead))
+    Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
+    if ($Recover -and $storedSuccess -and $null -eq $State.ActiveRoleCall -and
+        @(Get-ReviewLoopPendingOperatorMessages $State -Role Fixer).Count -gt 0) {
+        $retryCurrentAttempt = $false
+    }
     if ($Recover -and $storedSuccess -and $storedAttempt -eq $attempt -and
+        @(Get-ReviewLoopPendingOperatorMessages $State -Role Fixer).Count -eq 0 -and
         $null -ne $State.LastFixerResult -and $null -ne $State.LastFixerResult.StructuredResult) {
         $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
         if ((-not [string]::IsNullOrWhiteSpace($storedFingerprint) -and
@@ -3392,6 +3426,7 @@ function Invoke-ReviewLoopFixWorkflow {
                 CallId = [string](Get-ReviewLoopObjectProperty -Object $State.LastFixerResult -Name "CallId" -Default "")
                 Success = $true
                 StructuredResult = $State.LastFixerResult.StructuredResult
+                OperatorRevision = [int](Get-ReviewLoopObjectProperty $State.LastFixerResult -Name OperatorRevision -Default 0)
                 ThreadId = $threadId
             }
             $assessment = Invoke-ReviewLoopAttemptAssessment `
@@ -3466,6 +3501,7 @@ function Invoke-ReviewLoopFixWorkflow {
         $State.RetainedCandidate = $null
         $State.LastFixerResult = [pscustomobject]@{
             CallId = [string]$fixer.CallId
+            OperatorRevision = [int](Get-ReviewLoopObjectProperty $fixer -Name OperatorRevision -Default 0)
             Success = [bool]$fixer.Success
             FailureKind = [string]$fixer.FailureKind
             StructuredResult = $fixer.StructuredResult
@@ -3582,6 +3618,23 @@ function Invoke-ReviewLoopRetainedAssessment {
     }
     Assert-ReviewLoopRetainedCandidate -State $State
     Assert-ReviewLoopRepositoryUnchanged -RepoPath $RepoPath -Snapshot $State.LastReview.Snapshot -Operation "The candidate review evidence"
+    Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
+    if (@(Get-ReviewLoopPendingOperatorMessages $State -Role Fixer).Count -gt 0) {
+        $State.ActiveClusterId = [string]$candidate.ClusterId
+        $State.ActiveWorkIds = @($candidate.WorkIds | Where-Object {
+            $_ -cin @(Get-ReviewLoopOpenWork -State $State | ForEach-Object id)
+        })
+        $State.ActiveFindingIds = @()
+        $State.ActiveFindingSource = 'operator'
+        $State.ActiveStrategy = $candidate.Strategy
+        $State.ActiveFixAttempt = 0
+        $State.LastFixerResult = $null
+        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage strategy_ready
+        Invoke-ReviewLoopFixWorkflow -Config $Config -State $State -StatePath $StatePath `
+            -Ledger $Ledger -LedgerPath $LedgerPath -Findings @() -RepoPath $RepoPath `
+            -Speed $Speed -RunRoot $RunRoot -CodexPath $CodexPath | Out-Null
+        return $true
+    }
     if ($candidate.FixerResult.Success -and $null -ne $candidate.FixerResult.StructuredResult) {
         $State.ActiveClusterId = [string]$candidate.ClusterId
         $State.ActiveWorkIds = @($candidate.WorkIds | Where-Object {
@@ -3596,6 +3649,7 @@ function Invoke-ReviewLoopRetainedAssessment {
             Success = $true
             CallId = [string](Get-ReviewLoopObjectProperty -Object $candidate.FixerResult -Name CallId -Default "")
             StructuredResult = $candidate.FixerResult.StructuredResult
+            OperatorRevision = [int](Get-ReviewLoopObjectProperty $candidate.FixerResult -Name OperatorRevision -Default 0)
         }
         $assessment = Invoke-ReviewLoopAttemptAssessment -Config $Config -State $State -StatePath $StatePath `
             -Ledger $Ledger -LedgerPath $LedgerPath -Findings @() -FixerCall $fixer `
@@ -3650,7 +3704,8 @@ function Resume-ReviewLoopInterruptedFix {
         "cluster_selected", "strategy_ready", "fixing", "fix_attempted",
         "fixer_partial_captured", "testing", "tested", "test_failed", "verified", "gate_failed"
     ) -or
-        (@($State.ActiveFindingIds).Count -eq 0 -and @($State.ActiveWorkIds).Count -eq 0)) {
+        (@($State.ActiveFindingIds).Count -eq 0 -and @($State.ActiveWorkIds).Count -eq 0 -and
+            $State.ActiveFindingSource -ne 'operator')) {
         return $false
     }
 
@@ -4326,6 +4381,17 @@ function Complete-ReviewLoopRun {
     if (-not (Test-ReviewLoopGoalAccepted -State $State) -or
         @(Get-ReviewLoopOpenFindings -Ledger (Read-ReviewLoopLedger -Path $LedgerPath -RepoPath $State.RepoPath)).Count -gt 0) {
         throw "Overall completion requires current Architect acceptance and no open native findings or architecture work."
+    }
+    Initialize-ReviewLoopOperator $State
+    if ($null -eq $State.Operator.Boundary -or $State.Operator.Boundary.Kind -ne 'completion' -or
+        @(Get-ReviewLoopPendingOperatorMessages $State -Required).Count -gt 0) {
+        throw 'Completion requires a sealed operator boundary with no pending required delivery.'
+    }
+    foreach ($message in @(Get-ReviewLoopPendingOperatorMessages $State)) {
+        foreach ($delivery in @($message.Deliveries | Where-Object Status -EQ pending)) {
+            $delivery.Status = 'rejected'
+            Write-ReviewLoopStatus -Message "$($message.Id) rejected for $($delivery.Role): no further matching role call" -Kind Warning
+        }
     }
     $State.Status = "completed"
     $State.ExitCode = 0
@@ -5040,6 +5106,29 @@ function Invoke-ReviewLoopCore {
         }
         while ($true) {
             Assert-ReviewLoopExecutionUnchanged -Config $config
+            Sync-ReviewLoopOperatorMessages -State $state -StatePath $statePath
+            if ($null -eq $state.Operator.Boundary) {
+                if (@(Get-ReviewLoopPendingOperatorMessages $state -Role Reviewer -Required).Count -gt 0) {
+                    $state.CompletionRequalificationRequired = $true
+                    $state.CleanPasses = 0
+                    $state.CleanHead = ''
+                }
+                elseif (@(Get-ReviewLoopPendingOperatorMessages $state -Role Fixer -Required).Count -gt 0 -and
+                    $state.Stage -ne 'review_round_requested' -and
+                    [int]$state.ReviewCyclesThisInvocation -lt [int]$config.MaxReviewCycles -and
+                    @(Get-ReviewLoopOpenFindings -Ledger $ledger).Count -eq 0 -and
+                    @(Get-ReviewLoopOpenWork -State $state).Count -eq 0 -and $null -eq $state.RetainedCandidate) {
+                    $state.ActiveClusterId = 'operator-' + [string]$state.Operator.Revisions.Fixer
+                    $state.ActiveFindingSource = 'operator'
+                    $state.ActiveFixAttempt = 0
+                    $state.ActiveStrategy = $null
+                    Set-ReviewLoopCheckpoint -State $state -StatePath $statePath -Stage strategy_ready
+                    Invoke-ReviewLoopFixWorkflow -Config $config -State $state -StatePath $statePath `
+                        -Ledger $ledger -LedgerPath $paths.LedgerPath -Findings @() -RepoPath $repo `
+                        -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath | Out-Null
+                    continue
+                }
+            }
             $finalLessonsCompletion = Get-ReviewLoopLessonsLearnedFinalCompletion -State $state
             $cleanGateReady = [int]$state.CleanPasses -ge [int]$config.CleanPassesRequired -and
                 [string]$state.CleanHead -eq [string]$state.CurrentHead
