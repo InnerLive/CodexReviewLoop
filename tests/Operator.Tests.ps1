@@ -72,6 +72,16 @@ function Get-OperatorAcceptResult {
     '{"schemaVersion":"2.0","accept":true,"summary":"Accepted.","feedback":[],"commitMessage":{"subject":"Handle operator evidence","rationale":"The evidence is addressed.","changes":["Update the owned candidate."]},"newOrders":[],"workOutcomes":[],"goalComplete":true}'
 }
 
+function Invoke-OperatorLoop {
+    param($Case)
+    Invoke-CodexReviewLoop -RepoPath $Case.Repo -ConfigPath $Case.Profile -CodexPath $fakeCodex -HeartbeatSeconds 0 -Json
+}
+
+function New-OperatorPausePlan {
+    param($Case, [string]$At)
+    @{ runRoot = $Case.Paths.RunRoot; pauseAt = $At; message = 'Investigate the evidence.' }
+}
+
 function Clear-OperatorCase {
         & (Get-Module CodexReviewLoop) { Initialize-ReviewLoopConsole -TranscriptPath '' -HostOutputEnabled $false }
         if ($null -ne $script:operatorCase) {
@@ -92,8 +102,9 @@ Describe 'Durable operator messages' {
     It 'publishes immutable messages outside the worktree and retries identical IDs' {
         $c=New-OperatorCase
         $id=[guid]::NewGuid().ToString('D')
-        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer,Architect -Message 'evidence' -Id $id | Should Be $id
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot @('Fixer','Architect') 'evidence' $id | Should Be $id
         Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Architect,Fixer -Message 'evidence' -Id $id | Should Be $id
+        & (Join-Path $root 'operator-message.ps1') $c.Paths.RunRoot @('Architect','Fixer') 'evidence' $id | Should Be $id
         { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'different' -Id $id } | Should Throw 'different content'
         $s=Read-ReviewLoopState $c.Paths.StatePath
         @($s.Operator.Requests).Count | Should Be 0
@@ -294,16 +305,19 @@ Describe 'Durable operator messages' {
         $mailbox=& (Get-Module CodexReviewLoop) {param($s) Get-ReviewLoopOperatorMailbox $s} $s
         $path=Join-Path $mailbox "$id.json"
         $request=Get-Content $path -Raw | ConvertFrom-Json
-        $request.Version=2
+        $request.Version=3
         $request | ConvertTo-Json -Depth 10 | Set-Content $path
         (Invoke-OperatorRole $c).Success | Should Be $true
         $s=Read-ReviewLoopState $c.Paths.StatePath
         $s.Operator.Requests[0].Rejection | Should Be 'unknown request version'
-        $s.Operator.Version=2
+        $s.Operator.Version=3
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         {Read-ReviewLoopState $c.Paths.StatePath} | Should Throw 'Unknown operator state version'
         $s.Operator.Version=1
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
+        $upgraded=Read-ReviewLoopState $c.Paths.StatePath
+        $upgraded.Operator.Version | Should Be 2
+        $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
     }
 
     It 'reruns Architect assessment for evidence arriving during a completed assessment' {
@@ -551,5 +565,520 @@ Describe 'Operator assessment dependency binding' {
             (Invoke-ReviewLoopArchitectAssessment @arguments).Accepted | Should Be $true
         } $c $fakeCodex
         @(Get-OperatorCalls).Count | Should Be 2
+    }
+}
+
+Describe 'Controlled operator pauses' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'publishes an immutable pause, coalesces due requests, and consumes them across resume' {
+        $c = New-OperatorCase
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt afterrole -Message 'inspect'
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'inspect' -Id $id | Should Be $id
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt BeforeCommit -Message 'inspect' -Id $id } | Should Throw 'different content'
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRound -Message 'also inspect' | Out-Null
+        $r = Invoke-OperatorLoop $c
+        $r.Status | Should Be paused
+        $r.ExitCode | Should Be 5
+        $r.Requests.Count | Should Be 2
+        @((Read-ReviewLoopState $c.Paths.StatePath).RoleCalls).Count | Should Be 0
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'inspect' -Id $id | Should Be $id
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[0].Status | Should Be reached
+    }
+
+    It 'stops after native Reviewer before classifier and reuses the completed native result' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{ result = 'The result requires interpretation.'; operatorMessages = @((New-OperatorPausePlan $c AfterRole)) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw "Expected pause, got $($r.Status): $($r.Reason)" }
+        @((Get-OperatorCalls) | Where-Object callKind -eq review).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'classification').Count | Should Be 0
+        Set-OperatorPlans $c @(@{}, @{ result = (Get-OperatorAcceptResult) })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object callKind -eq review).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'classification').Count | Should Be 1
+    }
+
+    It 'stops after classifier before another role and does not repeat either completed review call' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{ result = 'The result requires interpretation.' },
+            @{ result = '{"schemaVersion":"1.0","hasFindings":false}'; operatorMessages = @((New-OperatorPausePlan $c AfterRole)) })
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        Set-OperatorPlans $c @(@{ result = (Get-OperatorAcceptResult) })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object callKind -eq review).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'classification').Count | Should Be 1
+    }
+
+    It 'preserves all dirty Fixer files and resumes at the targeted test without another Fixer call' {
+        $c = New-OperatorCase
+        # Commit only fixture baseline files, never the tool checkout.
+        Set-Content (Join-Path $c.Repo 'delete.txt') 'delete me'
+        [IO.File]::WriteAllBytes((Join-Path $c.Repo 'binary.dat'), [byte[]]@(0,1,2,255))
+        & git -C $c.Repo add .
+        & git -C $c.Repo commit -q -m 'fixture files'
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.StartHead = $s.CurrentHead = Get-ReviewLoopGitValue $c.Repo @('rev-parse','HEAD')
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ mutations = @(
+            @{ path = 'README.txt'; content = 'fixed' }, @{ path = 'delete.txt'; delete = $true },
+            @{ path = 'binary.dat'; content = "`0new`0" }, @{ path = 'new.txt'; content = 'untracked' }
+        ); operatorMessages = @((New-OperatorPausePlan $c AfterRole)) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Stage | Should Be fix_attempted
+        $s.Operator.Pause.Backup.Entries.Count | Should Be 4
+        Test-Path $s.Operator.Pause.Backup.ManifestPath | Should Be $true
+        $s.RetainedCandidate | Should BeNullOrEmpty
+        Set-OperatorPlans $c @(@{ result = (Get-OperatorAcceptResult) }, @{ result = 'No findings.' })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+        Test-Path (Join-Path $c.Repo 'delete.txt') | Should Be $false
+        Get-Content (Join-Path $c.Repo 'new.txt') | Should Be untracked
+    }
+
+    It 'stops before commit gates and does not repeat a completed test or Architect assessment' {
+        $c = New-OperatorCase
+        $counter = Join-Path $c.Root 'test-count.txt'
+        $test = Join-Path $c.Root 'targeted.ps1'
+        "Add-Content -LiteralPath '$($counter.Replace("'","''"))' -Value executed" | Set-Content $test
+        $fixer = @{ schemaVersion = '3.0'; summary = 'Fix'; targetedTest = @{ available = $true; executable = 'pwsh'; arguments = @('-NoProfile','-File',$test) } } | ConvertTo-Json -Depth 5 -Compress
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ result = $fixer; mutations = @(@{ path = 'README.txt'; content = 'fixed' }); operatorMessages = @((New-OperatorPausePlan $c BeforeCommit)) },
+            @{ result = (Get-OperatorAcceptResult) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Stage | Should Be verified
+        $s.PendingCommit | Should BeNullOrEmpty
+        $s.Operator.Boundary | Should BeNullOrEmpty
+        Set-OperatorPlans $c @(@{ result = 'No findings.' })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @(Get-Content $counter).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'assessment').Count | Should Be 1
+    }
+
+    It 'stops after a targeted test and preserves its outcome for resume' {
+        $c = New-OperatorCase
+        (Get-Content -Raw $c.Profile).Replace('AutoCommit=', "TargetedTestRepositoryChanges=@{Mode='RestoreAll'}; AutoCommit=") | Set-Content $c.Profile
+        $test = Join-Path $c.Root 'targeted.ps1'
+        $counter = Join-Path $c.Root 'count.txt'
+        @"
+& '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -PauseAt AfterRole -Message 'test complete' | Out-Null
+Set-Content '$($c.Repo)\README.txt' 'temporary test side effect'
+Add-Content '$counter' executed
+"@ | Set-Content $test
+        $fixer = @{ schemaVersion = '3.0'; summary = 'Fix'; targetedTest = @{ available = $true; executable = 'pwsh'; arguments = @('-NoProfile','-File',$test) } } | ConvertTo-Json -Depth 5 -Compress
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ result = $fixer })
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        (Read-ReviewLoopState $c.Paths.StatePath).Stage | Should Be tested
+        @(& git -C $c.Repo status --porcelain).Count | Should Be 0
+        Set-OperatorPlans $c @(@{ result = (Get-OperatorAcceptResult) }, @{ result = 'No findings.' })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @(Get-Content $counter).Count | Should Be 1
+    }
+
+    It 'finishes an accepted dirty round before stopping and retains later halt requests' {
+        $c = New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ mutations = @(@{ path = 'README.txt'; content = 'fixed' }); operatorMessages = @(
+            (New-OperatorPausePlan $c AfterRound), (New-OperatorPausePlan $c BeforeCompletion)) }, @{ result = (Get-OperatorAcceptResult) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        (Read-ReviewLoopState $c.Paths.StatePath).Stage | Should Be fix_committed
+        $r.PendingPauseIds.Count | Should Be 1
+        @(& git -C $c.Repo status --porcelain).Count | Should Be 0
+        Set-OperatorPlans $c @(@{ result = 'No findings.' })
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+    }
+
+    It 'stops at an exhausted dirty round with intact RetainedCandidate provenance' {
+        $c = New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ mutations = @(@{ path = 'README.txt'; content = 'retained' }); operatorMessages = @((New-OperatorPausePlan $c AfterRound)) }, @{},
+            @{ mutations = @(@{path='README.txt';content='retained second attempt'}) }, @{})
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Stage | Should Be review_round_requested
+        $s.RetainedCandidate.Artifact.ManifestPath | Should Not BeNullOrEmpty
+        $s.RetainedCandidate.Attempt | Should Be 2
+        $s.RetainedCandidate.Snapshot.Fingerprint | Should Be $s.Operator.Pause.Snapshot.Fingerprint
+        Set-OperatorPlans $c @(@{ result = 'No findings.' }, @{ result = (Get-OperatorAcceptResult) }, @{ result = 'No findings.' })
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 2
+    }
+
+    It 'accepts a completion pause while messages are sealed and resumes without another goal call' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{ result = 'No findings.' }, @{ phase = 'completion'; result = (Get-OperatorAcceptResult); operatorMessages = @((New-OperatorPausePlan $c BeforeCompletion)) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        $r.Requests[0].Reached | Should Be BeforeCompletion
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Boundary.Kind | Should Be completion
+        $before = @(Get-OperatorCalls).Count
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @(Get-OperatorCalls).Count | Should Be $before
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'late' } | Should Throw 'completion is sealed'
+    }
+
+    It 'does not turn a role technical failure into a successful pause' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{ exitCode = 7; operatorMessages = @((New-OperatorPausePlan $c AfterRole)) })
+        $r = Invoke-OperatorLoop $c
+        $r.Status | Should Be failed
+        $r.ExitCode | Should Be 2
+    }
+
+    It 'preserves a published request through an import crash and marks it reached atomically' {
+        $c = New-OperatorCase
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'inspect'
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            Import-ReviewLoopOperatorMessages $s (Get-ReviewLoopOperatorMailbox $s)
+            # Simulate loss before the in-memory import was checkpointed.
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            @($s.Operator.Requests).Count | Should Be 0
+        } $c
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Status | Should Be paused
+        $s.Operator.Requests[0].Status | Should Be reached
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'inspect' -Id $id | Should Be $id
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+    }
+
+    It 'refuses changed paused candidates and damaged backups before resuming model work' {
+        $c = New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ mutations = @(@{ path = 'README.txt'; content = 'fixed' }); operatorMessages = @((New-OperatorPausePlan $c AfterRole)) })
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        $before = @(Get-OperatorCalls).Count
+        Set-Content (Join-Path $c.Repo 'README.txt') 'outside'
+        (Invoke-OperatorLoop $c).Status | Should Be failed
+        @(Get-OperatorCalls).Count | Should Be $before
+        [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'), 'fixed')
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        Set-Content (Join-Path $s.Operator.Pause.Backup.Root 'files\README.txt') 'damaged'
+        (Invoke-OperatorLoop $c).Status | Should Be failed
+        @(Get-OperatorCalls).Count | Should Be $before
+    }
+
+    It 'keeps PendingCommit resumable before staging, after staging, after commit-object creation and after HEAD advancement' {
+        foreach ($phase in @('prepared','staged','object','advanced')) {
+            $c = New-OperatorCase
+            $before = & git -C $c.Repo rev-parse HEAD
+            [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'), 'candidate')
+            & (Get-Module CodexReviewLoop) {
+                param($c,$phase)
+                $s = Read-ReviewLoopState $c.Paths.StatePath
+                $s.ActiveFindingSource = 'operator'; $s.ActiveClusterId = 'pending-pause'
+                $s.Stage = 'commit_preparing'
+                $ledger = New-ReviewLoopLedger $c.Repo
+                Write-ReviewLoopLedger $c.Paths.LedgerPath $ledger | Out-Null
+                Close-ReviewLoopOperatorBoundary $s $c.Paths.StatePath commit | Out-Null
+                $s.PendingCommit = [pscustomobject]@{
+                    PreHead = $s.CurrentHead; PatchFingerprint = Get-ReviewLoopWorktreeFingerprint $c.Repo
+                    ExpectedTree = ''; ExpectedCommit = ''; Message = 'Test: pending pause'; NeedsCurrentGates = $false
+                    OperatorBoundaryId = $s.Operator.Boundary.Id
+                    Verification = [pscustomobject]@{ WorkRevision=0; workOutcomes=@(); goalComplete=$false }
+                }
+                if ($phase -ne 'prepared') {
+                    & git -C $c.Repo add -A
+                    $s.PendingCommit.ExpectedTree = Get-ReviewLoopGitValue $c.Repo @('write-tree')
+                    $s.Stage = 'commit_pending'
+                }
+                if ($phase -in @('object','advanced')) {
+                    $s.PendingCommit.ExpectedCommit = (& git -C $c.Repo commit-tree $s.PendingCommit.ExpectedTree -p $s.CurrentHead -m $s.PendingCommit.Message).Trim()
+                }
+                if ($phase -eq 'advanced') {
+                    & git -C $c.Repo update-ref HEAD $s.PendingCommit.ExpectedCommit $s.CurrentHead
+                }
+                Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+            } $c $phase
+            Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt BeforeCommit -Message 'late commit check' | Out-Null
+            $r = Invoke-OperatorLoop $c
+            if ($r.Status -ne 'paused') { throw "$phase : $($r.Reason)" }
+            $r.Requests[0].Missed | Should Be $true
+            $r.Requests[0].Reached | Should Be CommitRecovery
+            (Read-ReviewLoopState $c.Paths.StatePath).PendingCommit | Should Not BeNullOrEmpty
+            (Invoke-OperatorLoop $c).Status | Should Be completed
+            (& git -C $c.Repo rev-list --count "$before..HEAD") | Should Be 1
+            @(& git -C $c.Repo status --porcelain).Count | Should Be 0
+            Clear-OperatorCase
+        }
+    }
+
+    It 'finishes a running host gate and pauses at a recoverable commit instead of starting another transaction' {
+        $c = New-OperatorCase
+        $gate = Join-Path $c.Root 'gate.ps1'
+        $counter = Join-Path $c.Root 'gate-count.txt'
+        @"
+& '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -PauseAt BeforeCommit -Message 'gate check' | Out-Null
+Add-Content '$counter' executed
+"@ | Set-Content $gate
+        (Get-Content -Raw $c.Profile).Replace('HostGates=@()', "HostGates=@(@{Name='pause gate';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})") | Set-Content $c.Profile
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{ mutations = @(@{path='README.txt';content='fixed'}) }, @{ result=(Get-OperatorAcceptResult) })
+        $r = Invoke-OperatorLoop $c
+        if ($r.Status -ne 'paused') { throw $r.Reason }
+        $r.Requests[0].Missed | Should Be $true
+        $r.Requests[0].Reached | Should Be CommitRecovery
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.ActiveHostGateRecovery | Should BeNullOrEmpty
+        $s.PendingCommit | Should Not BeNullOrEmpty
+        @(Get-Content $counter).Count | Should Be 1
+        # Remove only the test gate after its recorded transaction. This forces
+        # the ordinary execution requalification path on explicit resume.
+        (Get-Content -Raw $c.Profile).Replace("HostGates=@(@{Name='pause gate';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})",'HostGates=@()') | Set-Content $c.Profile
+        Set-OperatorPlans $c @(@{result=(Get-OperatorAcceptResult)}, @{result='No findings.'})
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+    }
+
+    It 'stops after a Critic and does not repeat its completed call on resume' {
+        $c = New-OperatorCase
+        (Get-Content -Raw $c.Profile).Replace('CriticStartAfterReviews=0','CriticStartAfterReviews=1').Replace('CleanPassesRequired=1','CleanPassesRequired=2') | Set-Content $c.Profile
+        $env:CODEX_REVIEW_LOOP_FAKE_PID_FILE = Join-Path $c.Root 'role.pid'
+        Set-OperatorPlans $c @(@{result='No findings.'}, @{operatorMessages=@((New-OperatorPausePlan $c AfterRole))})
+        $r = Invoke-OperatorLoop $c
+        $r.Status | Should Be paused
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1
+        $rolePid = [int](Get-Content $env:CODEX_REVIEW_LOOP_FAKE_PID_FILE)
+        Get-Process -Id $rolePid -ErrorAction SilentlyContinue | Should BeNullOrEmpty
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1
+    }
+
+    It 'publishes identical pause IDs concurrently through the public command' {
+        $c=New-OperatorCase
+        $id=[guid]::NewGuid().ToString('D')
+        $processes=@()
+        try {
+            foreach ($i in 1..2) {
+                $info=[Diagnostics.ProcessStartInfo]::new()
+                $info.FileName=(Get-Command pwsh).Source; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+                $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+                @('-NoProfile','-File',(Join-Path $root 'operator-message.ps1'),$c.Paths.RunRoot,
+                    '-PauseAt','AfterRole','-Message','parallel halt','-Id',$id) | ForEach-Object {[void]$info.ArgumentList.Add($_)}
+                $processes += [Diagnostics.Process]::Start($info)
+            }
+            foreach ($process in $processes) {
+                if (-not $process.WaitForExit(30000)) { throw 'Pause publisher did not finish.' }
+                $process.StandardOutput.ReadToEnd() | Should Match "$id requested AfterRole"
+                $process.StandardError.ReadToEnd() | Should Be ''
+                $process.ExitCode | Should Be 0
+            }
+            $r=Invoke-OperatorLoop $c
+            $r.Status | Should Be paused
+            $r.Requests.Count | Should Be 1
+        }
+        finally {
+            foreach ($process in $processes) {
+                if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+                $process.Dispose()
+            }
+        }
+    }
+
+    It 'returns public CLI exit 5 with JSON and releases the repository lease' {
+        $c=New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'CLI halt' | Out-Null
+        $info=[Diagnostics.ProcessStartInfo]::new()
+        $info.FileName=(Get-Command pwsh).Source; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+        $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+        @('-NoProfile','-File',(Join-Path $root 'codex-review-loop.ps1'),'-RepoPath',$c.Repo,
+            '-ConfigPath',$c.Profile,'-CodexPath',$fakeCodex,'-Json','-HeartbeatSeconds','0') | ForEach-Object {[void]$info.ArgumentList.Add($_)}
+        $process=[Diagnostics.Process]::Start($info)
+        try {
+            if (-not $process.WaitForExit(30000)) { throw 'Paused CLI did not exit.' }
+            $process.ExitCode | Should Be 5
+            ($process.StandardOutput.ReadToEnd() | ConvertFrom-Json).Status | Should Be paused
+            $process.StandardError.ReadToEnd() | Should Be ''
+            $lease=[IO.FileStream]::new((Join-Path $c.Repo '.git\codex-review-loop.lock'),[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            $lease.Dispose()
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+            $process.Dispose()
+        }
+    }
+
+}
+
+Describe 'Operator pause persistence boundaries' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'recovers actual process death after saving a Fixer result and after saving the reached pause' {
+        foreach ($crashAt in @('fixer-result','paused')) {
+            $c=New-OperatorCase
+            $marker=Join-Path $c.Root 'checkpoint-saved.txt'
+            $scriptPath=Join-Path $c.Root 'crash-window.ps1'
+            @'
+param($modulePath,$repo,$profilePath,$fake,$marker,$crashAt)
+Import-Module $modulePath -Force
+& (Get-Module CodexReviewLoop) {
+    param($marker,$crashAt)
+    $script:crashMarker=$marker
+    $script:crashAt=$crashAt
+    $script:crashWrite=${function:Write-ReviewLoopState}
+    function script:Write-ReviewLoopState {
+        param($Path,$State)
+        & $script:crashWrite -Path $Path -State $State
+        $last=$State.RoleCalls | Select-Object -Last 1
+        $ready=($script:crashAt -eq 'paused' -and $State.Status -eq 'paused') -or
+            ($script:crashAt -eq 'fixer-result' -and $State.Stage -eq 'fixing' -and
+             $null -eq $State.ActiveRoleCall -and $null -ne $last -and $last.Role -eq 'Fixer' -and $last.Success)
+        if ($ready) {
+            [IO.File]::WriteAllText($script:crashMarker,'saved')
+            Start-Sleep -Seconds 60
+        }
+    }
+} $marker $crashAt
+Invoke-CodexReviewLoop -RepoPath $repo -ConfigPath $profilePath -CodexPath $fake -HeartbeatSeconds 0 -Json
+'@ | Set-Content $scriptPath
+            if ($crashAt -eq 'fixer-result') {
+                Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+                Set-OperatorPlans $c @(@{mutations=@(@{path='README.txt';content='saved candidate'});operatorMessages=@((New-OperatorPausePlan $c AfterRole))})
+            }
+            else { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'crash after halt' | Out-Null }
+            $info=[Diagnostics.ProcessStartInfo]::new()
+            $info.FileName=(Get-Command pwsh).Source; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+            $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+            @('-NoProfile','-File',$scriptPath,(Join-Path $root 'CodexReviewLoop.psd1'),$c.Repo,$c.Profile,$fakeCodex,$marker,$crashAt) |
+                ForEach-Object {[void]$info.ArgumentList.Add($_)}
+            $process=[Diagnostics.Process]::Start($info)
+            try {
+                $deadline=[DateTimeOffset]::UtcNow.AddSeconds(30)
+                while (-not (Test-Path $marker) -and -not $process.HasExited -and [DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+                if (-not (Test-Path $marker)) { throw "Crash checkpoint was not reached ($crashAt)." }
+                $process.Kill($true)
+                $process.WaitForExit()
+            }
+            finally {
+                if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+                $process.Dispose()
+            }
+            if ($crashAt -eq 'fixer-result') {
+                (Invoke-OperatorLoop $c).Status | Should Be paused
+                Set-OperatorPlans $c @(@{result=(Get-OperatorAcceptResult)}, @{result='No findings.'})
+            }
+            (Invoke-OperatorLoop $c).Status | Should Be completed
+            if ($crashAt -eq 'fixer-result') {
+                @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+                Get-Content (Join-Path $c.Repo 'README.txt') | Should Be 'saved candidate'
+            }
+            Clear-OperatorCase
+        }
+    }
+
+    It 'stops after Architect assessment before gates and reuses the applied decision on resume' {
+        $c=New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{mutations=@(@{path='README.txt';content='fixed'})},
+            @{result=(Get-OperatorAcceptResult);operatorMessages=@((New-OperatorPausePlan $c AfterRole))})
+        $r=Invoke-OperatorLoop $c
+        $r.Status | Should Be paused
+        (Read-ReviewLoopState $c.Paths.StatePath).Stage | Should Be verified
+        Set-OperatorPlans $c @(@{result='No findings.'})
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'assessment').Count | Should Be 1
+    }
+
+    It 'keeps a mutating gate failure technical while its pause remains pending' {
+        $c=New-OperatorCase
+        $gate=Join-Path $c.Root 'mutating-gate.ps1'
+        @"
+& '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -PauseAt AfterRole -Message 'gate failed' | Out-Null
+Set-Content '$($c.Repo)\README.txt' 'gate side effect'
+"@ | Set-Content $gate
+        (Get-Content -Raw $c.Profile).Replace('HostGates=@()',"HostGates=@(@{Name='mutation';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})") | Set-Content $c.Profile
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{mutations=@(@{path='README.txt';content='fixed'})},@{result=(Get-OperatorAcceptResult)})
+        $r=Invoke-OperatorLoop $c
+        $r.Status | Should Be failed
+        $r.ExitCode | Should Be 2
+        (Read-ReviewLoopState $c.Paths.StatePath).ActiveHostGateRecovery | Should Not BeNullOrEmpty
+    }
+
+    It 'rejects malformed or stale pause envelopes without delivering them as role evidence' {
+        $c=New-OperatorCase
+        $mixedRejected=$false
+        try { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -To Fixer -Message 'mixed' -ErrorAction Stop }
+        catch [System.Management.Automation.ParameterBindingException] { $mixedRejected=$true }
+        $mixedRejected | Should Be $true
+        $bad=Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'bad target'
+        $stale=Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'wrong run'
+        & (Get-Module CodexReviewLoop) {
+            param($c,$bad,$stale)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $mailbox=Get-ReviewLoopOperatorMailbox $s
+            $p=Join-Path $mailbox "$bad.json"
+            $request=Read-ReviewLoopJson $p
+            $request.Target.Cycle='invalid'
+            Write-ReviewLoopAtomicJson $p $request
+            $p=Join-Path $mailbox "$stale.json"
+            $request=Read-ReviewLoopJson $p
+            $request.Run.RunId='wrong-run'
+            Write-ReviewLoopAtomicJson $p $request
+        } $c $bad $stale
+        (Invoke-OperatorRole $c).Success | Should Be $true
+        $s=Read-ReviewLoopState $c.Paths.StatePath
+        ($s.Operator.Requests | Where-Object Id -eq $bad).Rejection | Should Be 'invalid request'
+        ($s.Operator.Requests | Where-Object Id -eq $stale).Rejection | Should Be 'run identity mismatch'
+        $s.Operator.Revisions.Architect | Should Be 0
+    }
+}
+
+Describe 'Operator pause completion-round boundaries' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'stops after LessonsLearned or its outside-round result before new repair work' {
+        foreach ($variant in @(@{At='AfterRole';Changes=$false}, @{At='AfterRound';Changes=$false}, @{At='AfterRound';Changes=$true})) {
+            $c=New-OperatorCase
+            Set-Content (Join-Path $c.Repo 'AGENTS.md') 'Use the repository contract.'
+            & git -C $c.Repo add AGENTS.md
+            & git -C $c.Repo commit -q -m 'fixture guidance'
+            & (Get-Module CodexReviewLoop) {
+                param($c)
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $s.StartHead=$s.CurrentHead=Get-ReviewLoopGitValue $c.Repo @('rev-parse','HEAD')
+                Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+            } $c
+            (Get-Content -Raw $c.Profile).Replace('LessonsLearnedCommitThreshold=0','LessonsLearnedCommitThreshold=1') | Set-Content $c.Profile
+            Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'fix' -RequireDelivery | Out-Null
+            $lesson=@{operatorMessages=@((New-OperatorPausePlan $c $variant.At))}
+            if ($variant.Changes) {
+                $lesson.result=@{
+                    schemaVersion='2.0';summary='Record a durable invariant.'
+                    diagnosis=@{summary='The guidance needs clarification.';causes=@();guidanceAssessment=@()}
+                    changes=@(@{title='Record the invariant';action='update';surface='agents_md';targets=@('AGENTS.md')
+                        outcome='Clarify the invariant.';rationale='The run evidenced a gap.';futureUse='Future changes.';evidence=@('The accepted fix.')})
+                } | ConvertTo-Json -Depth 10 -Compress
+            }
+            $plans=@(@{mutations=@(@{path='README.txt';content='fixed'})}, @{result=(Get-OperatorAcceptResult)}, @{result='No findings.'}, $lesson)
+            if ($variant.Changes) { $plans+=@(@{exitCode=13},@{exitCode=13},@{exitCode=13}) }
+            Set-OperatorPlans $c $plans
+            $r=Invoke-OperatorLoop $c
+            if ($r.Status -ne 'paused') { throw "Expected $($variant.At) pause, got $($r.Status): $($r.Reason)" }
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.Stage | Should Be $(if($variant.Changes){'reviewed'}else{'lessons_learned_completed'})
+            @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+            if ($variant.Changes) {
+                Set-OperatorPlans $c @(@{}, @{mutations=@(@{path='AGENTS.md';content='Updated lesson guidance.'})}, @{result=(Get-OperatorAcceptResult)})
+            }
+            (Invoke-OperatorLoop $c).Status | Should Be completed
+            @((Get-OperatorCalls) | Where-Object schemaPath -match 'lessons-learned').Count | Should Be 1
+            if ($variant.Changes) { @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 2 }
+            Clear-OperatorCase
+        }
     }
 }

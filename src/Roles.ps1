@@ -252,6 +252,7 @@ function Invoke-ConfiguredCodexRole {
 
     Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
+    if ($null -ne $State) { Invoke-ReviewLoopPauseBoundary $State $StatePath Step }
     $roleConfig = Get-ReviewLoopRoleConfig -Config $Config -Role $Role
     $schemaPath = if ([string]::IsNullOrWhiteSpace($SchemaName)) {
         ""
@@ -531,7 +532,7 @@ function Invoke-ConfiguredCodexRole {
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     }
     if ($null -ne $State -and $null -eq $pending) {
-        $State.$activeCallProperty = [pscustomobject][ordered]@{
+        $nextCall = [pscustomobject][ordered]@{
             CallId = $CallId
             Role = $Role
             Model = [string]$roleConfig.Model
@@ -558,10 +559,16 @@ function Invoke-ConfiguredCodexRole {
             ThreadStartedAt = ""
         }
         if ($null -ne $criticRecovery) {
-            $State.$activeCallProperty | Add-Member -NotePropertyName RepositoryBackup `
+            $nextCall | Add-Member -NotePropertyName RepositoryBackup `
                 -NotePropertyValue $criticRecovery.RepositoryBackup
         }
-        Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        Invoke-ReviewLoopOperatorLock $State {
+            param($mailbox)
+            Import-ReviewLoopOperatorMessages $State $mailbox -PausesOnly
+            Invoke-ReviewLoopPauseBoundary $State $StatePath Step -Locked
+            $State.$activeCallProperty = $nextCall
+            Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+        }
         if ($Role -in @("Reviewer", "Critic")) {
             Set-ReviewLoopReviewerRecoveryLocator `
                 -RepoPath $RepoPath -StatePath $StatePath
@@ -959,6 +966,7 @@ function Invoke-ReviewLoopReview {
             ))
     }
 
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
     $classificationSource = "deterministic"
     if ([string]$classification.Classification -eq "ambiguous") {
         $classifierPrompt = Get-ReviewLoopPrompt -Name "review-classifier.md" -Values @{
@@ -972,6 +980,7 @@ function Invoke-ReviewLoopReview {
             -CallId ("review-{0:d2}-classify" -f $cycle) `
             -State $State -StatePath $StatePath
         Assert-ReviewLoopRoleSuccess $classifierCall
+        Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
         $classification = [pscustomobject]@{
             Classification = if ([bool]$classifierCall.StructuredResult.hasFindings) {
                 "finding"
@@ -1054,6 +1063,7 @@ function Invoke-ReviewLoopOrientation {
     Register-ReviewLoopOrientation -State $State -Result $call.StructuredResult
     Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
     Write-ReviewLoopStatus -Message "Architect task: $($State.ArchitectWork.Goal.statement)" -Kind Architecture
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
 }
 
 function Invoke-ReviewLoopGoalAssessment {
@@ -1079,14 +1089,29 @@ function Invoke-ReviewLoopGoalAssessment {
             lessonsLearned = $State.LessonsLearned
         })
     }
-    $call = Invoke-ReviewLoopRoleCall -Config $Config -Role Architect -RepoPath $RepoPath `
-        -Speed $Speed -Prompt $prompt -LogRoot $RunRoot `
-        -SchemaName "architecture-assessment-v2.schema.json" -CodexPath $CodexPath `
-        -CallId "goal-c$($State.ReviewCycle)-w$($State.ArchitectWork.Revision)" -State $State -StatePath $StatePath `
-        -RequireGoalDecision
-    Assert-ReviewLoopRoleSuccess $call
-    Register-ReviewLoopWorkAssessment -State $State -Result $call.StructuredResult -RequireGoalDecision
+    $goalIdentity = {
+        ConvertTo-ReviewLoopJsonCompact ([ordered]@{
+            Kind = 'goal'; Snapshot = $snapshot; Execution = [string]$State.ExecutionFingerprint
+            Revision = [int]$State.ArchitectWork.Revision; Architect = [int]$State.Operator.Revisions.Architect
+        })
+    }
+    $saved = $State.Operator.Assessment
+    $record = if ($null -ne $saved -and $saved.Identity -ceq (& $goalIdentity)) {
+        $State.RoleCalls | Where-Object { $_.Role -eq 'Architect' -and $_.CallId -ceq $saved.CallId -and $_.Success } | Select-Object -Last 1
+    } else { $null }
+    if ($null -ne $record) { $call = ConvertFrom-ReviewLoopRoleCallRecord $record }
+    else {
+        $call = Invoke-ReviewLoopRoleCall -Config $Config -Role Architect -RepoPath $RepoPath `
+            -Speed $Speed -Prompt $prompt -LogRoot $RunRoot `
+            -SchemaName "architecture-assessment-v2.schema.json" -CodexPath $CodexPath `
+            -CallId "goal-c$($State.ReviewCycle)-w$($State.ArchitectWork.Revision)" -State $State -StatePath $StatePath `
+            -RequireGoalDecision
+        Assert-ReviewLoopRoleSuccess $call
+        Register-ReviewLoopWorkAssessment -State $State -Result $call.StructuredResult -RequireGoalDecision
+        $State.Operator.Assessment = [pscustomobject]@{ Identity = & $goalIdentity; CallId = [string]$call.CallId }
+    }
     Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
     if (-not $call.StructuredResult.accept -or -not $call.StructuredResult.goalComplete) {
         Open-ReviewLoopOperatorBoundary $State
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null

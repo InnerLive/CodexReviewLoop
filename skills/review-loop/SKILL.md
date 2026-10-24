@@ -98,3 +98,39 @@ For a stale/wrong run or rejected request, inspect the short reason and the norm
 run output. Correct the cause and publish a new message only if still relevant.
 Never silently carry old requests into another run, change an existing message,
 or edit the checkpoint to mark it delivered. `-Help` shows the command interface.
+
+## Controlled pauses
+
+Use the same run-scoped publisher with a reason and one boundary:
+
+```powershell
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -PauseAt AfterRole -Message 'Inspect the current result.'
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -PauseAt AfterRound -Message 'Investigate repeated repair failures.'
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -PauseAt BeforeCommit -Message 'Check an external prerequisite.'
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -PauseAt BeforeCompletion -Message 'Check final operational evidence.'
+```
+
+Choose `AfterRole` for the earliest safe intervention after the current call;
+`AfterRound` lets the current review and repair round finish, including tests,
+assessment and any accepted commit, or preservation of a rejected candidate.
+Outside a review/fix round, `AfterRound` stops at the next safe transition;
+an active retrospective finishes its current call before new repair work.
+`BeforeCommit` stops before commit gates and preparation, including the no-op
+path. `BeforeCompletion` lets final assessment and gates finish before completion.
+An already-running test or gate finishes its recovery first. A begun commit can
+stop at its durable recovery checkpoint. No model process is cancelled.
+
+Publication confirms only the request. Wait for `paused` (exit code `5`) and the
+reported requested/reached boundary. A missed boundary is reported explicitly;
+the loop then stops at its next safe point. Keep the ID and retry uncertain
+publication with identical arguments and `-Id`. Reached requests are consumed;
+other pending pause IDs remain effective after resume.
+
+Take over the checkout only after the loop process has exited and its repository
+lease is released. A request or a saved `paused` status alone is insufficient.
+Preserve HEAD, refs, index, the saved candidate and recovery artifacts; this pause
+does not authorize adopting external code changes into the run. Repair external
+prerequisites or investigate the reason, then explicitly repeat the compatible
+start command. Keep the saved task, review base and Reviewer instructions as
+described above. Do not restart automatically while the reason still exists;
+routine user approval is unnecessary within the authorized task.

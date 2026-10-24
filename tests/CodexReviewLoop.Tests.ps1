@@ -2320,6 +2320,15 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
             (Get-Content -Raw (Join-Path $destination "$name/SKILL.md")) |
                 Should Be (Get-Content -Raw (Join-Path $root "skills/$name/SKILL.md"))
         }
+        $installed = Get-Content -Raw (Join-Path $destination 'review-loop/SKILL.md')
+        foreach ($boundary in @('AfterRole','AfterRound','BeforeCommit','BeforeCompletion')) {
+            $installed | Should Match "-PauseAt $boundary"
+        }
+        $installed | Should Match 'process has exited'
+        $installed | Should Match 'Do not restart automatically'
+        $operator = Join-Path $binding.repositoryPath 'operator-message.ps1'
+        Test-Path $operator | Should Be $true
+        (& $operator -Help | Out-String) | Should Match 'PauseAt'
     }
 
     It "uses primary skills and path even when launched from a linked worktree" {

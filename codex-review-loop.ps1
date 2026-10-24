@@ -23,6 +23,11 @@ If no profile is found, the tool creates a commented profile using the next
 available number under <tool directory>\profiles, for example
 MyProject-001.psd1 or MyProject-002.psd1, and continues the run.
 
+Use operator-message.ps1 with the observed RunRoot to send one-time role evidence
+or request -PauseAt AfterRole|AfterRound|BeforeCommit|BeforeCompletion. A reached
+halt returns paused (exit 5); publication alone does not confirm process exit.
+Address the reason before explicitly resuming the same compatible command.
+
 .PARAMETER RepoPath
 Path to the Git repository to review and, when needed, fix.
 
@@ -140,7 +145,6 @@ Shows the full command help.
 .NOTES
 The ledger, checkpoints, and role logs are stored under the profile's LogRoot.
 AutoCommit and HostGates are controlled by the profile as well.
-Use operator-message.ps1 with the observed RunRoot to send one-time role evidence.
 
 .PARAMETER RequalifyExternalRefChange
 Path to an operator-approved exact external-ref-change evidence package.

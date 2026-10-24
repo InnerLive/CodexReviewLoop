@@ -23,6 +23,13 @@ It uses the existing role contexts and acceptance path. Optional required
 delivery can return the workflow to those roles before a sealed transaction;
 the Operator never writes authoritative checkpoints or grants acceptance.
 
+The same channel supports controlled pauses after a role, after a complete
+review/fix round, before commit preparation, and before final completion.
+Publication is distinct from reaching the halt. Completed results and the exact
+continuation are checkpointed, dirty candidates are backed up, and active
+transactions finish or remain at their durable recovery point. Normal pause
+requests never cancel a model process. See [pause operation and resume](operations.md#controlled-operator-pauses).
+
 ## Periodic Critic
 
 Starting after five successfully completed, distinct native reviews by default,

@@ -300,9 +300,11 @@ if ($exitCode -eq 0 -and
 }
 
 foreach ($message in $operatorMessages) {
-    & (Join-Path (Split-Path -Parent $PSScriptRoot) 'operator-message.ps1') `
-        -RunRoot $message.runRoot -To $message.to -Message $message.message `
-        -RequireDelivery:([bool]$message.requireDelivery) | Out-Null
+    $publication = @{ RunRoot = $message.runRoot; Message = $message.message }
+    $pauseAt = Get-FakePlanValue $message -Name pauseAt -Default ''
+    if ($pauseAt) { $publication.PauseAt = $pauseAt }
+    else { $publication.To = $message.to; $publication.RequireDelivery = [bool]$message.requireDelivery }
+    & (Join-Path (Split-Path -Parent $PSScriptRoot) 'operator-message.ps1') @publication | Out-Null
 }
 
 if ($plannedMutations.Count -gt 0) {

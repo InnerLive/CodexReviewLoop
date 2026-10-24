@@ -4,7 +4,7 @@ function Test-ReviewLoopStateCanResume {
     if ([string]$State.Status -eq "running") {
         return $true
     }
-    if ([string]$State.Status -eq "limit_reached") {
+    if ([string]$State.Status -in @("limit_reached", "paused")) {
         return $true
     }
     return (
@@ -2905,6 +2905,7 @@ function Complete-ReviewLoopPendingCommit {
         if ((Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath) -ne $expectedFingerprint) {
             throw "The worktree changed after verification; refusing the pending commit."
         }
+        Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
         Invoke-ReviewLoopGitStep -Name "Commit preparation" -Arguments @("add", "-A") `
             -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
         $tree = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("write-tree")
@@ -2928,6 +2929,7 @@ function Complete-ReviewLoopPendingCommit {
         $pending.ExpectedTree = $tree
         $pending | Add-Member -Force -NotePropertyName ExpectedCommit -NotePropertyValue ""
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
+        Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
         $autoCommit = if ($Config.ContainsKey("AutoCommit")) {
             [bool]$Config.AutoCommit
         }
@@ -2957,6 +2959,7 @@ function Complete-ReviewLoopPendingCommit {
         $candidateCommit = $candidate[0].ToLowerInvariant()
         $pending.ExpectedCommit = $candidateCommit
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
+        Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
         Invoke-ReviewLoopGitStep -Name "Commit" -Arguments @(
             "update-ref", "HEAD", $candidateCommit, $preHead
         ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
@@ -2969,6 +2972,7 @@ function Complete-ReviewLoopPendingCommit {
         $details = @($commitCheck.Mismatches) -join "; "
         throw "The resulting commit does not match the verified pending commit. Failed checks: $details."
     }
+    Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
     $subject = [string]$commitCheck.Subject
     if ([bool](Get-ReviewLoopObjectProperty -Object $pending -Name "NeedsCurrentGates" -Default $false)) {
         Update-ReviewLoopLiveConfig -Config $Config
@@ -3069,6 +3073,7 @@ function Complete-ReviewLoopFix {
         OperatorBoundaryId = [string]$State.Operator.Boundary.Id
     })
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_preparing"
+    Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
     Write-ReviewLoopStatus -Message "Preparing the verified commit." -Kind Progress
     Complete-ReviewLoopPendingCommit -Config $Config -State $State -StatePath $StatePath `
         -Ledger $Ledger -LedgerPath $LedgerPath -RepoPath $RepoPath -RunRoot $RunRoot | Out-Null
@@ -3111,10 +3116,24 @@ function Invoke-ReviewLoopAttemptAssessment {
         -Message "Fixer: $($FixerCall.StructuredResult.summary) · $($changedPaths.Count) changed paths$(if ($changedPaths.Count -gt 0) { ': ' + ($changedPaths -join ', ') } else { '' })" `
         -Kind $(if ($changedPaths.Count -gt 0) { "Success" } else { "Warning" })
 
-    Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "testing"
     Update-ReviewLoopLiveConfig -Config $Config
     Assert-ReviewLoopExecutionUnchanged -Config $Config
-    $tests = Invoke-ReviewLoopTargetedTests `
+    Invoke-ReviewLoopPauseBoundary $State $StatePath Step
+    $savedTest = $State.Operator.TargetedTest
+    $fixerIdentity = [string](Get-ReviewLoopObjectProperty $FixerCall -Name CallId -Default '')
+    $testIdentity = ConvertTo-ReviewLoopJsonCompact ([ordered]@{
+        CallId = $fixerIdentity; Attempt = $Attempt
+        FixerRevision = [int](Get-ReviewLoopObjectProperty $FixerCall -Name OperatorRevision -Default 0)
+        Snapshot = $worktreeSnapshot; Execution = [string]$State.ExecutionFingerprint
+        Test = $FixerCall.StructuredResult.targetedTest; Policy = $Config['TargetedTestRepositoryChanges']
+    })
+    if ($fixerIdentity -and $null -ne $savedTest -and $savedTest.Result.Success -and $savedTest.Identity -ceq $testIdentity) {
+        $tests = $savedTest.Result
+        $FixerCall.StructuredResult | Add-Member -Force -NotePropertyName testExecution -NotePropertyValue $savedTest.Execution
+    }
+    else {
+        Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "testing"
+        $tests = Invoke-ReviewLoopTargetedTests `
         -Config $Config -State $State -StatePath $StatePath `
         -FixerResult $FixerCall.StructuredResult `
         -RepoPath $RepoPath `
@@ -3122,6 +3141,12 @@ function Invoke-ReviewLoopAttemptAssessment {
         -ClusterId $State.ActiveClusterId `
         -Attempt $Attempt `
         -InactivityTimeoutSeconds (Get-ReviewLoopInactivityTimeoutSeconds -Config $Config)
+        $State.Operator.TargetedTest = if ($fixerIdentity) { [pscustomobject]@{
+            Identity = $testIdentity; Result = $tests
+            Execution = Get-ReviewLoopObjectProperty $FixerCall.StructuredResult -Name testExecution
+        } } else { $null }
+        Write-ReviewLoopState $StatePath $State | Out-Null
+    }
     Assert-ReviewLoopRepositoryUnchanged `
         -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "The targeted test"
     if (-not $tests.Success) {
@@ -3133,12 +3158,34 @@ function Invoke-ReviewLoopAttemptAssessment {
         }
     }
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "tested"
+    Invoke-ReviewLoopPauseBoundary $State $StatePath Step
 
     :operatorAssessment while ($true) {
-        $verification = Invoke-ReviewLoopArchitectAssessment `
+        Sync-ReviewLoopOperatorMessages $State $StatePath
+        $assessmentIdentity = {
+            ConvertTo-ReviewLoopJsonCompact ([ordered]@{
+                Fixer = $fixerIdentity; Attempt = $Attempt; Cycle = [int]$State.ReviewCycle; Snapshot = $worktreeSnapshot
+                Execution = [string]$State.ExecutionFingerprint; Revision = [int]$State.ArchitectWork.Revision
+                Architect = [int]$State.Operator.Revisions.Architect
+                FixerRevision = [int](Get-ReviewLoopObjectProperty $FixerCall -Name OperatorRevision -Default 0)
+            })
+        }
+        $savedAssessment = $State.Operator.Assessment
+        $record = if ($fixerIdentity -and $null -ne $savedAssessment -and $savedAssessment.Identity -ceq (& $assessmentIdentity)) {
+            $State.RoleCalls | Where-Object { $_.Role -eq 'Architect' -and $_.CallId -ceq $savedAssessment.CallId -and $_.Success } | Select-Object -Last 1
+        } else { $null }
+        if ($null -ne $record) {
+            $verification = [pscustomobject]@{ Accepted = [bool]$record.StructuredResult.accept; Result = $record.StructuredResult; Calls = @($record) }
+        }
+        else {
+            $verification = Invoke-ReviewLoopArchitectAssessment `
             -Config $Config -State $State -StatePath $StatePath -RepoPath $RepoPath `
             -Speed $Speed -RunRoot $RunRoot -Findings $Findings -FixerCall $FixerCall `
             -Attempt $Attempt -CodexPath $CodexPath
+            $State.Operator.Assessment = if ($fixerIdentity) { [pscustomobject]@{
+                Identity = & $assessmentIdentity; CallId = [string]$verification.Calls[0].CallId
+            } } else { $null }
+        }
         $targetedTest = $FixerCall.StructuredResult.targetedTest
         $targetedCommand = "$($targetedTest.executable) $(@($targetedTest.arguments) -join ' ')".Trim()
         $targetedAvailable = if ($targetedTest.PSObject.Properties.Name -contains "available") {
@@ -3162,6 +3209,7 @@ function Invoke-ReviewLoopAttemptAssessment {
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "verified"
         Assert-ReviewLoopRepositoryUnchanged `
             -RepoPath $RepoPath -Snapshot $worktreeSnapshot -Operation "Read-only verification"
+        Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
 
         if ($verification.Accepted) {
             $completion = Complete-ReviewLoopFix `
@@ -3276,6 +3324,7 @@ function Restart-ReviewLoopReviewRound {
         -Kind Info
     Clear-ReviewLoopActiveCluster `
         -State $State -StatePath $StatePath -Stage "review_round_requested"
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRound
     return $false
 }
 
@@ -3398,11 +3447,14 @@ function Invoke-ReviewLoopFixWorkflow {
     $storedHead = [string](Get-ReviewLoopObjectProperty `
         -Object $State.LastFixerResult -Name "WorktreeHead" -Default ([string]$State.CurrentHead))
     Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
+    $prepared = $State.Operator.FixerInput
+    $resumePrepared = $Recover -and $State.Stage -eq 'fixing' -and $null -ne $prepared -and
+        $prepared.ClusterId -ceq $State.ActiveClusterId -and $prepared.Cycle -eq $State.ReviewCycle -and $prepared.Attempt -eq $attempt
     if ($Recover -and $storedSuccess -and $null -eq $State.ActiveRoleCall -and
         @(Get-ReviewLoopPendingOperatorMessages $State -Role Fixer).Count -gt 0) {
         $retryCurrentAttempt = $false
     }
-    if ($Recover -and $storedSuccess -and $storedAttempt -eq $attempt -and
+    if ($Recover -and -not $resumePrepared -and $storedSuccess -and $storedAttempt -eq $attempt -and
         @(Get-ReviewLoopPendingOperatorMessages $State -Role Fixer).Count -eq 0 -and
         $null -ne $State.LastFixerResult -and $null -ne $State.LastFixerResult.StructuredResult) {
         $currentSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
@@ -3459,6 +3511,11 @@ function Invoke-ReviewLoopFixWorkflow {
         }
     }
 
+    if ($resumePrepared) {
+        $feedback = [string]$prepared.Feedback
+        $technicalCorrections = [int]$prepared.Correction
+        $retryCurrentAttempt = $true
+    }
     while ($true) {
         if (-not $retryCurrentAttempt) {
             Update-ReviewLoopLiveConfig -Config $Config
@@ -3479,6 +3536,10 @@ function Invoke-ReviewLoopFixWorkflow {
             Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
         }
         $retryCurrentAttempt = $false
+        $State.Operator.FixerInput = [pscustomobject]@{
+            ClusterId = [string]$State.ActiveClusterId; Cycle = [int]$State.ReviewCycle
+            Attempt = $attempt; Correction = $technicalCorrections; Feedback = $feedback
+        }
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fixing"
         $threadMode = if ([string]::IsNullOrWhiteSpace($threadId)) { "new thread" } else { "resuming thread" }
         Write-ReviewLoopStatus -Message "Fixer · call $attempt · $threadMode" -Kind Progress
@@ -3509,6 +3570,7 @@ function Invoke-ReviewLoopFixWorkflow {
             Attempt = $attempt
             Correction = $technicalCorrections
         }
+        $State.Operator.FixerInput = $null
         $fixerSnapshot = Get-ReviewLoopRepositorySnapshot -RepoPath $RepoPath
         $State.LastFixerResult | Add-Member -Force -NotePropertyName WorktreeFingerprint `
             -NotePropertyValue ([string]$fixerSnapshot.Fingerprint)
@@ -3552,6 +3614,7 @@ function Invoke-ReviewLoopFixWorkflow {
             }
         }
         Assert-ReviewLoopRoleSuccess $fixer
+        Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
         $assessment = Invoke-ReviewLoopAttemptAssessment `
             -Config $Config -State $State -StatePath $StatePath `
             -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
@@ -3598,6 +3661,7 @@ function Invoke-ReviewLoopCluster {
         -Findings $Findings -CodexPath $CodexPath
     $State.ActiveStrategy = $architect.StructuredResult
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "strategy_ready"
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
 
     Invoke-ReviewLoopFixWorkflow `
         -Config $Config -State $State -StatePath $StatePath `
@@ -4247,6 +4311,7 @@ function Invoke-ReviewLoopCriticGate {
     Write-ReviewLoopStatus -Message "Critic to Reviewer: $($call.StructuredResult.reviewerFeedback)" -Kind Review
     Write-ReviewLoopStatus -Message "Critic to Architect: $($call.StructuredResult.architectFeedback)" -Kind Review
     Write-ReviewLoopStatus -Message "Critic to Fixer: $($call.StructuredResult.fixerFeedback)" -Kind Review
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
 }
 
 function Invoke-ReviewLoopLessonsLearnedGate {
@@ -4323,6 +4388,7 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         $State.LessonsLearned.CompletedHead = $head
         Set-ReviewLoopCheckpoint `
             -State $State -StatePath $StatePath -Stage "lessons_learned_completed"
+        Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
         return [pscustomobject]@{
             Eligible = $true
             CompletionAllowed = $true
@@ -4346,6 +4412,7 @@ function Invoke-ReviewLoopLessonsLearnedGate {
         -Ledger $Ledger -Findings @($findings) -ReviewId $reviewId -Head $head | Out-Null
     Write-ReviewLoopLedger -Path $LedgerPath -Ledger $Ledger | Out-Null
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "reviewed"
+    Invoke-ReviewLoopPauseBoundary $State $StatePath AfterRole
     Write-ReviewLoopStatus `
         -Message "Implementing $($changes.Count) retrospective guidance change(s) through the normal fix workflow." `
         -Kind Progress
@@ -4393,10 +4460,15 @@ function Complete-ReviewLoopRun {
             Write-ReviewLoopStatus -Message "$($message.Id) rejected for $($delivery.Role): no further matching role call" -Kind Warning
         }
     }
-    $State.Status = "completed"
-    $State.ExitCode = 0
-    Set-ReviewLoopCheckpoint `
-        -State $State -StatePath $StatePath -Stage "completed" -Status "completed"
+    Invoke-ReviewLoopOperatorLock $State {
+        param($mailbox)
+        Import-ReviewLoopOperatorMessages $State $mailbox
+        Invoke-ReviewLoopPauseBoundary $State $StatePath BeforeCompletion -Locked
+        $State.Status = "completed"
+        $State.ExitCode = 0
+        Set-ReviewLoopCheckpoint `
+            -State $State -StatePath $StatePath -Stage "completed" -Status "completed"
+    }
     Write-ReviewLoopCompletionSummary `
         -Cycles $State.ReviewCycle `
         -CleanPasses "$($State.CleanPasses)/$CleanPassesRequired" `
@@ -4841,6 +4913,7 @@ function Invoke-ReviewLoopCore {
             -ColorMode $ColorMode `
             -HostOutputEnabled (-not $Json) `
             -TranscriptPath $terminalPath
+        if ($state.Status -eq 'paused') { Assert-ReviewLoopPausedRepository $state }
         Resume-ReviewLoopHostGateRecovery `
             -Config $config -State $state -StatePath $statePath `
             -RepoPath $repo | Out-Null
@@ -4968,7 +5041,7 @@ function Invoke-ReviewLoopCore {
         $state.BlockedReason = ""
         Write-ReviewLoopState -Path $statePath -State $state | Out-Null
     }
-    elseif ($resumed -and [string]$state.Status -eq "limit_reached") {
+    elseif ($resumed -and [string]$state.Status -in @("limit_reached", "paused")) {
         $state.Status = "running"
         $state.ExitCode = 0
         $state.BlockedReason = ""
@@ -5066,6 +5139,7 @@ function Invoke-ReviewLoopCore {
 
     try {
         $resumedBlockedCleanup = $false
+        Invoke-ReviewLoopPauseBoundary $state $statePath Step
         if ($resumed) {
             Complete-ReviewLoopPendingCommit `
                 -Config $config -State $state -StatePath $statePath -Ledger $ledger `
@@ -5106,6 +5180,7 @@ function Invoke-ReviewLoopCore {
         }
         while ($true) {
             Assert-ReviewLoopExecutionUnchanged -Config $config
+            Invoke-ReviewLoopPauseBoundary $state $statePath Step
             Sync-ReviewLoopOperatorMessages -State $state -StatePath $statePath
             if ($null -eq $state.Operator.Boundary) {
                 if (@(Get-ReviewLoopPendingOperatorMessages $state -Role Reviewer -Required).Count -gt 0) {
@@ -5240,6 +5315,7 @@ function Invoke-ReviewLoopCore {
 
             Invoke-ReviewLoopCriticGate -Config $config -State $state -StatePath $statePath `
                 -Ledger $ledger -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
+            Invoke-ReviewLoopPauseBoundary $state $statePath Step
 
             if ([string]$state.Stage -ne "reviewing") {
                 $state.ReviewCycle = [int]$state.ReviewCycle + 1
@@ -5325,6 +5401,23 @@ function Invoke-ReviewLoopCore {
         }
     }
     catch {
+        if ($_.Exception.Data.Contains('ReviewLoopPaused')) {
+            $requests = @($state.Operator.Requests | Where-Object { $_.Id -in $state.Operator.Pause.RequestIds })
+            foreach ($request in $requests) {
+                Write-ReviewLoopStatus -Message "$($request.Id) requested $($request.PauseAt); reached $($request.Reached) at $($request.Stage)$(if ($request.Missed) { '; requested boundary missed' })" -Kind Warning
+            }
+            return [pscustomobject]@{
+                Status = 'paused'; ExitCode = 5; Reason = 'Operator pause reached.'
+                NextSteps = @('Address the pause reason, then explicitly run the same compatible command to continue.')
+                RunRoot = $paths.RunRoot; StatePath = $statePath; LedgerPath = $paths.LedgerPath
+                ReviewCycles = $state.ReviewCycle; CleanPasses = $state.CleanPasses
+                Pause = $state.Operator.Pause
+                Requests = @($requests | Select-Object Id, PauseAt, Reached, Stage, Missed)
+                PendingPauseIds = @($state.Operator.Requests | Where-Object {
+                    (Get-ReviewLoopObjectProperty $_ -Name Kind -Default '') -eq 'pause' -and $_.Status -eq 'pending'
+                } | ForEach-Object Id)
+            }
+        }
         $message = ConvertTo-ReviewLoopRedactedText $_.Exception.Message
         $failureStage = [string]$state.Stage
         $state.Status = if (

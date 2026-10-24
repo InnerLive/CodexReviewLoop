@@ -521,6 +521,7 @@ function Test-ReviewLoopState {
     }
     if ([string]$State.Status -notin @(
         "running",
+        "paused",
         "completed",
         "limit_reached",
         "blocked",

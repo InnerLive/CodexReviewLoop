@@ -372,6 +372,52 @@ to another run automatically or edit checkpoints/mailboxes to repair a request.
 
 See the bundled `skills/review-loop/SKILL.md` for operator examples and selection.
 
+## Controlled operator pauses
+
+Publish a run-scoped request with `operator-message.ps1 <RunRoot> -PauseAt
+AfterRole|AfterRound|BeforeCommit|BeforeCompletion -Message '<reason>'`.
+Do not combine it with `-To` or `-RequireDelivery`. Publication returns the ID
+and requested boundary, not a reached-pause receipt. Identical retries use `-Id`.
+
+`AfterRole` stops after the active role result is saved and before further work.
+Without an active role it stops at the next safe transition. `AfterRound` waits
+for the current native review and full repair round, including targeted tests,
+assessment, gates and accepted commit; exhausted attempts preserve the complete
+`RetainedCandidate` before stopping. Outside an active round it stops immediately.
+`BeforeCommit` precedes the commit request seal and HostGates, including accepted
+no-ops. `BeforeCompletion` follows final assessment and gates and precedes the
+durable completed state. See [workflow](how-it-works.md) for the existing stages.
+
+Lessons-learned analysis and final goal assessment are outside the native round.
+An `AfterRound` request there finishes the current role and saves its result before
+new work starts. A lessons-learned repair already underway finishes as a repair
+round.
+
+Running tests, gates and Git operations finish their repository checks/recovery.
+A begun commit may stop with `PendingCommit` intact at an existing recovery
+checkpoint. A missed boundary is explicitly reported and stops at the next safe
+point instead of waiting silently for another transaction. Technical failures
+remain failures. Pause requests remain observable during sealed transactions;
+the sealed role-message set stays unchanged. Completion and publication share
+one atomic mailbox boundary; requests after completion are rejected.
+
+The halt stores the exact continuation stage, completed results and a verified
+backup of dirty candidate files and index. Resume does not repeat completed
+roles or targeted tests solely because of the pause. Reached request IDs cannot
+trigger again; other pending requests remain active. Existing identity and
+execution requalification rules still apply.
+
+Operator state version 1 upgrades to version 2 on the next checkpoint write,
+preserving run identity, deliveries and sealed boundaries. Older tools reject
+version 2 instead of ignoring pending pauses. Version 1 message envelopes remain
+supported; pause envelopes use version 2.
+
+Wait for process exit and release of the repository lease before taking over;
+the persisted state alone is not evidence of resource release. Preserve HEAD,
+refs, index, candidate and recovery artifacts. After addressing the reason,
+explicitly repeat the same compatible command. Do not edit checkpoints, adopt
+external patches, or automatically resume while the reason persists.
+
 ## Outcomes
 
 | Status | Exit code | Meaning |
@@ -380,6 +426,7 @@ See the bundled `skills/review-loop/SKILL.md` for operator examples and selectio
 | Invocation error | `1` | Validation or preflight failed before a run checkpoint was created |
 | `failed` | `2` | An initialized run failed; its latest checkpoint is preserved |
 | `limit_reached` | `4` | The configured per-invocation review budget was used; run the same command to continue |
+| `paused` | `5` | An Operator-requested safe halt was reached; address its reason and explicitly resume the saved continuation |
 
 Rejected solutions and exhausted Fixer rounds are not terminal outcomes. After
 `MaxFixAttempts` unsuccessful Fixer calls, the loop saves file contents, new files,
