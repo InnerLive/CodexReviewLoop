@@ -3,15 +3,15 @@ function Initialize-ReviewLoopOperator {
     if ($null -eq $State) { return }
     if ($State.PSObject.Properties.Name -notcontains 'Operator') {
         $State | Add-Member -NotePropertyName Operator -NotePropertyValue ([pscustomobject]@{
-            Version = 3
+            Version = 4
             Revisions = [pscustomobject]@{ Reviewer = 0; Architect = 0; Fixer = 0 }
             Requests = @()
             Boundary = $null
         })
     }
-    if ($State.Operator.Version -notin @(1,2,3)) { throw 'Unknown operator state version.' }
-    # Explicit additive upgrade; older tools must not ignore reassessment barriers.
-    $State.Operator.Version = 3
+    if ($State.Operator.Version -notin @(1,2,3,4)) { throw 'Unknown operator state version.' }
+    # Explicit additive upgrade; older tools must not ignore new request semantics.
+    $State.Operator.Version = 4
     foreach ($name in @('Pause', 'TargetedTest', 'Assessment', 'FixerInput', 'InterruptedFixerCall')) {
         if ($State.Operator.PSObject.Properties.Name -notcontains $name) {
             $State.Operator | Add-Member -NotePropertyName $name -NotePropertyValue $null
@@ -87,6 +87,7 @@ function Send-ReviewLoopOperatorMessage {
         [Parameter(Mandatory, ParameterSetName = 'Pause')]
         [ValidateSet('AfterRole','AfterRound','BeforeCommit','BeforeCompletion')][string]$PauseAt,
         [Parameter(Mandatory, ParameterSetName = 'Reassessment')][switch]$ReassessArchitect,
+        [Parameter(Mandatory, ParameterSetName = 'Critic')][switch]$RequestCritic,
         [Parameter(Mandatory, Position = 2)][string]$Message,
         [Parameter(Position = 3)][string]$Id = ([guid]::NewGuid().ToString('D')),
         [Parameter(ParameterSetName = 'Message')][switch]$RequireDelivery
@@ -109,7 +110,7 @@ function Send-ReviewLoopOperatorMessage {
         }
     } | Sort-Object -Unique)
     if ($ReassessArchitect) { $recipients = @('Architect') }
-    if (-not $PauseAt -and $recipients.Count -eq 0) { throw 'Select at least one recipient.' }
+    if (-not $PauseAt -and -not $RequestCritic -and $recipients.Count -eq 0) { throw 'Select at least one recipient.' }
     if ([string]::IsNullOrWhiteSpace($Message) -or $Message.Length -gt 4000) {
         throw 'Message must contain 1 to 4000 characters.'
     }
@@ -135,6 +136,12 @@ function Send-ReviewLoopOperatorMessage {
             To = @('Architect'); Message = $Message; RequireDelivery = $true
         }
     }
+    elseif ($RequestCritic) {
+        $request = [pscustomobject][ordered]@{
+            Version = 4; Kind = 'critic_request'; Id = $Id; Run = $identity
+            Message = $Message
+        }
+    }
     Invoke-ReviewLoopOperatorLock $state {
         param($mailbox)
         $current = Read-ReviewLoopState $statePath
@@ -149,7 +156,7 @@ function Send-ReviewLoopOperatorMessage {
             return
         }
         if ($current.Status -eq 'completed' -or
-            (-not $PauseAt -and -not $ReassessArchitect -and $null -ne $current.Operator.Boundary -and $current.Operator.Boundary.Kind -eq 'completion')) {
+            (-not $PauseAt -and -not $ReassessArchitect -and -not $RequestCritic -and $null -ne $current.Operator.Boundary -and $current.Operator.Boundary.Kind -eq 'completion')) {
             throw 'Run completion is sealed.'
         }
         if ($PauseAt) {
@@ -187,7 +194,7 @@ function Import-ReviewLoopOperatorMessages {
             if (-not [guid]::TryParseExact($id, 'D', [ref]$guid) -or $request.Id -cne $id) {
                 throw 'invalid message ID'
             }
-            if ($request.Version -notin @(1,2,3)) { throw 'unknown request version' }
+            if ($request.Version -notin @(1,2,3,4)) { throw 'unknown request version' }
             if ((ConvertTo-ReviewLoopJsonCompact $request.Run) -cne $identity) { throw 'run identity mismatch' }
             if ($request.Version -eq 2) {
                 if ($request.Kind -cne 'pause' -or $request.PauseAt -cnotin @('AfterRole','AfterRound','BeforeCommit','BeforeCompletion') -or
@@ -195,6 +202,13 @@ function Import-ReviewLoopOperatorMessages {
                     $null -eq $request.Target -or $request.Target.CallId -isnot [string] -or $request.Target.Cycle -isnot [long] -and $request.Target.Cycle -isnot [int] -or
                     [long]$request.Target.Cycle -lt 0 -or $request.Target.Stage -isnot [string] -or
                     $request.Target.Boundary -cnotin @('','commit','completion')) { throw 'invalid request' }
+            }
+            elseif ($request.Version -eq 4) {
+                if ($request.Kind -cne 'critic_request' -or $request.Message -isnot [string] -or
+                    [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
+                    @($request.PSObject.Properties.Name | Where-Object { $_ -cnotin @('Version','Kind','Id','Run','Message') }).Count -gt 0) {
+                    throw 'invalid request'
+                }
             }
             elseif ($request.RequireDelivery -isnot [bool] -or $request.Message -isnot [string] -or
                 [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
@@ -210,13 +224,21 @@ function Import-ReviewLoopOperatorMessages {
                 $_.Exception.Message
             } else { 'invalid request' }
         }
-        # Ordinary message sets stay sealed; pauses and reassessments remain observable.
+        # Ordinary message sets stay sealed; control requests remain observable.
         if (-not $reason -and $request.Version -eq 1 -and ($PausesOnly -or $null -ne $State.Operator.Boundary)) { continue }
         if (-not $reason -and $request.Version -eq 2) {
             $State.Operator.Requests += [pscustomobject]@{
                 Id = $id; Kind = 'pause'; Message = $request.Message; PauseAt = $request.PauseAt
                 Target = $request.Target; Status = 'pending'; Missed = $false; Reached = ''; Stage = ''
                 RequireDelivery = $false; Deliveries = @(); Rejection = ''
+            }
+            continue
+        }
+        if (-not $reason -and $request.Version -eq 4) {
+            $State.Operator.Requests += [pscustomobject]@{
+                Id = $id; Kind = 'critic_request'; Message = $request.Message
+                Status = 'pending'; CallId = ''; RequireDelivery = $false
+                Deliveries = @(); Rejection = ''
             }
             continue
         }
@@ -255,6 +277,13 @@ function Get-ReviewLoopPendingOperatorMessages {
         (-not $Required -or $_.RequireDelivery) -and
         (-not $Reassessment -or (Get-ReviewLoopObjectProperty $_ -Name Kind -Default '') -eq 'architect_reassessment') -and
         @($_.Deliveries | Where-Object { $_.Status -eq 'pending' -and (-not $Role -or $_.Role -eq $Role) }).Count -gt 0
+    })
+}
+
+function Get-ReviewLoopPendingCriticRequests {
+    param([object]$State)
+    return @($State.Operator.Requests | Where-Object {
+        (Get-ReviewLoopObjectProperty $_ -Name Kind -Default '') -eq 'critic_request' -and $_.Status -eq 'pending'
     })
 }
 

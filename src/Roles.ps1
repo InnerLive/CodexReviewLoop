@@ -162,6 +162,7 @@ function Invoke-ReviewLoopRoleCall {
         [string]$CallId = "",
         [object]$State = $null,
         [string]$StatePath = "",
+        [object[]]$CriticRequests = @(),
         [switch]$RequireWorkSelection,
         [switch]$RequireGoalDecision
     )
@@ -240,6 +241,7 @@ function Invoke-ConfiguredCodexRole {
         [string]$CallId = "",
         [object]$State = $null,
         [string]$StatePath = "",
+        [object[]]$CriticRequests = @(),
         [switch]$RequireWorkSelection,
         [switch]$RequireGoalDecision
     )
@@ -288,6 +290,10 @@ function Invoke-ConfiguredCodexRole {
         [int]$State.ArchitectWork.Revision
     } else { -1 }
     $activeCallProperty = if ($Role -eq "Critic") { "ActiveCriticCall" } else { "ActiveRoleCall" }
+    if ($Role -eq 'Critic' -and $null -ne (Get-ReviewLoopObjectProperty $State -Name ActiveCriticCall)) {
+        # A resumed critique keeps exactly the request set selected before its first start.
+        $CriticRequests = @((Get-ReviewLoopObjectProperty $State.ActiveCriticCall -Name CriticRequests -Default @()))
+    }
     $operatorRevision = 0
     $operatorMessages = @()
     if ($null -ne $State -and $Role -in @('Reviewer','Architect','Fixer')) {
@@ -568,6 +574,9 @@ function Invoke-ConfiguredCodexRole {
             $nextCall | Add-Member -NotePropertyName RepositoryBackup `
                 -NotePropertyValue $criticRecovery.RepositoryBackup
         }
+        if ($Role -eq 'Critic') {
+            $nextCall | Add-Member -NotePropertyName CriticRequests -NotePropertyValue @($CriticRequests | Select-Object Id, Message)
+        }
         Invoke-ReviewLoopOperatorLock $State {
             param($mailbox)
             Import-ReviewLoopOperatorMessages $State $mailbox -PausesOnly
@@ -746,6 +755,9 @@ function Invoke-ConfiguredCodexRole {
         $call | Add-Member -Force -NotePropertyName WorkRevision -NotePropertyValue $workRevision
         $call | Add-Member -Force -NotePropertyName OperatorRevision -NotePropertyValue $operatorRevision
         $call | Add-Member -Force -NotePropertyName OperatorMessageIds -NotePropertyValue @($operatorMessages | ForEach-Object Id)
+        if ($Role -eq 'Critic') {
+            $call.OperatorMessageIds = @($CriticRequests | ForEach-Object Id)
+        }
         $call | Add-Member -Force -NotePropertyName CoveredReviewCount -NotePropertyValue (
             [int](Get-ReviewLoopObjectProperty -Object $State.$activeCallProperty -Name "CoveredReviewCount" -Default 0))
         $call | Add-Member -Force -NotePropertyName RepositoryHead `
@@ -753,6 +765,13 @@ function Invoke-ConfiguredCodexRole {
         $call | Add-Member -Force -NotePropertyName WorktreeFingerprint `
             -NotePropertyValue ([string]$roleEndSnapshot.Fingerprint)
         if ([bool]$call.Success) {
+            if ($Role -eq 'Critic') {
+                foreach ($request in @(Get-ReviewLoopPendingCriticRequests $State)) {
+                    if ($request.Id -cin $call.OperatorMessageIds) {
+                        $request.Status = 'handled'; $request.CallId = $CallId
+                    }
+                }
+            }
             if ($Role -eq 'Architect' -and $SchemaName -eq 'architecture-assessment-v2.schema.json') {
                 $call.StructuredResult | Add-Member -Force -NotePropertyName OperatorRevision -NotePropertyValue $operatorRevision
             }
@@ -771,6 +790,11 @@ function Invoke-ConfiguredCodexRole {
         }
         Write-ReviewLoopState -Path $StatePath -State $State | Out-Null
         if ([bool]$call.Success) {
+            if ($Role -eq 'Critic') {
+                foreach ($request in $CriticRequests) {
+                    Write-ReviewLoopStatus -Message "$($request.Id) handled by Critic" -Kind Info
+                }
+            }
             foreach ($message in $operatorMessages) {
                 if ((Get-ReviewLoopObjectProperty $message -Name Kind -Default '') -eq 'architect_reassessment') { continue }
                 Write-ReviewLoopStatus -Message "$($message.Id) delivered to $Role" -Kind Info

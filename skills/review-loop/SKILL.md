@@ -126,6 +126,33 @@ run output. Correct the cause and publish a new message only if still relevant.
 Never silently carry old requests into another run, change an existing message,
 or edit the checkpoint to mark it delivered. `-Help` shows the command interface.
 
+## One-time Critic requests
+
+Send concrete product counter-evidence to the Architect; use
+`-ReassessArchitect` when an existing decision must be reconsidered before more
+implementation or acceptance. For evidenced recurring problems in the working
+process, request the existing advisory Critic when needed:
+
+```powershell
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -RequestCritic -Message 'Repeated repairs still assume X. Evidence: assessment-3.json, test-4.log.'
+```
+
+Give a short reason and optional evidence references, not another run summary.
+Consider existing criticism and the participants' response first. Do not repeat
+the same request without new evidence. Elapsed time alone does not justify
+negative criticism; the Critic judges the reason independently.
+
+This requests one call at the next legal cycle boundary before a native review,
+even with automatic critiques disabled. A regularly due call handles the request
+too. It changes no configuration and interrupts no Fixer, assessment, test, gate
+or commit. Multiple selected requests share one call; later arrivals remain
+pending. Publication is not handling: `handled by Critic` follows a validated
+result. Pending and interrupted requests survive resume; completed calls are not
+repeated. Existing review budgets still apply. Completion takes precedence and
+marks pending requests `superseded: run completed`; completed runs reject new
+requests. Keep the ID for identical retries. This mode has no `-To`,
+`-RequireDelivery`, `-PauseAt` or `-ReassessArchitect`.
+
 ## Controlled pauses
 
 Use the same run-scoped publisher with a reason and one boundary:

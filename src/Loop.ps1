@@ -4291,18 +4291,25 @@ function Invoke-ReviewLoopCriticGate {
     )
 
     Update-ReviewLoopLiveConfig -Config $Config
+    Sync-ReviewLoopOperatorMessages -State $State -StatePath $StatePath
     $completedCount = Get-ReviewLoopCompletedReviewCount -State $State
     $previous = Get-ReviewLoopLatestCritique -State $State
     $covered = [int](Get-ReviewLoopObjectProperty -Object $previous -Name "CoveredReviewCount" -Default 0)
     $pending = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveCriticCall"
     $startAfter = [int]$Config.CriticStartAfterReviews
+    $requests = @(if ($null -ne $pending) {
+        @((Get-ReviewLoopObjectProperty $pending -Name CriticRequests -Default @()))
+    } else { Get-ReviewLoopPendingCriticRequests $State | Select-Object Id, Message })
     if ($null -eq $pending) {
-        if ($startAfter -eq 0 -or $completedCount -lt $startAfter -or $completedCount -le $covered) {
+        $automaticDue = $startAfter -gt 0 -and $completedCount -ge $startAfter -and $completedCount -gt $covered
+        if (-not $automaticDue -and $requests.Count -eq 0) {
             return
         }
         # New critiques belong only to the boundary before the next native review.
         # A saved Critic call is recovered independently, including legacy mid-round calls.
-        if (-not (Test-ReviewLoopCycleBoundary -State $State)) {
+        if (-not (Test-ReviewLoopCycleBoundary -State $State) -or $null -ne $State.PendingCommit -or
+            $null -ne $State.ActiveHostGateRecovery -or $null -ne $State.Operator.InterruptedFixerCall -or
+            $State.Status -eq 'completed') {
             return
         }
     }
@@ -4337,6 +4344,10 @@ function Invoke-ReviewLoopCriticGate {
         }
     }
     $callId = if ($null -ne $pending) { [string]$pending.CallId } else { "critic-{0:d4}" -f $completedCount }
+    if ($null -eq $pending -and $requests.Count -gt 0) {
+        $requestKey = Get-ReviewLoopSha256 (ConvertTo-ReviewLoopJsonCompact @($requests.Id | Sort-Object))
+        $callId += "-operator-$requestKey"
+    }
     $context = Get-ReviewLoopRepositoryContext -State $State -RepoPath $RepoPath
     $context | Add-Member -NotePropertyName UnfinishedFixerWork -NotePropertyValue $unfinished
     $context | Add-Member -NotePropertyName CriticStartAfterReviews -NotePropertyValue $startAfter
@@ -4353,11 +4364,14 @@ function Invoke-ReviewLoopCriticGate {
         CRITIQUES = ConvertTo-ReviewLoopJsonCompact @($State.RoleCalls | Where-Object {
             $_.Role -eq "Critic" -and $_.Success
         } | Select-Object CallId, CoveredReviewCount, StructuredResult)
+        OPERATOR_REQUESTS = ConvertTo-ReviewLoopJsonCompact @($requests)
     }
-    Write-ReviewLoopStatus -Message "Critic due after $completedCount completed native reviews (previously covered: $covered)." -Kind Review
+    Write-ReviewLoopStatus -Message "Critic due after $completedCount completed native reviews (previously covered: $covered; operator requests: $($requests.Count))." -Kind Review
+    $requestArguments = @{}
+    if ($requests.Count -gt 0) { $requestArguments.CriticRequests = $requests }
     $call = Invoke-ReviewLoopRoleCall -Config $Config -Role "Critic" -RepoPath $RepoPath `
         -Speed $Speed -Prompt $prompt -LogRoot $RunRoot -SchemaName "critic-v2.schema.json" `
-        -CodexPath $CodexPath -CallId $callId -State $State -StatePath $StatePath
+        -CodexPath $CodexPath -CallId $callId -State $State -StatePath $StatePath @requestArguments
     Assert-ReviewLoopRoleSuccess $call
     Write-ReviewLoopStatus -Message "Critic to Reviewer: $($call.StructuredResult.reviewerFeedback)" -Kind Review
     Write-ReviewLoopStatus -Message "Critic to Architect: $($call.StructuredResult.architectFeedback)" -Kind Review
@@ -4513,6 +4527,10 @@ function Complete-ReviewLoopRun {
             return $false
         }
         Invoke-ReviewLoopPauseBoundary $State $StatePath BeforeCompletion -Locked
+        foreach ($request in @(Get-ReviewLoopPendingCriticRequests $State)) {
+            $request.Status = 'superseded'
+            Write-ReviewLoopStatus -Message "$($request.Id) superseded: run completed" -Kind Info
+        }
         foreach ($message in @(Get-ReviewLoopPendingOperatorMessages $State)) {
             foreach ($delivery in @($message.Deliveries | Where-Object Status -EQ pending)) {
                 $delivery.Status = 'rejected'

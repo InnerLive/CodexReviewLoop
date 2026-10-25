@@ -2327,12 +2327,17 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
         $installed | Should Match 'process has exited'
         $installed | Should Match 'Do not restart automatically'
         $installed | Should Match '-ReassessArchitect'
+        $installed | Should Match '-RequestCritic'
+        $installed | Should Match 'without new evidence'
+        $installed | Should Match 'Completion takes precedence'
+        Test-Path (Join-Path $destination 'review-loop/../prompting/SKILL.md') | Should Be $true
         $installed | Should Match 'user-authorized assignment change'
         (Get-FileHash (Join-Path $destination 'review-loop/SKILL.md')).Hash |
             Should Be (Get-FileHash (Join-Path $root 'skills/review-loop/SKILL.md')).Hash
         $operator = Join-Path $binding.repositoryPath 'operator-message.ps1'
         Test-Path $operator | Should Be $true
         (& $operator -Help | Out-String) | Should Match 'PauseAt'
+        (& $operator -Help | Out-String) | Should Match 'RequestCritic'
     }
 
     It "uses primary skills and path even when launched from a linked worktree" {

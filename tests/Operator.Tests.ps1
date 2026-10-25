@@ -96,6 +96,349 @@ function Clear-OperatorCase {
         $script:operatorCase=$null
 }
 
+function Invoke-OperatorCritic {
+    param($Case)
+    & (Get-Module CodexReviewLoop) {
+        param($c,$fake)
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $config = Import-ReviewLoopConfig -ConfigPath $c.Profile -RepoPath $c.Repo
+        Invoke-ReviewLoopCriticGate -Config $config -State $s -StatePath $c.Paths.StatePath `
+            -Ledger (New-ReviewLoopLedger $c.Repo) -RepoPath $c.Repo -Speed standard `
+            -RunRoot $c.Paths.RunRoot -CodexPath $fake
+    } $Case $fakeCodex
+}
+
+Describe 'One-time Operator Critic requests' {
+    AfterEach {
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
+        Clear-OperatorCase
+    }
+
+    It 'publishes immutable isolated requests with the existing identity and message limits' {
+        $c = New-OperatorCase
+        $id = [guid]::NewGuid().ToString('D')
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'CAUSE evidence.log' -Id $id | Should Be $id
+        (& (Join-Path $root 'operator-message.ps1') $c.Paths.RunRoot -RequestCritic -Message 'CAUSE evidence.log' -Id $id) | Should Match "$id requested Critic"
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'different' -Id $id } | Should Throw 'different content'
+        foreach ($extra in @(@{To='Architect'}, @{RequireDelivery=$true}, @{PauseAt='AfterRole'}, @{ReassessArchitect=$true})) {
+            $caught = $false
+            try { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message mixed @extra -ErrorAction Stop }
+            catch { $caught = $true }
+            $caught | Should Be $true
+        }
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message ('x' * 4001) } | Should Throw '4000'
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message ' ' } | Should Throw '4000'
+        @((Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests).Count | Should Be 0
+        Invoke-OperatorCritic $c
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Operator.Version | Should Be 4
+        $s.Operator.Requests[0].Status | Should Be handled
+        $s.Operator.Requests[0].RequireDelivery | Should Be $false
+        @($s.Operator.Requests[0].Deliveries).Count | Should Be 0
+        $s.Operator.Revisions.Architect | Should Be 0
+        @(& git -C $c.Repo status --porcelain).Count | Should Be 0
+    }
+
+    It 'runs explicitly with disabled or not-yet-due automation and coalesces a due automatic critique' {
+        foreach ($threshold in @(0,5,1)) {
+            $c = New-OperatorCase
+            (Get-Content -Raw $c.Profile).Replace('CriticStartAfterReviews=0',"CriticStartAfterReviews=$threshold") | Set-Content $c.Profile
+            & (Get-Module CodexReviewLoop) {
+                param($c)
+                $s = Read-ReviewLoopState $c.Paths.StatePath
+                $s.RoleCalls = @([pscustomobject]@{ Role='Reviewer'; Success=$true; CallId='review-01' })
+                $s.ReviewCycle = 1; $s.Stage = 'clean_review'
+                Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+            } $c
+            $profileHash = (Get-FileHash $c.Profile).Hash
+            $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'ROOT_CAUSE evidence.log'
+            Invoke-OperatorCritic $c
+            Invoke-OperatorCritic $c
+            $calls = @(Get-OperatorCalls)
+            $calls.Count | Should Be 1
+            $calls[0].prompt | Should Match ROOT_CAUSE
+            $calls[0].prompt | Should Match $id
+            $calls[0].prompt | Should Match 'Run retrospective:|Previous critiques:'
+            (Get-FileHash $c.Profile).Hash | Should Be $profileHash
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            @($s.RoleCalls | Where-Object Role -eq Critic).Count | Should Be 1
+            $s.RoleCalls[-1].CoveredReviewCount | Should Be 1
+            $s.ReviewCyclesThisInvocation | Should Be 0
+            $s.CleanPasses | Should Be 0
+            Clear-OperatorCase
+        }
+    }
+
+    It 'batches pending requests once and uses distinct calls for new requests at the same review count' {
+        $c = New-OperatorCase
+        $first = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message FIRST
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message FIRST -Id $first | Should Be $first
+        $second = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message SECOND
+        Invoke-OperatorCritic $c
+        $third = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message THIRD
+        Invoke-OperatorCritic $c
+        Invoke-OperatorCritic $c
+        $calls = Get-OperatorCalls
+        $calls.Count | Should Be 2
+        $calls[0].prompt | Should Match FIRST
+        $calls[0].prompt | Should Match SECOND
+        $calls[1].prompt | Should Match THIRD
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        @($s.Operator.Requests | Where-Object Status -eq handled).Count | Should Be 3
+        @($s.RoleCalls[0].OperatorMessageIds | Sort-Object) | Should Be @(@($first,$second) | Sort-Object)
+        $s.RoleCalls[1].OperatorMessageIds | Should Be @($third)
+        $s.RoleCalls[0].CallId | Should Not Be $s.RoleCalls[1].CallId
+    }
+
+    It 'keeps arrivals during a running critique pending and routes feedback separately' {
+        $c = New-OperatorCase
+        $first = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message FIRST
+        Set-OperatorPlans $c @(@{operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='LATE_EVIDENCE'})})
+        Invoke-OperatorCritic $c
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        ($s.Operator.Requests | Where-Object Id -eq $first).Status | Should Be handled
+        ($s.Operator.Requests | Where-Object Message -eq LATE_EVIDENCE).Status | Should Be pending
+        @($s.RoleCalls[-1].OperatorMessageIds) | Should Be @($first)
+        (Get-OperatorCalls)[0].prompt | Should Not Match LATE_EVIDENCE
+        Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
+        (Invoke-OperatorRole $c -Role Architect).Success | Should Be $true
+        (Invoke-OperatorRole $c -Role Fixer).Success | Should Be $true
+        (Invoke-OperatorRole $c -Role Reviewer).Success | Should Be $true
+        $calls = Get-OperatorCalls
+        $calls[1].prompt | Should Match 'Architect: make coherent decisions'
+        $calls[1].prompt | Should Not Match 'Reviewer: examine|Fixer: implement'
+        $calls[2].prompt | Should Match 'Fixer: implement'
+        $calls[2].prompt | Should Not Match 'Reviewer: examine|Architect: make'
+        # Preserve the native Reviewer's existing guidance surface and recorded Critic binding.
+        ($calls[3].arguments -join ' ') | Should Match 'review --base HEAD'
+        ($calls[3].arguments -join ' ') | Should Not Match 'Architect: make|Fixer: implement'
+        (Read-ReviewLoopState $c.Paths.StatePath).RoleCalls[-1].CriticId | Should Be $s.RoleCalls[-1].CallId
+    }
+
+    It 'defers requests throughout work and sealed commit transactions' {
+        $c = New-OperatorCase
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message DEFER
+        foreach ($stage in @('fixing','verifying','verified','commit_preparing','commit_pending','reviewed')) {
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.Stage = $stage
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+            Invoke-OperatorCritic $c
+            (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[0].Status | Should Be pending
+        }
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.Stage = 'fix_committed'; $s.PendingCommit = [pscustomobject]@{marker='owned'}
+            Close-ReviewLoopOperatorBoundary $s $c.Paths.StatePath commit | Out-Null
+        } $c
+        Invoke-OperatorCritic $c
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.PendingCommit.marker | Should Be owned
+        $s.Operator.Boundary.Kind | Should Be commit
+        $s.PendingCommit = $null
+        Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        Invoke-OperatorCritic $c
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[0].Status | Should Be handled
+    }
+
+    It 'finishes fixing testing assessment and commit gates before one requested critique' {
+        $c = New-OperatorCase
+        $before = (& git -C $c.Repo rev-parse HEAD).Trim()
+        $test = Join-Path $c.Root 'targeted.ps1'
+        $gate = Join-Path $c.Root 'gate.ps1'
+        $marker = Join-Path $c.Root 'gate-ran.txt'
+        @"
+& '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -RequestCritic -Message 'TARGETED_EVIDENCE' | Out-Null
+"@ | Set-Content $test
+        @"
+if (-not (Test-Path -LiteralPath '$marker')) {
+    & '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -RequestCritic -Message 'GATE_EVIDENCE' | Out-Null
+    Set-Content -LiteralPath '$marker' executed
+}
+"@ | Set-Content $gate
+        (Get-Content -Raw $c.Profile).Replace('HostGates=@()', "HostGates=@(@{Name='request gate';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})") | Set-Content $c.Profile
+        $fixer = @{schemaVersion='3.0';summary='Fixed';targetedTest=@{available=$true;executable='pwsh';arguments=@('-NoProfile','-File',$test)}} | ConvertTo-Json -Depth 6 -Compress
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message fix -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(
+            @{result=$fixer;mutations=@(@{path='README.txt';content='fixed'});operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='FIXER_EVIDENCE'})},
+            @{result=(Get-OperatorAcceptResult);operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='ASSESSMENT_EVIDENCE'})},
+            @{}, @{result='No findings.'})
+        $result = Invoke-OperatorLoop $c
+        if ($result.Status -ne 'completed') { throw $result.Reason }
+        (& git -C $c.Repo rev-list --count "$before..HEAD") | Should Be 1
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $requests = @($s.Operator.Requests | Where-Object Kind -eq critic_request)
+        $requests.Count | Should Be 4
+        @($requests | Where-Object Status -ne handled).Count | Should Be 0
+        @($requests.CallId | Select-Object -Unique).Count | Should Be 1
+        $calls = @(Get-OperatorCalls | Where-Object { $_.phase -notin @('orientation','completion') })
+        [IO.Path]::GetFileName($calls[0].schemaPath) | Should Be fixer-result-v3.schema.json
+        [IO.Path]::GetFileName($calls[1].schemaPath) | Should Be architecture-assessment-v2.schema.json
+        [IO.Path]::GetFileName($calls[2].schemaPath) | Should Be critic-v2.schema.json
+        $calls[2].prompt | Should Match FIXER_EVIDENCE
+        $calls[2].prompt | Should Match TARGETED_EVIDENCE
+        $calls[2].prompt | Should Match ASSESSMENT_EVIDENCE
+        $calls[2].prompt | Should Match GATE_EVIDENCE
+        $critic = $s.RoleCalls | Where-Object Role -eq Critic
+        $critic.RepositoryHead | Should Be $s.CurrentHead
+        @($s.RoleCalls | Where-Object Role -eq Fixer).Count | Should Be 1
+        $s.ActiveHostGateRecovery | Should BeNullOrEmpty
+        $s.PendingCommit | Should BeNullOrEmpty
+    }
+
+    It 'recovers a prepared commit before handling a later Critic request' {
+        $c = New-OperatorCase
+        $before = (& git -C $c.Repo rev-parse HEAD).Trim()
+        Set-Content (Join-Path $c.Repo 'README.txt') candidate
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.ActiveFindingSource = 'operator'; $s.ActiveClusterId = 'pending-critic'
+            $s.Stage = 'commit_preparing'
+            Write-ReviewLoopLedger $c.Paths.LedgerPath (New-ReviewLoopLedger $c.Repo) | Out-Null
+            Close-ReviewLoopOperatorBoundary $s $c.Paths.StatePath commit | Out-Null
+            $s.PendingCommit = [pscustomobject]@{
+                PreHead=$s.CurrentHead; PatchFingerprint=Get-ReviewLoopWorktreeFingerprint $c.Repo
+                ExpectedTree='';ExpectedCommit='';Message='Test: prepared candidate';NeedsCurrentGates=$false
+                OperatorBoundaryId=$s.Operator.Boundary.Id
+                Verification=[pscustomobject]@{WorkRevision=0;workOutcomes=@();goalComplete=$false}
+            }
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message AFTER_PREPARATION
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        (& git -C $c.Repo rev-list --count "$before..HEAD") | Should Be 1
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        ($s.Operator.Requests | Where-Object Id -eq $id).Status | Should Be handled
+        ($s.RoleCalls | Where-Object Role -eq Critic).RepositoryHead | Should Be $s.CurrentHead
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1
+        $s.PendingCommit | Should BeNullOrEmpty
+    }
+
+    It 'preserves a request across a pause before start and never repeats the handled call on resume' {
+        $c = New-OperatorCase
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message RESUME
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'before start' | Out-Null
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        ($s = Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Out-Null
+        ($s.Operator.Requests | Where-Object Id -eq $id).Status | Should Be pending
+        Set-OperatorPlans $c @(@{operatorMessages=@((New-OperatorPausePlan $c AfterRole))})
+        (Invoke-OperatorLoop $c).Status | Should Be paused
+        ($s = Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Out-Null
+        ($s.Operator.Requests | Where-Object Id -eq $id).Status | Should Be handled
+        Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1
+    }
+
+    It 'leaves requests pending at an exhausted review budget and handles them after explicit resume' {
+        $c = New-OperatorCase
+        (Get-Content -Raw $c.Profile).Replace('MaxReviewCycles=4','MaxReviewCycles=1').Replace('CleanPassesRequired=1','CleanPassesRequired=2') | Set-Content $c.Profile
+        Set-OperatorPlans $c @(@{result='No findings.';operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='NEXT_INVOCATION'})})
+        (Invoke-OperatorLoop $c).Status | Should Be limit_reached
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        ($s.Operator.Requests | Where-Object Kind -eq critic_request).Status | Should Be pending
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 0
+        Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1
+        (Read-ReviewLoopState $c.Paths.StatePath).ReviewCycle | Should Be 2
+    }
+
+    It 'retains failed request bindings with or without a thread and restores Critic mutations on resume' {
+        foreach ($emitThread in @($true,$false)) {
+            $c = New-OperatorCase
+            & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = {param($seconds)} }
+            $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message ORIGINAL
+            $env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE = '1'
+            Set-OperatorPlans $c @(@{exitCode=1;emitThread=$emitThread;mutations=@(@{path='README.txt';content='critic mutation'})},
+                @{exitCode=1;emitThread=$emitThread}, @{exitCode=1;emitThread=$emitThread})
+            $caught = $false
+            try { Invoke-OperatorCritic $c } catch { $caught = $true }
+            $caught | Should Be $true
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.ActiveCriticCall.CriticRequests[0].Id | Should Be $id
+            $s.Operator.Requests[0].Status | Should Be pending
+            (Get-Content (Join-Path $c.Repo 'README.txt')) | Should Be initial
+            $callId = $s.ActiveCriticCall.CallId
+            $thread = $s.ActiveCriticCall.ThreadId
+            $late = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message LATE
+            Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_EXIT_CODE,Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
+            Invoke-OperatorCritic $c
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $s.RoleCalls[-1].CallId | Should Be $callId
+            @($s.RoleCalls[-1].OperatorMessageIds) | Should Be @($id)
+            ($s.Operator.Requests | Where-Object Id -eq $late).Status | Should Be pending
+            if ($emitThread) { (Get-OperatorCalls)[-1].resumeThreadId | Should Be $thread }
+            else { (Get-OperatorCalls)[-1].prompt | Should Match ORIGINAL }
+            Invoke-OperatorCritic $c
+            (Read-ReviewLoopState $c.Paths.StatePath).RoleCalls[-1].CallId | Should Not Be $callId
+            Clear-OperatorCase
+        }
+    }
+
+    It 'keeps an invalid Critic result pending until a valid structured result is recovered' {
+        $c = New-OperatorCase
+        & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = {param($seconds)} }
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message INVALID | Out-Null
+        $env:CODEX_REVIEW_LOOP_FAKE_RESULT = '{"schemaVersion":"invalid"}'
+        $caught = $false
+        try { Invoke-OperatorCritic $c } catch { $caught = $true }
+        $caught | Should Be $true
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $s.Operator.Requests[0].Status | Should Be pending
+        $s.ActiveCriticCall | Should Not BeNullOrEmpty
+        Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_RESULT
+        Invoke-OperatorCritic $c
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[0].Status | Should Be handled
+    }
+
+    It 'lets completion supersede a request published during final assessment and rejects new requests afterwards' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{result='No findings.'}, @{phase='completion';result=(Get-OperatorAcceptResult);operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='FINAL_PHASE'})})
+        $result = Invoke-OperatorLoop $c
+        if ($result.Status -ne 'completed') { throw $result.Reason }
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        $request = $s.Operator.Requests | Where-Object Kind -eq critic_request
+        $request.Status | Should Be superseded
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 0
+        { Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message NEW } | Should Throw 'completion is sealed'
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message FINAL_PHASE -Id $request.Id | Should Be $request.Id
+    }
+
+    It 'supersedes an already pending request when clean completion takes precedence' {
+        $c = New-OperatorCase
+        Set-OperatorPlans $c @(@{result='No findings.';operatorMessages=@(@{runRoot=$c.Paths.RunRoot;requestCritic=$true;message='CLEAN_GATE'})})
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[0].Status | Should Be superseded
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 0
+    }
+
+    It 'rejects wrong-run and malformed Critic requests without changing role revisions' {
+        $c = New-OperatorCase
+        $wrong = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message WRONG
+        $bad = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message BAD
+        & (Get-Module CodexReviewLoop) {
+            param($c,$wrong,$bad)
+            $s = Read-ReviewLoopState $c.Paths.StatePath
+            $mailbox = Get-ReviewLoopOperatorMailbox $s
+            $r = Read-ReviewLoopJson (Join-Path $mailbox "$wrong.json")
+            $r.Run.RunId = 'other-run'
+            Write-ReviewLoopUtf8File (Join-Path $mailbox "$wrong.json") ($r | ConvertTo-Json -Depth 10)
+            $r = Read-ReviewLoopJson (Join-Path $mailbox "$bad.json")
+            $r | Add-Member RequireDelivery $true
+            Write-ReviewLoopUtf8File (Join-Path $mailbox "$bad.json") ($r | ConvertTo-Json -Depth 10)
+        } $c $wrong $bad
+        Invoke-OperatorCritic $c
+        $s = Read-ReviewLoopState $c.Paths.StatePath
+        ($s.Operator.Requests | Where-Object Id -eq $wrong).Rejection | Should Be 'run identity mismatch'
+        ($s.Operator.Requests | Where-Object Id -eq $bad).Rejection | Should Be 'invalid request'
+        $s.Operator.Revisions.Architect | Should Be 0
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+    }
+}
+
 Describe 'Durable operator messages' {
     AfterEach { Clear-OperatorCase }
 
@@ -305,23 +648,28 @@ Describe 'Durable operator messages' {
         $mailbox=& (Get-Module CodexReviewLoop) {param($s) Get-ReviewLoopOperatorMailbox $s} $s
         $path=Join-Path $mailbox "$id.json"
         $request=Get-Content $path -Raw | ConvertFrom-Json
-        $request.Version=4
+        $request.Version=5
         $request | ConvertTo-Json -Depth 10 | Set-Content $path
         (Invoke-OperatorRole $c).Success | Should Be $true
         $s=Read-ReviewLoopState $c.Paths.StatePath
         $s.Operator.Requests[0].Rejection | Should Be 'unknown request version'
-        $s.Operator.Version=4
+        $s.Operator.Version=5
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         {Read-ReviewLoopState $c.Paths.StatePath} | Should Throw 'Unknown operator state version'
         $s.Operator.Version=1
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         $upgraded=Read-ReviewLoopState $c.Paths.StatePath
-        $upgraded.Operator.Version | Should Be 3
+        $upgraded.Operator.Version | Should Be 4
+        $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
+        $upgraded.Operator.Version=3
+        $upgraded | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
+        $upgraded=Read-ReviewLoopState $c.Paths.StatePath
+        $upgraded.Operator.Version | Should Be 4
         $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
         $upgraded.Operator.Version=2
         $upgraded | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         $upgraded=Read-ReviewLoopState $c.Paths.StatePath
-        $upgraded.Operator.Version | Should Be 3
+        $upgraded.Operator.Version | Should Be 4
         $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
     }
 
@@ -561,7 +909,7 @@ Describe 'Targeted Architect reassessment' {
         }
         (Invoke-OperatorRole $c).Success | Should Be $true
         $s=Read-ReviewLoopState $c.Paths.StatePath
-        $s.Operator.Version | Should Be 3
+        $s.Operator.Version | Should Be 4
         $s.Operator.Requests[0].Deliveries[0].Status | Should Be pending
         (Get-OperatorCalls)[0].prompt | Should Not Match 'assumption X failed'
         & (Get-Module CodexReviewLoop) {

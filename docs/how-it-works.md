@@ -75,8 +75,18 @@ for resume. The durable count ignores failed calls and repeated attempts of
 the same native review. Feedback does not reset clean passes or consume the
 review budget. New criticism never interrupts a Fixer attempt, Architect
 assessment, gate, or commit, including on resume. `CriticStartAfterReviews = 0`
-disables new critiques; saved feedback remains available and an interrupted
+disables automatic critiques; saved feedback remains available and an interrupted
 critique is still recovered.
+
+The Operator can request one critique with `operator-message.ps1 $runRoot
+-RequestCritic -Message 'Reason and optional evidence references.'`, independently
+of that automatic threshold. The same Critic receives the selected request IDs
+and reasons alongside its normal evidence. All requests selected at the boundary
+share one call, including a regularly due critique; requests arriving later wait
+for the next legal boundary. Selection is bound to the active call, and successful
+feedback and request consumption are checkpointed atomically. An interrupted
+call resumes with its original selection. Completion takes precedence and marks
+unhandled requests as superseded without reopening the run.
 
 Critic output and its covered review count are saved atomically with the role
 result. Its own active-call checkpoint preserves an interrupted work role.

@@ -32,7 +32,7 @@ a `RepositoryPath` cannot be used for another repository.
 | `LogRoot` | `.\runs` | Ledger, checkpoints, and logs |
 | `CleanPassesRequired` | `2` | Live-reloaded completion gate |
 | `MaxReviewCycles` | `12` | Native review calls allowed per script invocation |
-| `CriticStartAfterReviews` | `5` | Start critiques at this many completed native reviews, then after every finished review/fix round; `0` disables new critiques |
+| `CriticStartAfterReviews` | `5` | Start automatic critiques at this many completed native reviews, then after every finished review/fix round; `0` disables automatic critiques |
 | `LessonsLearnedCommitThreshold` | `6` | Verified loop commits required for the conditional completion analysis; `0` disables it |
 | `ReviewAfterLessonsLearnedCommit` | `$false` | Require normal clean native reviews after a real lessons-learned commit |
 | `MaxFixAttempts` | `2` | Live-reloaded Fixer calls before returning to native review |
@@ -117,6 +117,10 @@ Critic feedback is durable run context, not a replacement for
 `ReviewerInstructions`. Each Reviewer or Architect call records the critique
 it received, preventing reuse of a cached decision predating new feedback.
 Critiques do not consume `MaxReviewCycles` or reset clean passes.
+
+Operator `-RequestCritic` requests are independent of `CriticStartAfterReviews`,
+including zero. They share a call with an automatic critique due at the same
+boundary and never rewrite this setting or bypass the invocation review budget.
 
 Other settings remain fixed for an active invocation. In particular, changing
 `Name`, `RepositoryPath`, `ReviewBase`, or `LogRoot` changes new-run identity.

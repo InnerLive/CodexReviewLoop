@@ -401,6 +401,30 @@ text requests reconstruction. The existing work revision and execution
 requalification remain the only task authority. Inspect the normal Architect
 result rather than requesting a separate acknowledgment or approval.
 
+### One-time Critic request
+
+```powershell
+& .\operator-message.ps1 $runRoot -RequestCritic -Message 'Repeated repairs still assume X. Evidence: assessment-3.json, test-4.log.'
+```
+
+Use this for evidenced working-process problems; direct product counter-evidence
+to the Architect, using `-ReassessArchitect` when its decision must be revisited.
+Check existing criticism and subsequent decisions before sending another request.
+Do not repeat a request without new evidence or infer poor work from runtime alone.
+
+The command reports publication only. The existing Critic handles the selected
+requests once at the next cycle boundary before native review, even when automatic
+critiques are disabled. A regularly due Critic handles them in the same call.
+Nothing interrupts a Fixer, assessment, test, gate or commit. Late arrivals wait;
+pending requests survive a pause or exhausted invocation budget. Interrupted
+Critic calls retain their selected requests and normal repository recovery.
+`handled by Critic` follows valid feedback and verified repository restoration.
+Completion takes precedence: remaining requests report `superseded: run completed`.
+New requests after completion are rejected; retrying an identical published ID
+is idempotent. This mode excludes `-To`, `-RequireDelivery`, `-PauseAt` and
+`-ReassessArchitect`. Reasons use the existing 1–4000 character message limit.
+The mailbox remains outside the reviewed worktree.
+
 ## Controlled operator pauses
 
 Publish a run-scoped request with `operator-message.ps1 <RunRoot> -PauseAt
@@ -436,10 +460,10 @@ roles or targeted tests solely because of the pause. Reached request IDs cannot
 trigger again; other pending requests remain active. Existing identity and
 execution requalification rules still apply.
 
-Operator state version 1 upgrades to version 2 on the next checkpoint write,
-preserving run identity, deliveries and sealed boundaries. Older tools reject
-version 2 instead of ignoring pending pauses. Version 1 message envelopes remain
-supported; pause envelopes use version 2.
+Operator state versions 1–3 upgrade additively to version 4 on the next checkpoint
+write, preserving run identity, requests, deliveries and sealed boundaries.
+Unknown newer versions are rejected. Message envelopes remain version 1, pause
+envelopes version 2, Architect reassessments version 3 and Critic requests version 4.
 
 Wait for process exit and release of the repository lease before taking over;
 the persisted state alone is not evidence of resource release. Preserve HEAD,
