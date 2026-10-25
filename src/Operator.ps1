@@ -179,6 +179,50 @@ function Send-ReviewLoopOperatorMessage {
     return $Id
 }
 
+function Read-ReviewLoopOperatorRequest {
+    param([IO.FileInfo]$File, [string]$Identity)
+    $id = $File.BaseName
+    $reason = ''
+    $request = $null
+    try {
+        $request = Read-ReviewLoopJson $File.FullName
+        $guid = [guid]::Empty
+        if (-not [guid]::TryParseExact($id, 'D', [ref]$guid) -or $request.Id -cne $id) {
+            throw 'invalid message ID'
+        }
+        if ($request.Version -notin @(1,2,3,4)) { throw 'unknown request version' }
+        if ((ConvertTo-ReviewLoopJsonCompact $request.Run) -cne $Identity) { throw 'run identity mismatch' }
+        if ($request.Version -eq 2) {
+            if ($request.Kind -cne 'pause' -or $request.PauseAt -cnotin @('AfterRole','AfterRound','BeforeCommit','BeforeCompletion') -or
+                $request.Message -isnot [string] -or [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
+                $null -eq $request.Target -or $request.Target.CallId -isnot [string] -or $request.Target.Cycle -isnot [long] -and $request.Target.Cycle -isnot [int] -or
+                [long]$request.Target.Cycle -lt 0 -or $request.Target.Stage -isnot [string] -or
+                $request.Target.Boundary -cnotin @('','commit','completion')) { throw 'invalid request' }
+        }
+        elseif ($request.Version -eq 4) {
+            if ($request.Kind -cne 'critic_request' -or $request.Message -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
+                @($request.PSObject.Properties.Name | Where-Object { $_ -cnotin @('Version','Kind','Id','Run','Message') }).Count -gt 0) {
+                throw 'invalid request'
+            }
+        }
+        elseif ($request.RequireDelivery -isnot [bool] -or $request.Message -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
+            @($request.To).Count -eq 0 -or @($request.To | Where-Object { $_ -cnotin @('Reviewer','Architect','Fixer') }).Count -gt 0 -or
+            @($request.To | Select-Object -Unique).Count -ne @($request.To).Count) { throw 'invalid message' }
+        if ($request.Version -eq 3 -and ($request.Kind -cne 'architect_reassessment' -or
+            @($request.To).Count -ne 1 -or $request.To[0] -cne 'Architect' -or -not $request.RequireDelivery)) {
+            throw 'invalid request'
+        }
+    }
+    catch {
+        $reason = if ($_.Exception.Message -cin @('invalid message ID','unknown request version','run identity mismatch','invalid message')) {
+            $_.Exception.Message
+        } else { 'invalid request' }
+    }
+    return [pscustomobject]@{ Request = $request; Rejection = $reason }
+}
+
 function Import-ReviewLoopOperatorMessages {
     param([object]$State, [string]$Mailbox, [switch]$PausesOnly)
     Initialize-ReviewLoopOperator $State
@@ -186,44 +230,9 @@ function Import-ReviewLoopOperatorMessages {
     foreach ($file in @(Get-ChildItem -LiteralPath $Mailbox -Filter '*.json' -File | Sort-Object Name)) {
         $id = $file.BaseName
         if (@($State.Operator.Requests | Where-Object Id -CEQ $id).Count -gt 0) { continue }
-        $reason = ''
-        $request = $null
-        try {
-            $request = Read-ReviewLoopJson $file.FullName
-            $guid = [guid]::Empty
-            if (-not [guid]::TryParseExact($id, 'D', [ref]$guid) -or $request.Id -cne $id) {
-                throw 'invalid message ID'
-            }
-            if ($request.Version -notin @(1,2,3,4)) { throw 'unknown request version' }
-            if ((ConvertTo-ReviewLoopJsonCompact $request.Run) -cne $identity) { throw 'run identity mismatch' }
-            if ($request.Version -eq 2) {
-                if ($request.Kind -cne 'pause' -or $request.PauseAt -cnotin @('AfterRole','AfterRound','BeforeCommit','BeforeCompletion') -or
-                    $request.Message -isnot [string] -or [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
-                    $null -eq $request.Target -or $request.Target.CallId -isnot [string] -or $request.Target.Cycle -isnot [long] -and $request.Target.Cycle -isnot [int] -or
-                    [long]$request.Target.Cycle -lt 0 -or $request.Target.Stage -isnot [string] -or
-                    $request.Target.Boundary -cnotin @('','commit','completion')) { throw 'invalid request' }
-            }
-            elseif ($request.Version -eq 4) {
-                if ($request.Kind -cne 'critic_request' -or $request.Message -isnot [string] -or
-                    [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
-                    @($request.PSObject.Properties.Name | Where-Object { $_ -cnotin @('Version','Kind','Id','Run','Message') }).Count -gt 0) {
-                    throw 'invalid request'
-                }
-            }
-            elseif ($request.RequireDelivery -isnot [bool] -or $request.Message -isnot [string] -or
-                [string]::IsNullOrWhiteSpace($request.Message) -or $request.Message.Length -gt 4000 -or
-                @($request.To).Count -eq 0 -or @($request.To | Where-Object { $_ -cnotin @('Reviewer','Architect','Fixer') }).Count -gt 0 -or
-                @($request.To | Select-Object -Unique).Count -ne @($request.To).Count) { throw 'invalid message' }
-            if ($request.Version -eq 3 -and ($request.Kind -cne 'architect_reassessment' -or
-                @($request.To).Count -ne 1 -or $request.To[0] -cne 'Architect' -or -not $request.RequireDelivery)) {
-                throw 'invalid request'
-            }
-        }
-        catch {
-            $reason = if ($_.Exception.Message -cin @('invalid message ID','unknown request version','run identity mismatch','invalid message')) {
-                $_.Exception.Message
-            } else { 'invalid request' }
-        }
+        $read = Read-ReviewLoopOperatorRequest -File $file -Identity $identity
+        $request = $read.Request
+        $reason = $read.Rejection
         # Ordinary message sets stay sealed; control requests remain observable.
         if (-not $reason -and $request.Version -eq 1 -and ($PausesOnly -or $null -ne $State.Operator.Boundary)) { continue }
         if (-not $reason -and $request.Version -eq 2) {

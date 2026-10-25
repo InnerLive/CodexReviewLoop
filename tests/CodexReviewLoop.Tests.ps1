@@ -2338,6 +2338,15 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
         Test-Path $operator | Should Be $true
         (& $operator -Help | Out-String) | Should Match 'PauseAt'
         (& $operator -Help | Out-String) | Should Match 'RequestCritic'
+        $status = Join-Path $binding.repositoryPath 'operator-status.ps1'
+        Test-Path $status | Should Be $true
+        (& $status -Help | Out-String) | Should Match 'Since'
+        $installed | Should Match 'Supervise the normal output'
+        $installed | Should Match 'Status only when needed'
+        $installed | Should Match 'configuration\s+reload path'
+        Set-Content (Join-Path $destination 'review-loop/personal-note.md') 'Keep my note.'
+        & (Join-Path $root 'install-skills.ps1') -SkillsPath $destination | Out-Null
+        (Get-Content -Raw (Join-Path $destination 'review-loop/personal-note.md')).Trim() | Should Be 'Keep my note.'
     }
 
     It "uses primary skills and path even when launched from a linked worktree" {

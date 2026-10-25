@@ -340,6 +340,50 @@ Reviewer instructions, role settings, and service tier, then resume the same run
 Archived patches are evidence, not automatically accepted work. A completed and
 integrated task must not be reopened for the upgrade.
 
+## Operator status
+
+Continue following the normal loop output. For re-entry after context loss or
+unclear outstanding interventions, read the exact observed RunRoot:
+
+```powershell
+$status = .\operator-status.ps1 $runRoot | ConvertFrom-Json
+.\operator-status.ps1 $runRoot -Since $status.Cursor
+```
+
+The public `Get-ReviewLoopOperatorStatus` function returns the same object;
+the script emits one compact JSON document, or a JSON error with exit code 1.
+`Saved` contains checkpoint facts: run identity, phase, active role, HEAD,
+review cycle, invocation review count, candidate/commit/recovery summaries and
+an actually saved pause. Unrecorded facts are omitted, including the invocation
+budget limit and remaining budget. No profile or transcript reconstruction fills
+those gaps. A previous reached pause is not presented as a current halt after resume.
+
+`Observed` records the query time, available repository-lease evidence and the
+last terminal file write time (falling back to checkpoint UpdatedAt), with its
+source and age in seconds. A saved running status, saved role or recent output
+does not prove a live process or productive progress. A held repository lease
+identifies neither its owner nor its run; an unavailable probe is omitted.
+This is a point-in-time read, not an atomic snapshot of checkpoint, mailbox,
+terminal and process activity.
+
+`Requests` merges open checkpoint requests and published mailbox requests by ID.
+Publication is distinct from imported/pending handling. Invalid mailbox entries
+show their validation reason without importing or rejecting them on the loop's
+behalf. Finalized requests are not repeated; the normal terminal records their
+outcomes. Reasons are redacted and shortened to 240 characters; full evidence
+remains in the existing request/role artifacts.
+
+`Cursor` is bound to the canonical run identity and a complete-line byte boundary
+in terminal.log. `-Since` adds `Changes.Lines` (at most 50 redacted lines) and
+`Changes.HasMore`; use the returned cursor for subsequent pages or queries.
+Incomplete last lines wait until complete. A cursor for another run, a shortened
+log or a mismatching nearby byte signature fails explicitly; request a fresh
+status deliberately. This small signature is not an audit hash of the whole log.
+Without a terminal log, status still works and returns an empty-position cursor.
+No status history, event stream, model summary or polling service is created.
+Status does not import requests, acquire the mailbox writer lock, write files,
+reload configuration, start roles or recover/resume a run.
+
 ## Operator messages
 
 Use `operator-message.ps1 <RunRoot> -To Architect -Message 'New evidence'` to

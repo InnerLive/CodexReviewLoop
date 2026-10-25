@@ -10,6 +10,7 @@
     FunctionsToExport = @(
         "Invoke-CodexReviewLoop",
         "Send-ReviewLoopOperatorMessage",
+        "Get-ReviewLoopOperatorStatus",
         "Invoke-CodexCliRole",
         "New-ReviewLoopLedger",
         "Read-ReviewLoopLedger",

@@ -47,8 +47,8 @@ try {
     elseif ($RequestCritic) { $arguments.RequestCritic = $true }
     else { $arguments.To = $To; $arguments.RequireDelivery = $RequireDelivery }
     $published = Send-ReviewLoopOperatorMessage @arguments
-    if ($PauseAt) { Write-Output "$published requested $PauseAt (publication only)" }
-    elseif ($RequestCritic) { Write-Output "$published requested Critic (publication only)" }
+    if ($PauseAt) { Write-Output "$published requested $PauseAt" }
+    elseif ($RequestCritic) { Write-Output "$published requested Critic" }
     else { Write-Output $published }
 }
 catch {

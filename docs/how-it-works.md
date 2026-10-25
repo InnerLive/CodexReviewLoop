@@ -23,6 +23,11 @@ It uses the existing role contexts and acceptance path. Optional required
 delivery can return the workflow to those roles before a sealed transaction;
 the Operator never writes authoritative checkpoints or grants acceptance.
 
+The optional [Operator status query](operations.md#operator-status) reads the exact
+run's checkpoint, outstanding requests and existing terminal log for re-entry.
+It separates saved state from observations and changes no run state. Normal
+supervision continues through the regular output, without a second dashboard.
+
 Targeted Architect reassessment requires the existing Architect to reconsider
 new evidence before further fixing, HEAD advancement or final completion. It
 uses the same session, work orders and advice/assessment contracts, preserving

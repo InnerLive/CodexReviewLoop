@@ -108,6 +108,265 @@ function Invoke-OperatorCritic {
     } $Case $fakeCodex
 }
 
+Describe 'Read-only Operator status' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'returns only available saved facts without creating a mailbox or changing the run or Git state' {
+        $c = New-OperatorCase
+        $before = (Get-FileHash $c.Paths.StatePath).Hash
+        $gitBefore = (& git -C $c.Repo status --porcelain=v1) -join "`n"
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Saved.Run.RunId | Should Be (Split-Path -Leaf $c.Paths.RunRoot)
+        $s.Saved.ReviewCyclesThisInvocation | Should Be 0
+        $s.Saved.CurrentHead | Should Be (& git -C $c.Repo rev-parse HEAD)
+        $s.Saved.Phase | Should Be initialized
+        $s.Observed.LastActivity.Source | Should Be 'checkpoint UpdatedAt'
+        $s.Observed.LastActivity.AgeSeconds | Should BeGreaterThan -1
+        ($s.Observed.PSObject.Properties.Name -contains 'RepositoryLease') | Should Be $false
+        ($s.Observed.PSObject.Properties.Name -contains 'Process') | Should Be $false
+        ($s.Saved.PSObject.Properties.Name -contains 'MaxReviewCycles') | Should Be $false
+        $s.Requests.Count | Should Be 0
+        (Get-FileHash $c.Paths.StatePath).Hash | Should Be $before
+        ((& git -C $c.Repo status --porcelain=v1) -join "`n") | Should Be $gitBefore
+        Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
+        $mailbox = & (Get-Module CodexReviewLoop) { param($s) Get-ReviewLoopOperatorMailbox $s } (Read-ReviewLoopState $c.Paths.StatePath)
+        Test-Path $mailbox | Should Be $false
+        (Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $s.Cursor).Changes.Lines.Count | Should Be 0
+    }
+
+    It 'does not invent missing invocation fields or treat a saved role as a live process' {
+        $c = New-OperatorCase
+        $state = Read-ReviewLoopState $c.Paths.StatePath
+        $state.PSObject.Properties.Remove('ReviewCyclesThisInvocation')
+        $state.ReviewCycle = 7
+        $state.ActiveRoleCall = [pscustomobject]@{ Role='Fixer'; CallId='saved-call' }
+        Write-ReviewLoopState $c.Paths.StatePath $state | Out-Null
+        $leasePath = Join-Path $c.Repo '.git\codex-review-loop.lock'
+        [IO.File]::WriteAllText($leasePath, '')
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Saved.ReviewCycle | Should Be 7
+        ($s.Saved.PSObject.Properties.Name -contains 'ReviewCyclesThisInvocation') | Should Be $false
+        $s.Saved.ActiveRole.CallId | Should Be saved-call
+        ($s.Saved.ActiveRole.PSObject.Properties.Name -contains 'StartedAt') | Should Be $false
+        $s.Observed.RepositoryLease | Should Be free
+        $lease = [IO.FileStream]::new($leasePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+            $s.Observed.RepositoryLease | Should Be held
+            ($s.Observed.PSObject.Properties.Name -contains 'ProcessId') | Should Be $false
+        }
+        finally { $lease.Dispose() }
+    }
+
+    It 'merges published and pending requests once and excludes resolved or rejected deliveries' {
+        $c = New-OperatorCase
+        $partial = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Architect,Fixer -Message 'ONE_TIME_EVIDENCE'
+        (Invoke-OperatorRole $c).Success | Should Be $true
+        $finished = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Architect -Message completed
+        (Invoke-OperatorRole $c -CallId second).Success | Should Be $true
+        $reassessment = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'New counter-evidence'
+        $pause = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt BeforeCommit -Message 'Handover'
+        $critic = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'Repeated procedure failure'
+        $before = (Get-FileHash $c.Paths.StatePath).Hash
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Requests.Count | Should Be 4
+        ($s.Requests | Where-Object Id -eq $partial).Source | Should Be checkpoint
+        ($s.Requests | Where-Object Id -eq $partial).PendingTo -join ',' | Should Be Fixer
+        @($s.Requests | Where-Object Id -eq $finished).Count | Should Be 0
+        foreach ($id in @($reassessment,$pause,$critic)) {
+            ($s.Requests | Where-Object Id -eq $id).Source | Should Be mailbox
+            ($s.Requests | Where-Object Id -eq $id).Status | Should Be published
+        }
+        ($s.Requests | Where-Object Id -eq $pause).PauseAt | Should Be BeforeCommit
+        (Get-FileHash $c.Paths.StatePath).Hash | Should Be $before
+        @((Get-OperatorCalls) | Where-Object prompt -match ONE_TIME_EVIDENCE).Count | Should Be 1
+    }
+
+    It 'accepts the same cursor through a junction alias' {
+        $c = New-OperatorCase
+        $alias = Join-Path $c.Root alias
+        New-Item -ItemType Junction -Path $alias -Target $c.Paths.RunRoot | Out-Null
+        try {
+            $s = Get-ReviewLoopOperatorStatus $alias
+            ($s.Observed.PSObject.Properties.Name -contains 'RepositoryLease') | Should Be $false
+            (Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $s.Cursor).Changes.Lines.Count | Should Be 0
+        }
+        finally { [IO.Directory]::Delete($alias) }
+    }
+
+    It 'keeps requested reached and missed halt facts distinct and omits historical halts after resume' {
+        $c = New-OperatorCase
+        $state = Read-ReviewLoopState $c.Paths.StatePath
+        $id = [guid]::NewGuid().ToString('D')
+        $state.Status = 'paused'
+        $state.Operator.Requests = @([pscustomobject]@{Id=$id;Kind='pause';Status='reached';PauseAt='BeforeCommit';Reached='CommitRecovery';Missed=$true})
+        $state.Operator.Pause = [pscustomobject]@{At='CommitRecovery';Stage='commit_preparing';RequestIds=@($id);Backup='PRIVATE_BACKUP'}
+        Write-ReviewLoopState $c.Paths.StatePath $state | Out-Null
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Saved.Pause.Requests[0].PauseAt | Should Be BeforeCommit
+        $s.Saved.Pause.Requests[0].Reached | Should Be CommitRecovery
+        $s.Saved.Pause.Requests[0].Missed | Should Be $true
+        $s.Requests.Count | Should Be 0
+        ($s | ConvertTo-Json -Depth 12) | Should Not Match PRIVATE_BACKUP
+        $state.Status = 'running'
+        Write-ReviewLoopState $c.Paths.StatePath $state | Out-Null
+        ((Get-ReviewLoopOperatorStatus $c.Paths.RunRoot).Saved.PSObject.Properties.Name -contains 'Pause') | Should Be $false
+    }
+
+    It 'uses the same malformed and wrong-run request validation without importing or emitting receipts' {
+        $c = New-OperatorCase
+        $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'counter-evidence'
+        $state = Read-ReviewLoopState $c.Paths.StatePath
+        $mailbox = & (Get-Module CodexReviewLoop) { param($s) Get-ReviewLoopOperatorMailbox $s } $state
+        $path = Join-Path $mailbox "$id.json"
+        $legacy = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Architect -Message 'Legacy message'
+        $legacyPath = Join-Path $mailbox "$legacy.json"
+        $legacyRequest = Get-Content -Raw $legacyPath | ConvertFrom-Json
+        $legacyRequest | Add-Member -NotePropertyName Kind -NotePropertyValue 'pause'
+        $legacyRequest | ConvertTo-Json -Depth 10 | Set-Content $legacyPath
+        $request = Get-Content -Raw $path | ConvertFrom-Json
+        $request.Run.RunId = 'wrong-run'
+        $request | ConvertTo-Json -Depth 10 | Set-Content $path
+        $bad = Join-Path $mailbox 'invalid.json'
+        Set-Content $bad '{'
+        $before = @(Get-ChildItem $mailbox -File | Get-FileHash | ForEach-Object Hash) -join ','
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Requests.Count | Should Be 3
+        ($s.Requests | Where-Object Id -eq $id).Reason | Should Be 'run identity mismatch'
+        ($s.Requests | Where-Object Id -eq $legacy).Kind | Should Be message
+        ($s.Requests | Where-Object Id -eq invalid).Status | Should Be invalid
+        @((Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests).Count | Should Be 0
+        (@(Get-ChildItem $mailbox -File | Get-FileHash | ForEach-Object Hash) -join ',') | Should Be $before
+    }
+
+    It 'paginates complete Unicode lines and leaves partial records for later without replaying them' {
+        $c = New-OperatorCase
+        $path = Join-Path $c.Paths.RunRoot 'terminal.log'
+        [IO.File]::WriteAllText($path, "initial`n", [Text.UTF8Encoding]::new($false))
+        $start = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $start.Observed.LastActivity.Source | Should Be 'terminal.log LastWriteTimeUtc'
+        $text = ((1..52 | ForEach-Object { "Zeile $_ äö 漢字" }) -join "`n") + "`npartial ä"
+        [IO.File]::AppendAllText($path, $text, [Text.UTF8Encoding]::new($false))
+        $first = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $start.Cursor
+        $first.Changes.Lines.Count | Should Be 50
+        $first.Changes.Lines[0] | Should Be 'Zeile 1 äö 漢字'
+        $first.Changes.Lines[-1] | Should Be 'Zeile 50 äö 漢字'
+        $first.Changes.HasMore | Should Be $true
+        $second = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $first.Cursor
+        ($second.Changes.Lines -join '|') | Should Be 'Zeile 51 äö 漢字|Zeile 52 äö 漢字'
+        $second.Changes.HasMore | Should Be $false
+        (Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $second.Cursor).Changes.Lines.Count | Should Be 0
+        [IO.File]::AppendAllText($path, " done`n", [Text.UTF8Encoding]::new($false))
+        $third = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $second.Cursor
+        $third.Changes.Lines[0] | Should Be 'partial ä done'
+    }
+
+    It 'redacts and bounds request context and redacts new output without modifying the original artifacts' {
+        $c = New-OperatorCase
+        $start = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $secret = 'example-credential-1234567890'
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Architect -Message ("password=$secret`n" + ('evidence ' * 80)) | Out-Null
+        $path = Join-Path $c.Paths.RunRoot 'terminal.log'
+        [IO.File]::WriteAllText($path, "`e[32mpassword=$secret`e[0m`n", [Text.UTF8Encoding]::new($false))
+        $before = (Get-FileHash $path).Hash
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $start.Cursor
+        $s.Requests[0].Message.Length | Should Be 240
+        ($s.Requests[0].To -is [array]) | Should Be $true
+        ($s | ConvertTo-Json -Depth 12) | Should Not Match $secret
+        $s.Changes.Lines[0] | Should Be 'password=[redacted]'
+        (Get-FileHash $path).Hash | Should Be $before
+    }
+
+    It 'rejects foreign malformed truncated and replaced cursors rather than silently restarting' {
+        $c = New-OperatorCase
+        $path = Join-Path $c.Paths.RunRoot 'terminal.log'
+        [IO.File]::WriteAllText($path, "first`n")
+        $start = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        { Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since 'broken' } | Should Throw 'cursor'
+        $cursor = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($start.Cursor)) | ConvertFrom-Json
+        $cursor.Run = 'other-run'
+        $foreign = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($cursor | ConvertTo-Json -Compress)))
+        { Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $foreign } | Should Throw 'different run'
+        [IO.File]::WriteAllText($path, "other`n")
+        { Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $start.Cursor } | Should Throw 'reset or replaced'
+        [IO.File]::WriteAllText($path, '')
+        { Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $start.Cursor } | Should Throw 'reset or replaced'
+    }
+
+    It 'exposes compact candidate and commit facts without their result and backup payloads' {
+        $c = New-OperatorCase
+        $state = Read-ReviewLoopState $c.Paths.StatePath
+        $state.RetainedCandidate = [pscustomobject]@{ ClusterId='candidate'; Attempt=2
+            Snapshot=[pscustomobject]@{Head=$state.CurrentHead;Fingerprint='tree'}; Artifact='PRIVATE_BACKUP'; FixerResult='PRIVATE_RESULT' }
+        $state.PendingCommit = [pscustomobject]@{PreHead=$state.CurrentHead;ExpectedTree='tree';ExpectedCommit='commit';PatchFingerprint='patch';Verification='PRIVATE_RESULT'}
+        $state.PartialFixRecovery = [pscustomobject]@{ Private='PRIVATE_RECOVERY' }
+        $state.ActiveFindingIds = @('finding-1')
+        $state.ActiveWorkIds = @('work-1')
+        Write-ReviewLoopState $c.Paths.StatePath $state | Out-Null
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Saved.Work.RetainedCandidate.Snapshot.Head | Should Be $state.CurrentHead
+        $s.Saved.Work.PendingCommit.ExpectedCommit | Should Be commit
+        $json = $s | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        ($json.Saved.Work.ActiveFindingIds -is [array]) | Should Be $true
+        ($json.Saved.Work.ActiveWorkIds -is [array]) | Should Be $true
+        ($s.Saved.Work.Recovery -contains 'PartialFixRecovery') | Should Be $true
+        ($s | ConvertTo-Json -Depth 12) | Should Not Match 'PRIVATE_'
+    }
+
+    It 'shows interventions through message reassessment pause and resume without repeating completed work' {
+        $c = New-OperatorCase
+        $message = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'STATUS_FIXER_EVIDENCE' -RequireDelivery
+        $reassess = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'STATUS_COUNTER_EVIDENCE'
+        Set-OperatorPlans $c @(@{}, @{}, @{}, @{ result=(Get-OperatorAcceptResult); operatorMessages=@((New-OperatorPausePlan $c AfterRole)) })
+        (Get-ReviewLoopOperatorStatus $c.Paths.RunRoot).Requests.Count | Should Be 2
+        $result = Invoke-OperatorLoop $c
+        if ($result.Status -ne 'paused') { throw "Expected pause: $($result.Reason)" }
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        $s.Saved.Status | Should Be paused
+        $s.Saved.Pause.Requests[0].Reached | Should Not BeNullOrEmpty
+        $s.Observed.RepositoryLease | Should Be free
+        @($s.Requests | Where-Object { $_.Id -in @($message,$reassess) }).Count | Should Be 0
+        $before = @(Get-OperatorCalls).Count
+        Get-ReviewLoopOperatorStatus $c.Paths.RunRoot -Since $s.Cursor | Out-Null
+        @(Get-OperatorCalls).Count | Should Be $before
+        Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
+        (Invoke-OperatorLoop $c).Status | Should Be completed
+        $done = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        ($done.Saved.PSObject.Properties.Name -contains 'Pause') | Should Be $false
+        $done.Requests.Count | Should Be 0
+        @((Get-OperatorCalls) | Where-Object prompt -match STATUS_FIXER_EVIDENCE).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object prompt -match STATUS_COUNTER_EVIDENCE).Count | Should Be 1
+    }
+
+    It 'returns one JSON document from the public command and JSON errors with nonzero exit' {
+        $c = New-OperatorCase
+        $script = Join-Path $root 'operator-status.ps1'
+        $json = & pwsh -NoProfile -File $script $c.Paths.RunRoot
+        $LASTEXITCODE | Should Be 0
+        @($json).Count | Should Be 1
+        ($json | ConvertFrom-Json).Saved.Phase | Should Be initialized
+        (& $script -Help | Out-String) | Should Match Since
+        $json = & pwsh -NoProfile -File $script (Join-Path $c.Root missing)
+        $LASTEXITCODE | Should Be 1
+        ($json | ConvertFrom-Json).Error | Should Not BeNullOrEmpty
+        $wrong = Join-Path $c.Root copied
+        New-Item -ItemType Directory $wrong | Out-Null
+        Copy-Item $c.Paths.StatePath (Join-Path $wrong run-v1.json)
+        { Get-ReviewLoopOperatorStatus $wrong } | Should Throw 'identity mismatch'
+    }
+}
+
+Describe 'Unavailable Operator status observation' {
+    AfterEach { Clear-OperatorCase }
+    It 'omits unavailable lease evidence while retaining the saved status' {
+        $c = New-OperatorCase
+        Mock Get-ReviewLoopGitValue { throw 'Probe unavailable' } -ModuleName CodexReviewLoop
+        $s = Get-ReviewLoopOperatorStatus $c.Paths.RunRoot
+        ($s.Observed.PSObject.Properties.Name -contains 'RepositoryLease') | Should Be $false
+        $s.Saved.Phase | Should Be initialized
+    }
+}
+
 Describe 'One-time Operator Critic requests' {
     AfterEach {
         & (Get-Module CodexReviewLoop) { $script:ReviewLoopRetryDelayOverride = $null }
@@ -320,13 +579,16 @@ if (-not (Test-Path -LiteralPath '$marker')) {
         $c = New-OperatorCase
         $id = Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message RESUME
         Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'before start' | Out-Null
+        ((Get-ReviewLoopOperatorStatus $c.Paths.RunRoot).Requests | Where-Object Id -eq $id).Status | Should Be published
         (Invoke-OperatorLoop $c).Status | Should Be paused
         ($s = Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Out-Null
         ($s.Operator.Requests | Where-Object Id -eq $id).Status | Should Be pending
+        ((Get-ReviewLoopOperatorStatus $c.Paths.RunRoot).Requests | Where-Object Id -eq $id).Status | Should Be pending
         Set-OperatorPlans $c @(@{operatorMessages=@((New-OperatorPausePlan $c AfterRole))})
         (Invoke-OperatorLoop $c).Status | Should Be paused
         ($s = Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Out-Null
         ($s.Operator.Requests | Where-Object Id -eq $id).Status | Should Be handled
+        @((Get-ReviewLoopOperatorStatus $c.Paths.RunRoot).Requests | Where-Object Id -eq $id).Count | Should Be 0
         Remove-Item Env:CODEX_REVIEW_LOOP_FAKE_INVOCATION_SEQUENCE
         (Invoke-OperatorLoop $c).Status | Should Be completed
         @((Get-OperatorCalls) | Where-Object schemaPath -match 'critic-v2').Count | Should Be 1

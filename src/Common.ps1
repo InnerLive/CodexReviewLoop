@@ -1345,6 +1345,7 @@ function Get-ReviewLoopExecutionFingerprint {
     foreach ($name in @(
         "codex-review-loop.ps1",
         "operator-message.ps1",
+        "operator-status.ps1",
         "CodexReviewLoop.psd1",
         "CodexReviewLoop.psm1"
     )) {

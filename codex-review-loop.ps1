@@ -24,9 +24,12 @@ available number under <tool directory>\profiles, for example
 MyProject-001.psd1 or MyProject-002.psd1, and continues the run.
 
 Use operator-message.ps1 with the observed RunRoot to send one-time role evidence
-or request -PauseAt AfterRole|AfterRound|BeforeCommit|BeforeCompletion. A reached
+or request -ReassessArchitect, -RequestCritic, or
+-PauseAt AfterRole|AfterRound|BeforeCommit|BeforeCompletion. A reached
 halt returns paused (exit 5); publication alone does not confirm process exit.
 Address the reason before explicitly resuming the same compatible command.
+Use operator-status.ps1 <RunRoot> [-Since <Cursor>] for read-only re-entry status;
+saved state and available observations are separate, and missing facts are omitted.
 
 .PARAMETER RepoPath
 Path to the Git repository to review and, when needed, fix.
