@@ -366,11 +366,40 @@ application or a new permanent history entry.
 Before commit gates and final assessment, the loop imports published requests
 and seals their transaction boundary. Later commit-window requests wait for the
 next phase; they never retroactively change that transaction, including recovery.
-Sealed completion rejects new requests. Pending ordinary recipients without a
+Sealed completion rejects new ordinary messages. Pending ordinary recipients without a
 further matching call are rejected at completion. Do not forward stale messages
 to another run automatically or edit checkpoints/mailboxes to repair a request.
 
 See the bundled `skills/review-loop/SKILL.md` for operator examples and selection.
+
+### Targeted Architect reassessment
+
+Use `operator-message.ps1 <RunRoot> -ReassessArchitect -Message 'Reason: the
+counter-check contradicts assumption X. Evidence: counter-check.log.'` when new
+evidence must be evaluated before further fixing, commit or completion. This
+parameter set accepts `-Id` but not `-To`, `-RequireDelivery` or `-PauseAt`.
+The existing Architect reuses its session and normal advice/assessment contracts.
+Several pending requests share a suitable call; evidence arriving during it
+requires a subsequent decision. Orientation alone does not consume reassessment.
+The loop reports the ID as evaluated only after applying the validated result.
+
+Unlike ordinary messages, these requests remain effective during sealed gates
+and commit preparation. Publication and HEAD advancement share the mailbox lock:
+a request published first returns the preserved candidate for reassessment.
+An abandoned prepared transaction is saved under `superseded-commit-*.json` in
+the run directory, with its path attached to the request. Matching targeted-test
+evidence remains reusable under the existing rules; gates run again before commit.
+If HEAD already advanced, recovery finishes that exact commit and the request
+applies before subsequent fixing or final completion. The final completion write
+uses the same publication boundary. Roles and gates are never run under the
+mailbox lock, and running roles are not interrupted.
+
+Give a concise reason, observation and evidence. The request does not authorize
+a new task, resolve findings or waive tests. Use `-TaskContext` on resume only
+for a user-authorized assignment change; omission inherits it and explicit empty
+text requests reconstruction. The existing work revision and execution
+requalification remain the only task authority. Inspect the normal Architect
+result rather than requesting a separate acknowledgment or approval.
 
 ## Controlled operator pauses
 

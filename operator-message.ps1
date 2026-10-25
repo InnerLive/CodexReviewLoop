@@ -1,11 +1,14 @@
 <#
 .SYNOPSIS
-Publishes one operator message or controlled pause request to an existing run.
+Publishes operator evidence, an Architect reassessment, or a controlled pause.
 .DESCRIPTION
 RunRoot pins the observed run. To explicitly selects Reviewer, Architect and/or
 Fixer. RequireDelivery requests these roles before the next unsealed commit or
 completion; use it sparingly. Reuse Id only to retry the identical request.
 PauseAt selects AfterRole, AfterRound, BeforeCommit or BeforeCompletion.
+ReassessArchitect requires the existing Architect to reconsider the supplied
+reason and evidence before further fixing, HEAD advancement or final completion.
+It does not change the task; use TaskContext on resume for an authorized change.
 Publication is not a reached-pause receipt. Wait for process exit before takeover.
 .EXAMPLE
 .\operator-message.ps1 $runRoot -To Architect -Message 'Check the new evidence.'
@@ -13,6 +16,8 @@ Publication is not a reached-pause receipt. Wait for process exit before takeove
 .\operator-message.ps1 $runRoot -To Reviewer,Fixer -Message 'Recheck recovery.' -RequireDelivery
 .EXAMPLE
 .\operator-message.ps1 $runRoot -PauseAt AfterRole -Message 'Inspect the current result.'
+.EXAMPLE
+.\operator-message.ps1 $runRoot -ReassessArchitect -Message 'Reason: assumption X failed. Evidence: counter-check.log.'
 #>
 [CmdletBinding(DefaultParameterSetName = 'Message')]
 param(
@@ -21,6 +26,7 @@ param(
     [string[]]$To,
     [Parameter(ParameterSetName = 'Pause')]
     [ValidateSet('AfterRole','AfterRound','BeforeCommit','BeforeCompletion')][string]$PauseAt,
+    [Parameter(ParameterSetName = 'Reassessment')][switch]$ReassessArchitect,
     [Parameter(Position = 2)][string]$Message,
     [Parameter(Position = 3)][string]$Id = ([guid]::NewGuid().ToString('D')),
     [Parameter(ParameterSetName = 'Message')][switch]$RequireDelivery,
@@ -32,6 +38,7 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'CodexReviewLoop.psd1') -Force
     $arguments = @{ RunRoot = $RunRoot; Message = $Message; Id = $Id }
     if ($PauseAt) { $arguments.PauseAt = $PauseAt }
+    elseif ($ReassessArchitect) { $arguments.ReassessArchitect = $true }
     else { $arguments.To = $To; $arguments.RequireDelivery = $RequireDelivery }
     $published = Send-ReviewLoopOperatorMessage @arguments
     if ($PauseAt) { Write-Output "$published requested $PauseAt (publication only)" }

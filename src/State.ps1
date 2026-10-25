@@ -824,6 +824,7 @@ function Test-ReviewLoopGoalAccepted {
         @(Get-ReviewLoopOpenWork -State $State).Count -gt 0 -or
         $null -ne $State.RetainedCandidate -or $null -ne $State.PendingCommit -or
         $null -ne $State.ActiveRoleCall -or $null -ne $State.ActiveCriticCall -or
+        $null -ne $State.Operator.InterruptedFixerCall -or
         $null -ne $State.ActiveHostGateRecovery -or $null -ne $State.BlockedCleanup -or
         $null -ne $State.PartialFixRecovery) {
         return $false

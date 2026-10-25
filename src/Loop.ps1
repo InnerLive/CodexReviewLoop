@@ -2870,6 +2870,24 @@ function New-ReviewLoopCommitMessage {
     return Get-ReviewLoopCanonicalCommitMessage -Message $message
 }
 
+function Reset-ReviewLoopCommitForReassessment {
+    param([object]$State, [string]$StatePath, [string]$RepoPath, [string]$RunRoot)
+    $pending = $State.PendingCommit
+    # Persist intent before index cleanup so a crash cannot revive the old approval.
+    $pending | Add-Member -Force -NotePropertyName ReassessmentRequired -NotePropertyValue $true
+    Write-ReviewLoopState $StatePath $State | Out-Null
+    $artifact = Join-Path $RunRoot "superseded-commit-$($pending.OperatorBoundaryId).json"
+    Write-ReviewLoopAtomicJson $artifact $pending
+    Restore-ReviewLoopVerifiedPatchToCleanIndex -RepoPath $RepoPath -ExpectedHead $pending.PreHead `
+        -ExpectedFingerprint $pending.PatchFingerprint -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
+    foreach ($request in @(Get-ReviewLoopPendingOperatorMessages $State -Reassessment)) {
+        $request | Add-Member -Force -NotePropertyName SupersededCommitPath -NotePropertyValue $artifact
+    }
+    $State.PendingCommit = $null
+    Open-ReviewLoopOperatorBoundary $State
+    Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage fix_attempted
+}
+
 function Complete-ReviewLoopPendingCommit {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Config,
@@ -2904,6 +2922,12 @@ function Complete-ReviewLoopPendingCommit {
     if ($head -eq $preHead) {
         if ((Get-ReviewLoopWorktreeFingerprint -RepoPath $RepoPath) -ne $expectedFingerprint) {
             throw "The worktree changed after verification; refusing the pending commit."
+        }
+        Sync-ReviewLoopOperatorMessages $State $StatePath
+        if (@(Get-ReviewLoopPendingOperatorMessages $State -Reassessment).Count -gt 0 -or
+            (Get-ReviewLoopObjectProperty $pending -Name ReassessmentRequired -Default $false)) {
+            Reset-ReviewLoopCommitForReassessment $State $StatePath $RepoPath $RunRoot
+            return $false
         }
         Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
         Invoke-ReviewLoopGitStep -Name "Commit preparation" -Arguments @("add", "-A") `
@@ -2960,9 +2984,20 @@ function Complete-ReviewLoopPendingCommit {
         $pending.ExpectedCommit = $candidateCommit
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_pending"
         Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
-        Invoke-ReviewLoopGitStep -Name "Commit" -Arguments @(
-            "update-ref", "HEAD", $candidateCommit, $preHead
-        ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
+        $advanced = Invoke-ReviewLoopOperatorLock $State {
+            param($mailbox)
+            Import-ReviewLoopOperatorMessages $State $mailbox
+            Write-ReviewLoopState $StatePath $State | Out-Null
+            if (@(Get-ReviewLoopPendingOperatorMessages $State -Reassessment).Count -gt 0) { return $false }
+            Invoke-ReviewLoopGitStep -Name "Commit" -Arguments @(
+                "update-ref", "HEAD", $candidateCommit, $preHead
+            ) -RepoPath $RepoPath -RunRoot $RunRoot -ClusterId $State.ActiveClusterId | Out-Null
+            return $true
+        }
+        if (-not $advanced) {
+            Reset-ReviewLoopCommitForReassessment $State $StatePath $RepoPath $RunRoot
+            return $false
+        }
         $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
     }
 
@@ -3046,9 +3081,19 @@ function Complete-ReviewLoopFix {
 
     $head = Get-ReviewLoopGitValue -RepoPath $RepoPath -Arguments @("rev-parse", "HEAD")
     if (Test-ReviewLoopGitClean -RepoPath $RepoPath) {
-        Complete-ReviewLoopResolution -State $State -StatePath $StatePath `
-            -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
-            -VerificationResult $Verification.Result -Commit $head
+        $resolved = Invoke-ReviewLoopOperatorLock $State {
+            param($mailbox)
+            Import-ReviewLoopOperatorMessages $State $mailbox
+            Write-ReviewLoopState $StatePath $State | Out-Null
+            if (@(Get-ReviewLoopPendingOperatorMessages $State -Reassessment).Count -gt 0) { return $false }
+            Complete-ReviewLoopResolution -State $State -StatePath $StatePath `
+                -Ledger $Ledger -LedgerPath $LedgerPath -Findings $Findings `
+                -VerificationResult $Verification.Result -Commit $head
+            return $true
+        }
+        if (-not $resolved) {
+            return [pscustomobject]@{ Success=$false; Retryable=$true; Feedback='Pending Architect reassessment.'; OperatorRole='Architect' }
+        }
         Write-ReviewLoopStatus -Message "No commit was needed; the finding is resolved on the current HEAD." -Kind Success
         return [pscustomobject]@{ Success = $true; Retryable = $false; Feedback = "" }
     }
@@ -3075,8 +3120,11 @@ function Complete-ReviewLoopFix {
     Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "commit_preparing"
     Invoke-ReviewLoopPauseBoundary $State $StatePath CommitRecovery
     Write-ReviewLoopStatus -Message "Preparing the verified commit." -Kind Progress
-    Complete-ReviewLoopPendingCommit -Config $Config -State $State -StatePath $StatePath `
-        -Ledger $Ledger -LedgerPath $LedgerPath -RepoPath $RepoPath -RunRoot $RunRoot | Out-Null
+    $committed = Complete-ReviewLoopPendingCommit -Config $Config -State $State -StatePath $StatePath `
+        -Ledger $Ledger -LedgerPath $LedgerPath -RepoPath $RepoPath -RunRoot $RunRoot
+    if (-not $committed) {
+        return [pscustomobject]@{ Success=$false; Retryable=$true; Feedback='Pending Architect reassessment.'; OperatorRole='Architect' }
+    }
     return [pscustomobject]@{ Success = $true; Retryable = $false; Feedback = "" }
 }
 
@@ -3405,6 +3453,7 @@ function Invoke-ReviewLoopFixWorkflow {
     $partialRecovery = Get-ReviewLoopObjectProperty -Object $State -Name "PartialFixRecovery"
     if ($Recover -and [string]::IsNullOrWhiteSpace($threadId) -and $attempt -gt 0 -and
         $null -eq (Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall") -and
+        $null -eq $State.Operator.InterruptedFixerCall -and
         -not (Test-ReviewLoopGitClean -RepoPath $RepoPath) -and
         $null -eq $partialRecovery) {
         Stop-ReviewLoopBlocked -Message "Interrupted legacy fixer checkpoint has no resumable role thread."
@@ -3543,7 +3592,9 @@ function Invoke-ReviewLoopFixWorkflow {
         Set-ReviewLoopCheckpoint -State $State -StatePath $StatePath -Stage "fixing"
         $threadMode = if ([string]::IsNullOrWhiteSpace($threadId)) { "new thread" } else { "resuming thread" }
         Write-ReviewLoopStatus -Message "Fixer · call $attempt · $threadMode" -Kind Progress
-        $activeRoleCall = Get-ReviewLoopObjectProperty -Object $State -Name "ActiveRoleCall"
+        $activeRoleCall = if ($null -ne $State.Operator.InterruptedFixerCall) { $State.Operator.InterruptedFixerCall }
+            elseif ($null -ne $State.ActiveRoleCall -and $State.ActiveRoleCall.Role -eq 'Fixer') { $State.ActiveRoleCall }
+            else { $null }
         $fixerCallId = if ($null -ne $activeRoleCall) {
             [string](Get-ReviewLoopObjectProperty -Object $activeRoleCall -Name "CallId" -Default "")
         }
@@ -4454,21 +4505,27 @@ function Complete-ReviewLoopRun {
         @(Get-ReviewLoopPendingOperatorMessages $State -Required).Count -gt 0) {
         throw 'Completion requires a sealed operator boundary with no pending required delivery.'
     }
-    foreach ($message in @(Get-ReviewLoopPendingOperatorMessages $State)) {
-        foreach ($delivery in @($message.Deliveries | Where-Object Status -EQ pending)) {
-            $delivery.Status = 'rejected'
-            Write-ReviewLoopStatus -Message "$($message.Id) rejected for $($delivery.Role): no further matching role call" -Kind Warning
-        }
-    }
-    Invoke-ReviewLoopOperatorLock $State {
+    $sealed = Invoke-ReviewLoopOperatorLock $State {
         param($mailbox)
         Import-ReviewLoopOperatorMessages $State $mailbox
+        if (@(Get-ReviewLoopPendingOperatorMessages $State -Reassessment).Count -gt 0) {
+            Write-ReviewLoopState $StatePath $State | Out-Null
+            return $false
+        }
         Invoke-ReviewLoopPauseBoundary $State $StatePath BeforeCompletion -Locked
+        foreach ($message in @(Get-ReviewLoopPendingOperatorMessages $State)) {
+            foreach ($delivery in @($message.Deliveries | Where-Object Status -EQ pending)) {
+                $delivery.Status = 'rejected'
+                Write-ReviewLoopStatus -Message "$($message.Id) rejected for $($delivery.Role): no further matching role call" -Kind Warning
+            }
+        }
         $State.Status = "completed"
         $State.ExitCode = 0
         Set-ReviewLoopCheckpoint `
             -State $State -StatePath $StatePath -Stage "completed" -Status "completed"
+        return $true
     }
+    if (-not $sealed) { return $null }
     Write-ReviewLoopCompletionSummary `
         -Cycles $State.ReviewCycle `
         -CleanPasses "$($State.CleanPasses)/$CleanPassesRequired" `
@@ -5021,7 +5078,8 @@ function Invoke-ReviewLoopCore {
             $state.Stage = [string](Get-ReviewLoopObjectProperty `
                 -Object $activeRoleCall -Name "CheckpointStage" -Default "reviewing")
         }
-        elseif ([string]$state.Stage -eq "stopped" -and (@($state.ActiveFindingIds).Count -gt 0 -or @($state.ActiveWorkIds).Count -gt 0)) {
+        elseif ([string]$state.Stage -eq "stopped" -and (@($state.ActiveFindingIds).Count -gt 0 -or @($state.ActiveWorkIds).Count -gt 0 -or
+            $null -ne $state.Operator.InterruptedFixerCall)) {
             $state.Stage = if (
                 $null -ne $state.LastFixerResult -and
                 $null -ne $state.LastFixerResult.StructuredResult
@@ -5235,12 +5293,14 @@ function Invoke-ReviewLoopCore {
                             Invoke-ReviewLoopOpenClusters -Config $config -State $state -StatePath $statePath -Ledger $ledger -LedgerPath $paths.LedgerPath -RepoPath $repo -Speed $Speed -RunRoot $paths.RunRoot -CodexPath $CodexPath
                             continue
                         }
-                        return Complete-ReviewLoopRun `
+                        $completed = Complete-ReviewLoopRun `
                             -State $state -StatePath $statePath -RunRoot $paths.RunRoot `
                             -LedgerPath $paths.LedgerPath -TranscriptPath $terminalPath `
                             -CleanPassesRequired ([int]$config.CleanPassesRequired) `
                             -CompletionEvidence ([string](Get-ReviewLoopObjectProperty `
                                 -Object $lessonsGate -Name "CompletionEvidence" -Default ""))
+                        if ($null -ne $completed) { return $completed }
+                        continue
                     }
                 }
                 catch {

@@ -303,6 +303,7 @@ foreach ($message in $operatorMessages) {
     $publication = @{ RunRoot = $message.runRoot; Message = $message.message }
     $pauseAt = Get-FakePlanValue $message -Name pauseAt -Default ''
     if ($pauseAt) { $publication.PauseAt = $pauseAt }
+    elseif (Get-FakePlanValue $message -Name reassessArchitect -Default $false) { $publication.ReassessArchitect = $true }
     else { $publication.To = $message.to; $publication.RequireDelivery = [bool]$message.requireDelivery }
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'operator-message.ps1') @publication | Out-Null
 }

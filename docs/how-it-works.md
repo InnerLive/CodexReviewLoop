@@ -23,6 +23,13 @@ It uses the existing role contexts and acceptance path. Optional required
 delivery can return the workflow to those roles before a sealed transaction;
 the Operator never writes authoritative checkpoints or grants acceptance.
 
+Targeted Architect reassessment requires the existing Architect to reconsider
+new evidence before further fixing, HEAD advancement or final completion. It
+uses the same session, work orders and advice/assessment contracts, preserving
+the candidate and still-matching test evidence. Unlike ordinary messages, it
+remains effective during prepared commit and completion gates. Only an authorized
+`TaskContext` replacement changes the assignment and requalifies its revision.
+
 The same channel supports controlled pauses after a role, after a complete
 review/fix round, before commit preparation, and before final completion.
 Publication is distinct from reaching the halt. Completed results and the exact

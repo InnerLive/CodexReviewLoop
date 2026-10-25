@@ -2326,6 +2326,10 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
         }
         $installed | Should Match 'process has exited'
         $installed | Should Match 'Do not restart automatically'
+        $installed | Should Match '-ReassessArchitect'
+        $installed | Should Match 'user-authorized assignment change'
+        (Get-FileHash (Join-Path $destination 'review-loop/SKILL.md')).Hash |
+            Should Be (Get-FileHash (Join-Path $root 'skills/review-loop/SKILL.md')).Hash
         $operator = Join-Path $binding.repositoryPath 'operator-message.ps1'
         Test-Path $operator | Should Be $true
         (& $operator -Help | Out-String) | Should Match 'PauseAt'

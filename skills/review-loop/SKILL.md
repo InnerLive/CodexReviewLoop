@@ -70,6 +70,32 @@ supervising Operator chooses recipients from the normal flow; no routing model
 or acknowledgment evaluation runs. Messages do not replace the assignment or
 grant acceptance. Use `TaskContext` on resume for an authorized assignment change.
 
+Choose a normal message for evidence that can wait for the recipient's next
+regular call. Choose Architect reassessment when new evidence challenges a
+decision that must be reconsidered before further implementation or acceptance:
+
+```powershell
+& (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -ReassessArchitect -Message 'Reason: the counter-check contradicts assumption X. Evidence: counter-check.log.'
+```
+
+Supply a short reason, observation and evidence or artifact reference. The
+existing Architect uses its normal session, advice and assessment contracts;
+evaluate that normal result without asking for an extra acknowledgment. This
+mode has no `-To`, `-RequireDelivery` or `-PauseAt`. It preserves the current
+assignment, open work and findings, and cannot replace required tests.
+Only a user-authorized assignment change replaces `TaskContext` on resume;
+omit it to inherit the assignment, or pass an explicit empty value to reconstruct
+it. That existing revision path requalifies prior decisions and completion.
+
+Reassessment also applies during commit gates or a prepared commit. A request
+published before the atomic HEAD update prevents that commit until the Architect
+has evaluated it. The owned candidate and matching test evidence are preserved;
+current gates still run before commit. After HEAD advances, the request applies
+to subsequent work. During final assessment or gates, reassessment remains
+available until the run is atomically completed. Completed runs reject new
+requests. Publication returns only the ID; `evaluated by Architect` means its
+normal validated result was applied, not that the Operator granted acceptance.
+
 The command returns a message ID, meaning published, not delivered. Keep that ID;
 retry an uncertain publication with the identical recipients, text and switch
 plus `-Id $messageId`. A changed request needs a new ID. The loop reports only
@@ -87,10 +113,11 @@ It can restart native review of a preserved candidate or repeat fixing and
 assessment. Existing budgets, tests, gates and acceptance responsibilities still
 apply. Exhausted budgets leave the delivery pending for resume.
 
-The loop seals a durable request boundary before commit gates and final
-assessment. Messages published after a commit boundary apply to the next phase,
+For ordinary messages the loop seals a durable request boundary before commit
+gates and final assessment. Messages published after a commit boundary apply to
+the next phase,
 even with `-RequireDelivery`; they cannot alter the sealed transaction on resume.
-After completion is sealed, new messages are rejected. Ordinary messages with no
+After completion is sealed, new ordinary messages are rejected. Messages with no
 remaining matching call are rejected at completion. Mailboxes live outside the
 reviewed worktree under `%LOCALAPPDATA%\CodexReviewLoop\operator`.
 

@@ -305,18 +305,23 @@ Describe 'Durable operator messages' {
         $mailbox=& (Get-Module CodexReviewLoop) {param($s) Get-ReviewLoopOperatorMailbox $s} $s
         $path=Join-Path $mailbox "$id.json"
         $request=Get-Content $path -Raw | ConvertFrom-Json
-        $request.Version=3
+        $request.Version=4
         $request | ConvertTo-Json -Depth 10 | Set-Content $path
         (Invoke-OperatorRole $c).Success | Should Be $true
         $s=Read-ReviewLoopState $c.Paths.StatePath
         $s.Operator.Requests[0].Rejection | Should Be 'unknown request version'
-        $s.Operator.Version=3
+        $s.Operator.Version=4
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         {Read-ReviewLoopState $c.Paths.StatePath} | Should Throw 'Unknown operator state version'
         $s.Operator.Version=1
         $s | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
         $upgraded=Read-ReviewLoopState $c.Paths.StatePath
-        $upgraded.Operator.Version | Should Be 2
+        $upgraded.Operator.Version | Should Be 3
+        $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
+        $upgraded.Operator.Version=2
+        $upgraded | ConvertTo-Json -Depth 50 | Set-Content $c.Paths.StatePath
+        $upgraded=Read-ReviewLoopState $c.Paths.StatePath
+        $upgraded.Operator.Version | Should Be 3
         $upgraded.Operator.Requests[0].Rejection | Should Be 'unknown request version'
     }
 
@@ -539,6 +544,501 @@ Describe 'Durable operator messages' {
         $workCalls[2].schemaPath | Should Match 'fixer-result'
         $workCalls[2].prompt | Should Match AFTER_PRE_GATE_CUTOFF
         @((Read-ReviewLoopState $c.Paths.StatePath).LoopCommits).Count | Should Be 1
+    }
+}
+
+Describe 'Targeted Architect reassessment' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'publishes an immutable typed request and does not consume it in orientation' {
+        $c=New-OperatorCase
+        $id=Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'Reason: assumption X failed. Evidence: check.log.'
+        & (Join-Path $root 'operator-message.ps1') $c.Paths.RunRoot -ReassessArchitect -Message 'Reason: assumption X failed. Evidence: check.log.' -Id $id | Should Be $id
+        {Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'different' -Id $id} | Should Throw 'different content'
+        foreach($incompatible in @(@('-To','Fixer'),@('-RequireDelivery'),@('-PauseAt','AfterRole'))) {
+            & pwsh -NoProfile -File (Join-Path $root 'operator-message.ps1') $c.Paths.RunRoot -ReassessArchitect -Message invalid @incompatible 2>$null
+            $LASTEXITCODE | Should Not Be 0
+        }
+        (Invoke-OperatorRole $c).Success | Should Be $true
+        $s=Read-ReviewLoopState $c.Paths.StatePath
+        $s.Operator.Version | Should Be 3
+        $s.Operator.Requests[0].Deliveries[0].Status | Should Be pending
+        (Get-OperatorCalls)[0].prompt | Should Not Match 'assumption X failed'
+        & (Get-Module CodexReviewLoop) {
+            param($c,$fake)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $config=Import-ReviewLoopConfig $c.Profile $c.Repo
+            Invoke-ReviewLoopArchitect -Config $config -State $s -StatePath $c.Paths.StatePath -RepoPath $c.Repo `
+                -Speed standard -RunRoot $c.Paths.RunRoot -Findings @() -CodexPath $fake -Reassessment | Out-Null
+        } $c $fakeCodex
+        $s=Read-ReviewLoopState $c.Paths.StatePath
+        $s.Operator.Requests[0].Deliveries[0].Status | Should Be delivered
+        $s.Operator.Requests[0].Deliveries[0].CallId | Should Match 'reassess'
+        $s.TaskContext | Should Be ''
+        $calls=Get-OperatorCalls
+        $calls[-1].resumeThreadId | Should Be $s.RoleCalls[0].ThreadId
+    }
+
+    It 'coalesces pending evidence and reassesses again for evidence arriving during advice before one Fixer call' {
+        $c=New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'FIRST_COUNTERCHECK' | Out-Null
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'SECOND_COUNTERCHECK' | Out-Null
+        Set-OperatorPlans $c @(
+            @{operatorMessages=@(@{runRoot=$c.Paths.RunRoot;reassessArchitect=$true;message='LATER_COUNTERCHECK'})},
+            @{}, @{}, @{result=(Get-OperatorAcceptResult)}, @{result='No findings.'})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        $calls=Get-OperatorCalls
+        $advice=@($calls | Where-Object schemaPath -match 'architecture-advice')
+        $advice.Count | Should Be 2
+        $advice[0].prompt | Should Match FIRST_COUNTERCHECK
+        $advice[0].prompt | Should Match SECOND_COUNTERCHECK
+        $advice[0].prompt | Should Not Match LATER_COUNTERCHECK
+        $advice[1].prompt | Should Match LATER_COUNTERCHECK
+        @($calls | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+        $calls[3].schemaPath | Should Match 'fixer-result'
+        @((Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Where-Object {$_.Kind -eq 'architect_reassessment' -and $_.Deliveries[0].Status -eq 'delivered'}).Count | Should Be 3
+    }
+
+    It 'reassesses an existing candidate after acceptance without repeating its Fixer or matching targeted test' {
+        $c=New-OperatorCase
+        $counter=Join-Path $c.Root 'tests.txt'
+        $test=Join-Path $c.Root 'targeted.ps1'
+        "Add-Content -LiteralPath '$counter' executed" | Set-Content $test
+        $fixer=@{schemaVersion='3.0';summary='Fix';targetedTest=@{available=$true;executable='pwsh';arguments=@('-NoProfile','-File',$test)}} | ConvertTo-Json -Depth 6 -Compress
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(
+            @{result=$fixer;mutations=@(@{path='README.txt';content='candidate'})},
+            @{result=(Get-OperatorAcceptResult);operatorMessages=@(@{runRoot=$c.Paths.RunRoot;reassessArchitect=$true;message='AFTER_ACCEPTANCE'})},
+            @{result=(Get-OperatorAcceptResult)}, @{result='No findings.'})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        @(Get-Content $counter).Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object {$_.schemaPath -match 'assessment' -and $_.phase -ne 'completion'}).Count | Should Be 2
+        @((Get-OperatorCalls) | Where-Object prompt -match AFTER_ACCEPTANCE).Count | Should Be 1
+    }
+
+    It 'blocks a pending commit at every recoverable preparation phase and preserves the candidate' {
+        foreach($phase in @('prepared','staged','object')) {
+            $c=New-OperatorCase
+            [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'),'candidate')
+            & (Get-Module CodexReviewLoop) {
+                param($c,$phase)
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $s.ActiveFindingSource='operator';$s.ActiveClusterId='reassessment-pending';$s.Stage='commit_preparing'
+                $ledger=New-ReviewLoopLedger $c.Repo
+                Write-ReviewLoopLedger $c.Paths.LedgerPath $ledger | Out-Null
+                Close-ReviewLoopOperatorBoundary $s $c.Paths.StatePath commit | Out-Null
+                $s.PendingCommit=[pscustomobject]@{
+                    PreHead=$s.CurrentHead;PatchFingerprint=Get-ReviewLoopWorktreeFingerprint $c.Repo
+                    ExpectedTree='';ExpectedCommit='';Message='Test: reassessment';NeedsCurrentGates=$false
+                    OperatorBoundaryId=$s.Operator.Boundary.Id
+                    Verification=[pscustomobject]@{WorkRevision=0;workOutcomes=@();goalComplete=$false}
+                }
+                if($phase -ne 'prepared') {
+                    & git -C $c.Repo add -A
+                    $s.PendingCommit.ExpectedTree=Get-ReviewLoopGitValue $c.Repo @('write-tree')
+                }
+                if($phase -eq 'object') {
+                    $s.PendingCommit.ExpectedCommit=(& git -C $c.Repo commit-tree $s.PendingCommit.ExpectedTree -p $s.CurrentHead -m $s.PendingCommit.Message).Trim()
+                }
+                Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+            } $c $phase
+            $before=(& git -C $c.Repo rev-parse HEAD).Trim()
+            Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'PRE_HEAD_COUNTERCHECK' | Out-Null
+            & (Get-Module CodexReviewLoop) {
+                param($c)
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $config=Import-ReviewLoopConfig $c.Profile $c.Repo
+                $ledger=Read-ReviewLoopLedger $c.Paths.LedgerPath
+                Complete-ReviewLoopPendingCommit -Config $config -State $s -StatePath $c.Paths.StatePath `
+                    -Ledger $ledger -LedgerPath $c.Paths.LedgerPath -RepoPath $c.Repo -RunRoot $c.Paths.RunRoot | Should Be $false
+                $s.PendingCommit | Should BeNullOrEmpty
+                $s.Stage | Should Be fix_attempted
+                Test-Path $s.Operator.Requests[0].SupersededCommitPath | Should Be $true
+            } $c
+            (& git -C $c.Repo rev-parse HEAD).Trim() | Should Be $before
+            Get-Content (Join-Path $c.Repo 'README.txt') | Should Be candidate
+            @(& git -C $c.Repo diff --cached --name-only).Count | Should Be 0
+            Clear-OperatorCase
+        }
+    }
+
+    It 'reassesses evidence published inside commit gates and reruns gates before committing' {
+        $c=New-OperatorCase
+        $gate=Join-Path $c.Root 'gate.ps1'
+        $counter=Join-Path $c.Root 'gates.txt'
+        @"
+if (-not (Test-Path '$counter')) {
+    & '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -ReassessArchitect -Message 'IN_COMMIT_GATE' | Out-Null
+}
+Add-Content '$counter' executed
+"@ | Set-Content $gate
+        (Get-Content -Raw $c.Profile).Replace('HostGates=@()',"HostGates=@(@{Name='evidence';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})") | Set-Content $c.Profile
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{mutations=@(@{path='README.txt';content='candidate'})},
+            @{result=(Get-OperatorAcceptResult)}, @{result=(Get-OperatorAcceptResult)}, @{result='No findings.'})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        @(Get-Content $counter).Count | Should Be 2
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+        @((Get-OperatorCalls) | Where-Object prompt -match IN_COMMIT_GATE).Count | Should Be 1
+        (Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests[-1].SupersededCommitPath | Should Not BeNullOrEmpty
+    }
+
+    It 'accepts requests during sealed completion and evaluates them without another native review' {
+        $c=New-OperatorCase
+        Set-OperatorPlans $c @(@{result='No findings.'},
+            @{phase='completion';result=(Get-OperatorAcceptResult);operatorMessages=@(@{runRoot=$c.Paths.RunRoot;reassessArchitect=$true;message='DURING_COMPLETION'})})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        $calls=Get-OperatorCalls
+        @($calls | Where-Object callKind -eq review).Count | Should Be 1
+        @($calls | Where-Object phase -eq completion).Count | Should Be 2
+        @($calls | Where-Object prompt -match DURING_COMPLETION).Count | Should Be 1
+        {Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'too late'} | Should Throw 'completion is sealed'
+    }
+
+    It 'serializes late evidence before HEAD advancement and preserves requests arriving just after it' {
+        foreach($injection in @(2,3,4,5)) {
+            $c=New-OperatorCase
+            $before=(& git -C $c.Repo rev-parse HEAD).Trim()
+            Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+            $plans=@(@{mutations=@(@{path='README.txt';content='candidate'})},@{result=(Get-OperatorAcceptResult)})
+            if($injection -lt 5){$plans+=@{result=(Get-OperatorAcceptResult)}}
+            $plans+=@{result='No findings.'}
+            Set-OperatorPlans $c $plans
+            & (Get-Module CodexReviewLoop) {
+                param($c,$at,$fake)
+                $script:reassessmentPauseOriginal=${function:Invoke-ReviewLoopPauseBoundary}
+                $script:reassessmentInjection=[pscustomobject]@{Case=$c;At=$at;Count=0;HeadBefore='';HeadAfter=''}
+                function script:Invoke-ReviewLoopPauseBoundary {
+                    param($State,$StatePath,$At='Step',[switch]$Locked)
+                    if($At -eq 'CommitRecovery' -and -not $Locked) {
+                        $script:reassessmentInjection.Count++
+                        if($script:reassessmentInjection.Count -eq $script:reassessmentInjection.At) {
+                            $case=$script:reassessmentInjection.Case
+                            $script:reassessmentInjection.HeadBefore=Get-ReviewLoopGitValue $case.Repo @('rev-parse','HEAD')
+                            Send-ReviewLoopOperatorMessage $case.Paths.RunRoot -ReassessArchitect -Message 'AT_PUBLICATION_BOUNDARY' | Out-Null
+                        }
+                    }
+                    & $script:reassessmentPauseOriginal @PSBoundParameters
+                }
+                try {
+                    $r=Invoke-CodexReviewLoop -RepoPath $c.Repo -ConfigPath $c.Profile -CodexPath $fake -HeartbeatSeconds 0 -Json
+                    if($r.Status -ne 'completed'){throw $r.Reason}
+                    $script:reassessmentInjection.HeadBefore
+                }
+                finally {
+                    Set-Item Function:script:Invoke-ReviewLoopPauseBoundary $script:reassessmentPauseOriginal
+                    Remove-Variable reassessmentPauseOriginal,reassessmentInjection -Scope Script
+                }
+            } $c $injection $fakeCodex | ForEach-Object {
+                if($injection -lt 5){$_ | Should Be $before}else{$_ | Should Not Be $before}
+            }
+            (& git -C $c.Repo rev-list --count "$before..HEAD") | Should Be 1
+            $calls=Get-OperatorCalls
+            @($calls | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+            @($calls | Where-Object prompt -match AT_PUBLICATION_BOUNDARY).Count | Should Be 1
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.Operator.Requests[-1].Deliveries[0].Status | Should Be delivered
+            if($injection -lt 5){Test-Path $s.Operator.Requests[-1].SupersededCommitPath | Should Be $true}
+            Clear-OperatorCase
+        }
+    }
+
+    It 'reassesses before retrying a Fixer after a failed targeted test and keeps the new advice' {
+        $c=New-OperatorCase
+        $test=Join-Path $c.Root 'failing.ps1'
+        "& '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -ReassessArchitect -Message 'FAILED_TEST_COUNTERCHECK' | Out-Null; exit 1" | Set-Content $test
+        $fixer=@{schemaVersion='3.0';summary='First candidate';targetedTest=@{available=$true;executable='pwsh';arguments=@('-NoProfile','-File',$test)}} | ConvertTo-Json -Depth 6 -Compress
+        $advice='{"schemaVersion":"3.0","summary":"Revised plan","approach":"REVISED_APPROACH","steps":[],"considerations":[],"orders":[],"selectedWorkIds":[]}'
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(@{result=$fixer},@{result=$advice},@{},@{result=(Get-OperatorAcceptResult)},@{result='No findings.'})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        $calls=Get-OperatorCalls
+        $calls[2].schemaPath | Should Match 'architecture-advice'
+        $calls[2].prompt | Should Match FAILED_TEST_COUNTERCHECK
+        $calls[3].schemaPath | Should Match 'fixer-result'
+        $calls[3].prompt | Should Match REVISED_APPROACH
+        @($calls | Where-Object schemaPath -match 'fixer-result').Count | Should Be 2
+    }
+
+    It 'keeps evidence pending across a failed Architect and resumes its existing session before fixing' {
+        $c=New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'RESUMABLE_COUNTERCHECK' | Out-Null
+        Set-OperatorPlans $c @(@{exitCode=7},@{exitCode=7},@{exitCode=7})
+        $first=Invoke-OperatorLoop $c
+        $first.Status | Should Not Be completed
+        $s=Read-ReviewLoopState $c.Paths.StatePath
+        @($s.Operator.Requests | Where-Object Kind -eq architect_reassessment)[0].Deliveries[0].Status | Should Be pending
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 0
+        Set-OperatorPlans $c @(@{},@{},@{result=(Get-OperatorAcceptResult)},@{result='No findings.'})
+        $second=Invoke-OperatorLoop $c
+        if($second.Status -ne 'completed'){throw $second.Reason}
+        @((Read-ReviewLoopState $c.Paths.StatePath).Operator.Requests | Where-Object Kind -eq architect_reassessment)[0].Deliveries[0].Status | Should Be delivered
+    }
+
+    It 'uses normal assessment for a retained candidate with fresh evidence from native review' {
+        $c=New-OperatorCase
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+        Set-OperatorPlans $c @(
+            @{mutations=@(@{path='README.txt';content='retained'})},
+            @{result=(Get-OperatorAcceptResult);operatorMessages=@(@{runRoot=$c.Paths.RunRoot;to=@('Reviewer');message='review candidate';requireDelivery=$true})},
+            @{result='No findings.';operatorMessages=@(@{runRoot=$c.Paths.RunRoot;reassessArchitect=$true;message='RETAINED_COUNTERCHECK'})},
+            @{result=(Get-OperatorAcceptResult)},@{result='No findings.'})
+        $r=Invoke-OperatorLoop $c
+        if($r.Status -ne 'completed'){throw $r.Reason}
+        $calls=Get-OperatorCalls
+        @($calls | Where-Object schemaPath -match 'fixer-result').Count | Should Be 1
+        @($calls | Where-Object schemaPath -match 'architecture-advice').Count | Should Be 0
+        @($calls | Where-Object prompt -match RETAINED_COUNTERCHECK).Count | Should Be 1
+        (Read-ReviewLoopState $c.Paths.StatePath).RetainedCandidate | Should BeNullOrEmpty
+    }
+
+    It 'prevents no-op resolution and final completion from using an old acceptance' {
+        foreach($mode in @('noop','completion')) {
+            $c=New-OperatorCase
+            $gate=Join-Path $c.Root 'gate.ps1'
+            $counter=Join-Path $c.Root 'count.txt'
+            @"
+if (-not (Test-Path '$counter')) {
+    & '$root\operator-message.ps1' '$($c.Paths.RunRoot)' -ReassessArchitect -Message 'LATE_GATE_COUNTERCHECK' | Out-Null
+}
+Add-Content '$counter' executed
+"@ | Set-Content $gate
+            (Get-Content -Raw $c.Profile).Replace('HostGates=@()',"HostGates=@(@{Name='evidence';FilePath='pwsh';Arguments=@('-NoProfile','-File','$gate')})") | Set-Content $c.Profile
+            if($mode -eq 'noop') {
+                Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Fixer -Message 'start' -RequireDelivery | Out-Null
+                Set-OperatorPlans $c @(@{},@{result=(Get-OperatorAcceptResult)},@{result=(Get-OperatorAcceptResult)},@{result='No findings.'})
+            }
+            else {Set-OperatorPlans $c @(@{result='No findings.'})}
+            $head=(& git -C $c.Repo rev-parse HEAD).Trim()
+            $r=Invoke-OperatorLoop $c
+            if($r.Status -ne 'completed'){throw $r.Reason}
+            (& git -C $c.Repo rev-parse HEAD).Trim() | Should Be $head
+            @(Get-Content $counter).Count | Should Be 2
+            @((Get-OperatorCalls) | Where-Object prompt -match LATE_GATE_COUNTERCHECK).Count | Should Be 1
+            @((Get-OperatorCalls) | Where-Object callKind -eq review).Count | Should Be 1
+            Clear-OperatorCase
+        }
+    }
+
+    It 'returns from the final completion write to assessment for a just-published request' {
+        $c=New-OperatorCase
+        Set-OperatorPlans $c @(@{result='No findings.'})
+        & (Get-Module CodexReviewLoop) {
+            param($c,$fake)
+            $script:reassessmentCompletionOriginal=${function:Complete-ReviewLoopRun}
+            $script:reassessmentCompletionInjected=$false
+            function script:Complete-ReviewLoopRun {
+                param($State,$StatePath,$RunRoot,$LedgerPath,$TranscriptPath,$CleanPassesRequired,$CompletionEvidence='')
+                if(-not $script:reassessmentCompletionInjected) {
+                    Send-ReviewLoopOperatorMessage $RunRoot -ReassessArchitect -Message 'AT_FINAL_WRITE' | Out-Null
+                    $script:reassessmentCompletionInjected=$true
+                }
+                & $script:reassessmentCompletionOriginal @PSBoundParameters
+            }
+            try {
+                $r=Invoke-CodexReviewLoop -RepoPath $c.Repo -ConfigPath $c.Profile -CodexPath $fake -HeartbeatSeconds 0 -Json
+                if($r.Status -ne 'completed'){throw $r.Reason}
+            }
+            finally {
+                Set-Item Function:script:Complete-ReviewLoopRun $script:reassessmentCompletionOriginal
+                Remove-Variable reassessmentCompletionOriginal,reassessmentCompletionInjected -Scope Script
+            }
+        } $c $fakeCodex
+        $calls=Get-OperatorCalls
+        @($calls | Where-Object callKind -eq review).Count | Should Be 1
+        @($calls | Where-Object phase -eq completion).Count | Should Be 2
+        @($calls | Where-Object prompt -match AT_FINAL_WRITE).Count | Should Be 1
+    }
+}
+
+Describe 'Architect reassessment recovery boundaries' {
+    AfterEach { Clear-OperatorCase }
+
+    It 'keeps a pause pending while a dirty interrupted Fixer is suspended for reassessment' {
+        $c=New-OperatorCase
+        [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'),'interrupted candidate')
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.Stage='fixing'
+            $s.Operator.InterruptedFixerCall=[pscustomobject]@{
+                CallId='suspended-fixer';ReassessmentSnapshot=Get-ReviewLoopRepositorySnapshot $c.Repo
+            }
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -PauseAt AfterRole -Message 'inspect after recovery' | Out-Null
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            Invoke-ReviewLoopPauseBoundary $s $c.Paths.StatePath Step
+            $s.Operator.Requests[0].Status | Should Be pending
+            $s.Status | Should Not Be paused
+            Get-Content (Join-Path $c.Repo 'README.txt') | Should Be 'interrupted candidate'
+        } $c
+    }
+
+    It 'rejects malformed reassessment envelopes without advancing Architect context' {
+        $c=New-OperatorCase
+        foreach($variant in @('recipient','required','kind','empty','run')) {
+            $id=Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'counter-check'
+            & (Get-Module CodexReviewLoop) {
+                param($c,$id,$variant)
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $mailbox=Get-ReviewLoopOperatorMailbox $s
+                $path=Join-Path $mailbox "$id.json"
+                $request=Read-ReviewLoopJson $path
+                switch($variant) {
+                    recipient {$request.To=@('Fixer')}
+                    required {$request.RequireDelivery=$false}
+                    kind {$request.Kind='message'}
+                    empty {$request.Message=' '}
+                    run {$request.Run.RunId='another-run'}
+                }
+                Write-ReviewLoopAtomicJson $path $request
+                Sync-ReviewLoopOperatorMessages $s $c.Paths.StatePath
+                $s.Operator.Requests[-1].Rejection | Should Not BeNullOrEmpty
+                @($s.Operator.Requests[-1].Deliveries).Count | Should Be 0
+                $s.Operator.Revisions.Architect | Should Be 0
+            } $c $id $variant
+        }
+    }
+
+    It 'preserves an interrupted dirty Fixer while reassessment fails and resumes that Fixer only after the decision' {
+        $c=New-OperatorCase
+        & (Get-Module CodexReviewLoop) {
+            param($c,$fake)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $config=Import-ReviewLoopConfig $c.Profile $c.Repo
+            Invoke-ReviewLoopOrientation -Config $config -State $s -StatePath $c.Paths.StatePath `
+                -RepoPath $c.Repo -Speed standard -RunRoot $c.Paths.RunRoot -CodexPath $fake
+            $snapshot=Get-ReviewLoopRepositorySnapshot $c.Repo
+            $s.ActiveClusterId='interrupted-fixer';$s.ActiveFindingSource='operator';$s.ActiveFixAttempt=1;$s.Stage='fixing'
+            $s.ActiveRoleCall=[pscustomobject]@{
+                CallId='interrupted-fixer-c0-fix-a1-c0';Role='Fixer';ThreadId='original-fixer-thread'
+                Model='fake';Thinking='high';Speed='standard';Mode='Exec';SchemaName='fixer-result-v3.schema.json'
+                ExecutionFingerprint=$s.ExecutionFingerprint;CriticId='';WorkRevision=$s.ArchitectWork.Revision
+                RepositoryHead=$snapshot.Head;RepositoryHeadRef=$snapshot.HeadRef;RepositoryBranch=$snapshot.Branch
+                RefsFingerprint=$snapshot.RefsFingerprint;RepositoryRefs=$snapshot.Refs
+                WorktreeFingerprint=$snapshot.Fingerprint;IndexFingerprint=$snapshot.IndexFingerprint
+                OperatorRevision=0;OperatorMessageIds=@();CheckpointStage='fixing';StartedAt=[DateTimeOffset]::UtcNow.ToString('O')
+            }
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c $fakeCodex
+        [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'),'interrupted candidate')
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'INTERRUPTED_FIXER_COUNTERCHECK' | Out-Null
+        Set-OperatorPlans $c @(@{exitCode=7},@{exitCode=7},@{exitCode=7})
+        (Invoke-OperatorLoop $c).Status | Should Not Be completed
+        $saved=Read-ReviewLoopState $c.Paths.StatePath
+        $saved.Operator.InterruptedFixerCall.ThreadId | Should Be original-fixer-thread
+        $saved.Operator.Requests[0].Deliveries[0].Status | Should Be pending
+        Get-Content (Join-Path $c.Repo 'README.txt') | Should Be 'interrupted candidate'
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 0
+        Set-OperatorPlans $c @(@{},@{},@{result=(Get-OperatorAcceptResult)},@{result='No findings.'})
+        $external=Join-Path $c.Repo 'external.txt'
+        Set-Content -LiteralPath $external 'unrelated external work'
+        $changed=Invoke-OperatorLoop $c
+        $changed.Status | Should Not Be completed
+        $changed.Reason | Should Match 'Suspended Fixer reassessment'
+        @((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result').Count | Should Be 0
+        [IO.File]::Delete($external)
+        $resumed=Invoke-OperatorLoop $c
+        if($resumed.Status -ne 'completed'){throw $resumed.Reason}
+        $fixers=@((Get-OperatorCalls) | Where-Object schemaPath -match 'fixer-result')
+        $fixers.Count | Should Be 1
+        $fixers[0].resumeThreadId | Should Be original-fixer-thread
+        $saved=Read-ReviewLoopState $c.Paths.StatePath
+        $saved.Operator.InterruptedFixerCall | Should BeNullOrEmpty
+        $saved.Operator.Requests[0].Deliveries[0].Status | Should Be delivered
+    }
+
+    It 'recovers a saved role result before or after registration without repeating the Architect call' {
+        foreach($crash in @('before','after')) {
+            $c=New-OperatorCase
+            Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'REGISTER_COUNTERCHECK' | Out-Null
+            & (Get-Module CodexReviewLoop) {
+                param($c,$fake,$crash)
+                $script:reassessmentRegisterOriginal=${function:Register-ReviewLoopWorkPlan}
+                $script:reassessmentRegisterCrash=$crash
+                function script:Register-ReviewLoopWorkPlan {
+                    param($State,$Result,[switch]$RequireSelection)
+                    $authoritative=$State.PSObject.Properties.Name -contains 'Operator'
+                    if($authoritative -and $script:reassessmentRegisterCrash -eq 'before'){throw 'simulated registration crash'}
+                    & $script:reassessmentRegisterOriginal @PSBoundParameters
+                    if($authoritative){throw 'simulated registration crash'}
+                }
+                try {
+                    $s=Read-ReviewLoopState $c.Paths.StatePath
+                    $config=Import-ReviewLoopConfig $c.Profile $c.Repo
+                    {Invoke-ReviewLoopArchitect -Config $config -State $s -StatePath $c.Paths.StatePath -RepoPath $c.Repo `
+                        -Speed standard -RunRoot $c.Paths.RunRoot -Findings @() -CodexPath $fake -Reassessment} | Should Throw 'registration crash'
+                }
+                finally {
+                    Set-Item Function:script:Register-ReviewLoopWorkPlan $script:reassessmentRegisterOriginal
+                    Remove-Variable reassessmentRegisterOriginal,reassessmentRegisterCrash -Scope Script
+                }
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $s.Operator.Requests[0].Deliveries[0].Status | Should Be pending
+                Invoke-ReviewLoopArchitect -Config $config -State $s -StatePath $c.Paths.StatePath -RepoPath $c.Repo `
+                    -Speed standard -RunRoot $c.Paths.RunRoot -Findings @() -CodexPath $fake -Reassessment | Out-Null
+                $s.Operator.Requests[0].Deliveries[0].Status | Should Be delivered
+            } $c $fakeCodex $crash
+            @(Get-OperatorCalls).Count | Should Be 1
+            Clear-OperatorCase
+        }
+    }
+
+    It 'retains the pending-commit invalidation intent across an interrupted index cleanup' {
+        $c=New-OperatorCase
+        [IO.File]::WriteAllText((Join-Path $c.Repo 'README.txt'),'candidate')
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.ActiveFindingSource='operator';$s.ActiveClusterId='interrupted-cleanup';$s.Stage='commit_pending'
+            $ledger=New-ReviewLoopLedger $c.Repo
+            Write-ReviewLoopLedger $c.Paths.LedgerPath $ledger | Out-Null
+            Close-ReviewLoopOperatorBoundary $s $c.Paths.StatePath commit | Out-Null
+            & git -C $c.Repo add -A
+            $s.PendingCommit=[pscustomobject]@{
+                PreHead=$s.CurrentHead;PatchFingerprint=Get-ReviewLoopWorktreeFingerprint $c.Repo
+                ExpectedTree=Get-ReviewLoopGitValue $c.Repo @('write-tree');ExpectedCommit='';Message='Test: cleanup recovery';NeedsCurrentGates=$false
+                OperatorBoundaryId=$s.Operator.Boundary.Id
+                Verification=[pscustomobject]@{WorkRevision=0;workOutcomes=@();goalComplete=$false}
+            }
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -ReassessArchitect -Message 'CLEANUP_COUNTERCHECK' | Out-Null
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $script:reassessmentRestoreOriginal=${function:Restore-ReviewLoopVerifiedPatchToCleanIndex}
+            function script:Restore-ReviewLoopVerifiedPatchToCleanIndex {throw 'simulated cleanup crash'}
+            try {
+                $s=Read-ReviewLoopState $c.Paths.StatePath
+                $config=Import-ReviewLoopConfig $c.Profile $c.Repo
+                $ledger=Read-ReviewLoopLedger $c.Paths.LedgerPath
+                {Complete-ReviewLoopPendingCommit -Config $config -State $s -StatePath $c.Paths.StatePath `
+                    -Ledger $ledger -LedgerPath $c.Paths.LedgerPath -RepoPath $c.Repo -RunRoot $c.Paths.RunRoot} | Should Throw 'cleanup crash'
+            }
+            finally {
+                Set-Item Function:script:Restore-ReviewLoopVerifiedPatchToCleanIndex $script:reassessmentRestoreOriginal
+                Remove-Variable reassessmentRestoreOriginal -Scope Script
+            }
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.PendingCommit.ReassessmentRequired | Should Be $true
+            Complete-ReviewLoopPendingCommit -Config $config -State $s -StatePath $c.Paths.StatePath `
+                -Ledger $ledger -LedgerPath $c.Paths.LedgerPath -RepoPath $c.Repo -RunRoot $c.Paths.RunRoot | Should Be $false
+            $s.PendingCommit | Should BeNullOrEmpty
+            $s.Operator.Requests[0].Deliveries[0].Status | Should Be pending
+            @(& git -C $c.Repo diff --cached --name-only).Count | Should Be 0
+            Get-Content (Join-Path $c.Repo 'README.txt') | Should Be candidate
+        } $c
     }
 }
 
