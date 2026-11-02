@@ -141,6 +141,12 @@ terminal or checkpoint; only its effect on the execution fingerprint is kept.
 roles. It is a CLI input, not a profile setting. A new run without it asks the
 Architect to reconstruct the goal from repository evidence. The raw text and
 clarified goal are persisted with architecture work in the run checkpoint.
+Every Reviewer, Architect, Fixer, Critic and Lessons Learned call receives the
+complete saved assignment, the goal with sources and uncertainties, and compact
+open work. Fixers receive only selected work; the mechanical ReviewClassifier
+receives no task context. This also applies after orientation and on resume.
+The goal states the desired outcome; defects, repairs and acceptance status
+remain in work orders and assessments rather than changing the assignment.
 
 Resume without the parameter inherits the saved text. An explicit replacement,
 including an empty string, requires new orientation and invalidates dependent

@@ -6,7 +6,7 @@ description: Explain, prepare, run, or resume CodexReviewLoop with shared task c
 # Review Loop
 
 Use `codex-review-loop.ps1` with PowerShell 7. Read `installation.json` beside
-this skill; `repositoryPath` records the primary tool checkout. Infer the target
+this skill; use its `repositoryPath` as `$reviewLoopRoot`. Infer the target
 repository from the conversation. Resolve paths and routine configuration yourself.
 
 Start or resume only when asked. The loop can edit and auto-commit; new runs
@@ -14,10 +14,13 @@ require a clean dedicated branch. Preserve unrelated changes.
 
 ## Shared task and resume
 
-For a new run, pass the goal, acceptance criteria and user constraints neutrally
-in `-TaskContext`, applying [prompting](../prompting/SKILL.md). Implementation
-choices and previous checks are evidence, not requirements. Without a supplied
-task the Architect reconstructs the goal from the branch and project sources.
+For a new run, preserve the user's full assignment, acceptance criteria,
+constraints and explicit exceptions in `-TaskContext`, applying
+[prompting](../prompting/SKILL.md). This saved assignment reaches every working role
+on each call. Keep the derived goal focused on the desired outcome; evolving defect,
+repair and acceptance status belongs in work orders and assessments. Implementation
+choices and previous checks are evidence. Without a supplied task the Architect
+reconstructs the goal from the branch and project sources.
 
 ```powershell
 & (Join-Path $reviewLoopRoot 'codex-review-loop.ps1') -RepoPath $repoPath
@@ -29,8 +32,11 @@ are discovered automatically. Repeating the compatible command resumes its check
 
 On resume, omit TaskContext to inherit the saved assignment. Replace it only for a
 user-authorized assignment change; an explicit empty value requests reconstruction.
-Keep ReviewerInstructions for Reviewer-specific guidance, preserving profile guidance.
-When supplied, retain its exact text on resume; only its fingerprint is checkpointed.
+Use ReviewerInstructions for guidance needed on every native review. An explicit
+CLI value replaces profile guidance, so preserve any still-applicable text.
+Retain the exact supplied text on resume; only its fingerprint is checkpointed.
+It is fixed for the invocation. To change it during a run, pause safely and resume
+with the intended guidance; existing review/acceptance evidence is requalified.
 
 MaxFixAttempts returns the preserved candidate to native review. MaxReviewCycles
 bounds one invocation and resets on resume. Assess progress at `limit_reached`;
@@ -47,18 +53,16 @@ Use the exact reported RunRoot containing `run-v1.json` for every intervention:
 
 | Need | Action |
 | --- | --- |
-| A hint for the next matching role call | Message with explicit recipients |
+| A hint for one matching call per role | Message with explicit recipients |
 | New product evidence requires revisiting a decision before more fixing or acceptance | Architect reassessment |
 | Evidenced recurring working-process problems | One-time Critic request |
 | A necessary investigation or handover | Controlled pause |
 | Re-entry after context loss or unclear pending interventions | Read-only status |
 
 Already live-changeable profile settings use the existing profile/configuration
-reload path in [configuration](../../docs/configuration.md); do not send them as
-operator requests. Detailed boundaries and recovery rules belong to
-[operations](../../docs/operations.md) in the tool checkout. See also
-[workflow](../../docs/how-it-works.md). Resolve these documents from repositoryPath
-when using an installed copy of this skill.
+reload path in `docs/configuration.md`; do not send them as operator requests.
+Resolve this and `docs/operations.md` (boundaries/recovery) and
+`docs/how-it-works.md` (workflow) from `$reviewLoopRoot`.
 
 ## Messages and reassessment
 
@@ -69,20 +73,24 @@ when using an installed copy of this skill.
 ```
 
 Choose Reviewer for native review evidence, Architect for advice/assessment and
-Fixer for implementation evidence. Ordinary messages reach the next regular call
-once per recipient, including resume. Running calls are never interrupted.
-Use RequireDelivery sparingly: it can force additional review, fixing or assessment
-before the next unsealed commit or completion, within existing budgets.
+Fixer for implementation evidence. A message is delivered once per recipient:
+a Reviewer hint applies to one native review, not subsequent review cycles.
+Pending delivery survives resume; transport retries belong to the same logical
+call. Running calls are never interrupted. RequireDelivery can force addressed
+roles before the next unsealed commit or completion, within existing budgets;
+it does not make the message permanent. Otherwise, recipients with no further
+matching call are rejected at completion.
 
 ReassessArchitect uses the existing Architect session and normal decision contract.
 It remains effective during commit/completion gates before atomic HEAD advancement
 or completion. It preserves the candidate and still-matching test evidence.
-It has no To, RequireDelivery or PauseAt. Inspect the normal Architect result.
+It has no To, RequireDelivery or PauseAt.
 
-Publication returns an ID, not proof of delivery or a reached halt. Keep it;
-retry an uncertain publication with identical arguments and `-Id $messageId`.
-Changed content needs a new ID. Normal output reports delivery, evaluation or
-rejection briefly. Requests never replace the assignment or grant acceptance.
+Publication returns an ID. Retry an uncertain publication with identical arguments
+and `-Id $messageId`; this does not redeliver a consumed message. Changed content
+needs a new ID. Normal output reports delivery, evaluation, rejection or a reached
+halt. Delivery is not agreement or resolution: inspect the normal role result.
+Requests never replace the assignment or grant acceptance.
 Never edit checkpoints/mailboxes or silently forward requests to a different run.
 
 ## One-time Critic
@@ -91,12 +99,13 @@ Never edit checkpoints/mailboxes or silently forward requests to a different run
 & (Join-Path $reviewLoopRoot 'operator-message.ps1') $runRoot -RequestCritic -Message 'Repeated repairs assume X. Evidence: assessment-3.json.'
 ```
 
-Check existing criticism and the participants' response first. Do not repeat
-requests without new evidence or infer poor work from elapsed time alone.
+Check what participants received, existing criticism and their response. Do not
+repeat requests without new evidence or infer poor work from elapsed time alone.
 The advisory Critic handles selected requests at the next legal cycle boundary,
 even with automatic critiques disabled; a due automatic call handles them too.
-It interrupts no work. Pending requests survive pause, budget exhaustion and
-resume. Completion takes precedence and supersedes remaining requests.
+It interrupts no work. A due Critic can follow a clean review while more reviews
+are required. Pending requests survive pause, budget exhaustion and resume.
+Completion takes precedence and supersedes remaining requests.
 This mode excludes To, RequireDelivery, PauseAt and ReassessArchitect.
 
 ## Controlled pause and handover
@@ -131,11 +140,9 @@ $status = & (Join-Path $reviewLoopRoot 'operator-status.ps1') $runRoot | Convert
 
 Saved contains checkpoint facts; Observed contains separately sourced observations.
 Neither a saved active role nor recent terminal output proves a running process.
-A held repository lease identifies no process or run. Missing facts are omitted;
-the invocation counter is available, but its unrecorded budget limit is not.
+A held repository lease identifies no process or run. Status reads pending
+requests without importing them or changing the run.
 
-Status reads open checkpoint and published mailbox requests without importing them
-or changing the run. Since returns up to 50 complete new terminal.log lines,
-a new Cursor and Changes.HasMore. Continue with that cursor for remaining pages.
-Foreign/reset cursors are rejected; obtain a fresh status deliberately.
-No polling or second dashboard is needed.
+Since returns up to 50 complete new terminal.log lines and a new Cursor. Continue
+with that cursor while Changes.HasMore. After a foreign/reset cursor rejection,
+obtain a fresh status.

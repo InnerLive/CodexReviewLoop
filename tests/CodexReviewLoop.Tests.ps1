@@ -2315,10 +2315,13 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
         $destination = Join-Path $TestDrive 'primary-installed-skills'
         & (Join-Path $root 'install-skills.ps1') -SkillsPath $destination | Out-Null
         $binding = Get-Content -Raw (Join-Path $destination 'review-loop/installation.json') | ConvertFrom-Json
-        $binding.repositoryPath | Should Be $root
+        $primaryRecord = @(& git -C $root worktree list --porcelain)[0]
+        $LASTEXITCODE | Should Be 0
+        $primary = [IO.Path]::GetFullPath($primaryRecord.Substring('worktree '.Length))
+        $binding.repositoryPath | Should Be $primary
         foreach ($name in @('prompting', 'review-loop')) {
             (Get-Content -Raw (Join-Path $destination "$name/SKILL.md")) |
-                Should Be (Get-Content -Raw (Join-Path $root "skills/$name/SKILL.md"))
+                Should Be (Get-Content -Raw (Join-Path $primary "skills/$name/SKILL.md"))
         }
         $installed = Get-Content -Raw (Join-Path $destination 'review-loop/SKILL.md')
         foreach ($boundary in @('AfterRole','AfterRound','BeforeCommit','BeforeCompletion')) {
@@ -2333,7 +2336,7 @@ Describe "Skill installation checkout selection" -Tags @("FullLocal") {
         Test-Path (Join-Path $destination 'review-loop/../prompting/SKILL.md') | Should Be $true
         $installed | Should Match 'user-authorized assignment change'
         (Get-FileHash (Join-Path $destination 'review-loop/SKILL.md')).Hash |
-            Should Be (Get-FileHash (Join-Path $root 'skills/review-loop/SKILL.md')).Hash
+            Should Be (Get-FileHash (Join-Path $primary 'skills/review-loop/SKILL.md')).Hash
         $operator = Join-Path $binding.repositoryPath 'operator-message.ps1'
         Test-Path $operator | Should Be $true
         (& $operator -Help | Out-String) | Should Match 'PauseAt'
@@ -2615,6 +2618,16 @@ Fixer result and targeted-test evidence:
         $fixer | Should Not Match 'targetedTest\.executable'
     }
 
+    It "separates the intended goal from defects and acceptance in orientation guidance" {
+        $orientation = Get-Content -Raw (Join-Path $root 'prompts/architect-orientation.md')
+        $orientation | Should Match 'intended outcome in goal.statement'
+        $orientation | Should Match 'not current defects, repair'
+        $orientation | Should Match 'in orders; put implementation judgments in assessments'
+        $context = Get-Content -Raw (Join-Path $root 'prompts/architecture-context.md')
+        $context | Should Match 'original assignment, including its exceptions and non-goals, is authoritative'
+        $context | Should Match 'Current findings still require independent evaluation'
+    }
+
     It "describes the deterministic orchestrator and each structured role handoff" {
         $instructions = & (Get-Module CodexReviewLoop) {
             $config = @{ HostGates = @() }
@@ -2719,6 +2732,14 @@ Describe "Lessons-learned retrospective evidence" -Tags @("Fast", "FullLocal") {
                 StructuredResult = [pscustomobject]@{ summary = "Handle both sibling paths." }
             },
             [pscustomobject]@{
+                Role = "Architect"; CallId = "C-test-c2-architect-reassess"; Success = $true
+                StructuredResult = [pscustomobject]@{ summary = "New evidence excludes the second path." }
+            },
+            [pscustomobject]@{
+                Role = "Architect"; CallId = "C-test-c2-architect-reassess"; Success = $true
+                StructuredResult = [pscustomobject]@{ summary = "Later evidence confirms the narrower scope." }
+            },
+            [pscustomobject]@{
                 Role = "Fixer"; CallId = "C-test-c2-fix-a1-c0"; Success = $true
                 StructuredResult = [pscustomobject]@{ summary = "Updated the first path." }
             },
@@ -2799,6 +2820,9 @@ Describe "Lessons-learned retrospective evidence" -Tags @("Fast", "FullLocal") {
         $evidence.cycles[1].reviewerResult | Should Be "finding"
         @($evidence.cycles[1].fixerAttempts).Count | Should Be 3
         @($evidence.cycles[1].architectAssessments).Count | Should Be 2
+        @($evidence.cycles[1].architectSummaries) | Should Be @(
+            'Handle both sibling paths.', 'New evidence excludes the second path.',
+            'Later evidence confirms the narrower scope.')
         @($evidence.cycles[1].resolutionCommits) | Should Be @($current)
         $evidence.diff.initial.files | Should Be 1
         $evidence.diff.initial.additions | Should Be 1

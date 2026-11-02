@@ -263,7 +263,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
         $critics[0].Thinking | Should Be 'high'
         $saved.ReviewCycle | Should Be 43
         $saved.ActiveCriticCall | Should BeNullOrEmpty
-        ($calls[1].arguments -join ' ') | Should Not Match 'Reviewer: examine'
+        ($calls[1].arguments -join ' ') | Should Match 'Reviewer: examine'
         ($calls[1].arguments -join ' ') | Should Not Match 'Architect: make'
     }
 
@@ -370,7 +370,7 @@ Describe "Periodic Critic process and resume" -Tags @("Process") {
             ($calls[$index].arguments -join ' ') | Should Not Match 'Reviewer: examine'
         }
         ($calls[4].arguments -join ' ') | Should Match 'Keep my original review context'
-        ($calls[4].arguments -join ' ') | Should Not Match 'Reviewer: examine the current work independently'
+        ($calls[4].arguments -join ' ') | Should Match 'Reviewer: examine the current work independently'
         ($calls[4].arguments -join ' ') | Should Not Match 'Architect: make'
         $state.RoleCalls[-1].CriticId | Should Be 'critic-0010'
         $saved = Read-ReviewLoopState $statePath
@@ -5187,18 +5187,19 @@ Describe "Bounded native transport and concise role context" -Tags @("Process") 
         Test-Path $env:CODEX_REVIEW_LOOP_FAKE_LOG | Should Be $false
     }
 
-    It "keeps short native review guidance and base without state or Critic serialization" {
+    It "delivers the original assignment to native review without serializing repository snapshots" {
         $case=New-ReliabilityTestCase
         $config=Import-PowerShellDataFile $case.ConfigPath
         $config.ReviewerInstructions='Prüfe A29 gemäß Paketkarte.'
         $state=New-ReviewLoopState -RepoPath $case.Repo -ReviewBase HEAD -Speed standard -RunRoot $case.LogRoot -ReviewBaseCommit (& git -C $case.Repo rev-parse HEAD)
         $state.RetainedCandidate=[pscustomobject]@{Snapshot=[pscustomobject]@{Refs=@('DO_NOT_SERIALIZE'*5000)}}
-        $state.TaskContext='DO_NOT_SERIALIZE'
+        $state.TaskContext='Keep the current contract; legacy compatibility is not required.'
         $call=& (Get-Module CodexReviewLoop) { param($c,$s,$r,$log,$fake) Invoke-ConfiguredCodexRole -Config $c -Role Reviewer -RepoPath $r -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -LogRoot $log -CallId review-short -State $s -StatePath (Join-Path $log 'run-v1.json') -CodexPath $fake } $config $state $case.Repo $case.LogRoot $fakeCodex
         $call.Success | Should Be $true
         $record=Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ConvertFrom-Json
         ($record.arguments -join ' ') | Should Match 'review --base HEAD'
         ($record.arguments -join ' ') | Should Match 'Prüfe A29'
+        ($record.arguments -join ' ') | Should Match 'legacy compatibility is not required'
         ($record.arguments -join ' ') | Should Not Match 'DO_NOT_SERIALIZE'
         $record.prompt | Should Be ''
     }
@@ -5228,20 +5229,68 @@ Describe "Bounded native transport and concise role context" -Tags @("Process") 
         }
     }
 
-    It "excludes snapshots history and outcome evidence and emits each active objective once" {
+    It "shares the complete task and goal while filtering only Fixer work and excluding repository snapshots" {
         $case=New-ReliabilityTestCase
         $s=New-ReviewLoopState -RepoPath $case.Repo -ReviewBase HEAD -Speed standard -RunRoot $case.LogRoot -ReviewBaseCommit (& git -C $case.Repo rev-parse HEAD)
-        $s.ArchitectWork.Goal=[pscustomobject]@{statement='CURRENT_GOAL';sources=@('PRIVATE_TECHNICAL_EVIDENCE');uncertainties=@()}
+        $s.TaskContext='ORIGINAL_TASK_WITH_EXCEPTION'
+        $s.ArchitectWork.Goal=[pscustomobject]@{statement='CURRENT_GOAL';sources=@('GOAL_SOURCE');uncertainties=@('GOAL_UNCERTAINTY')}
         $s.ArchitectWork.OrientationRequired=$false
         & (Get-Module CodexReviewLoop) { param($state) Merge-ReviewLoopWorkOrders -State $state -Orders @([pscustomobject]@{id='W-1';objective='CURRENT_OBJECTIVE';rationale='PRIVATE_TECHNICAL_EVIDENCE';doneWhen='CURRENT_DONE';evidence=@('PRIVATE_TECHNICAL_EVIDENCE')}) } $s
         $s.ActiveWorkIds=@('W-1')
-        foreach($role in @('Architect','Fixer')) {
+        & (Get-Module CodexReviewLoop) { param($state) Merge-ReviewLoopWorkOrders -State $state -Orders @([pscustomobject]@{id='W-2';objective='OTHER_OBJECTIVE';rationale='PRIVATE_TECHNICAL_EVIDENCE';doneWhen='OTHER_DONE';evidence=@()}) } $s
+        foreach($role in @('Reviewer','Architect','Fixer','Critic','LessonsLearned')) {
             $text=& (Get-Module CodexReviewLoop) { param($state,$repo,$role) Get-ReviewLoopSharedContextInstructions -State $state -RepoPath $repo -Role $role } $s $case.Repo $role
-            foreach($token in @('CURRENT_GOAL','CURRENT_OBJECTIVE','CURRENT_DONE')) { [regex]::Matches($text,$token).Count | Should Be 1 }
+            foreach($token in @('ORIGINAL_TASK_WITH_EXCEPTION','CURRENT_GOAL','GOAL_SOURCE','GOAL_UNCERTAINTY','CURRENT_OBJECTIVE','CURRENT_DONE')) { [regex]::Matches($text,$token).Count | Should Be 1 }
             $text | Should Not Match 'PRIVATE_TECHNICAL_EVIDENCE|RetainedCandidate|outcomeEvidence|Refs'
+            if ($role -eq 'Fixer') { $text | Should Not Match 'OTHER_OBJECTIVE|OTHER_DONE' }
+            else { $text | Should Match 'OTHER_OBJECTIVE'; $text | Should Match 'OTHER_DONE' }
         }
-        foreach($role in @('Reviewer','Critic','LessonsLearned')) {
-            (& (Get-Module CodexReviewLoop) { param($state,$repo,$role) Get-ReviewLoopSharedContextInstructions -State $state -RepoPath $repo -Role $role } $s $case.Repo $role) | Should Be ''
+        (& (Get-Module CodexReviewLoop) { param($state,$repo) Get-ReviewLoopSharedContextInstructions -State $state -RepoPath $repo -Role ReviewClassifier } $s $case.Repo) | Should Be ''
+    }
+
+    It "passes assignment exceptions goal sources and uncertainties to real role processes on fresh and resumed calls" {
+        $case = New-ReliabilityTestCase
+        $config = Import-PowerShellDataFile $case.ConfigPath
+        $state = New-ReviewLoopState -RepoPath $case.Repo -ReviewBase HEAD -Speed standard `
+            -RunRoot $case.LogRoot -ReviewBaseCommit (& git -C $case.Repo rev-parse HEAD)
+        $state.TaskContext = "Support expressions.`nLegacy compatibility is not required; retain Umlauts: äöü."
+        $state.ArchitectWork.OrientationRequired = $false
+        $state.ArchitectWork.Goal = [pscustomobject]@{
+            statement = 'DESIRED_OUTCOME'; sources = @('USER_REQUIREMENTS'); uncertainties = @('UNCONFIRMED_UI_BEHAVIOR')
+        }
+        foreach ($role in @('Reviewer','Architect','Fixer','Critic','LessonsLearned','ReviewClassifier')) {
+            $config.Roles[$role] = @{ Model = 'fake'; Thinking = 'high' }
+            foreach ($attempt in 1..2) {
+                $mode = if ($role -eq 'Reviewer') { 'Review' } elseif ($attempt -eq 1) { 'Exec' } else { 'Resume' }
+                $call = & (Get-Module CodexReviewLoop) {
+                    param($c,$s,$r,$logs,$fake,$role,$mode,$attempt)
+                    Invoke-ConfiguredCodexRole -Config $c -Role $role -RepoPath $r -Speed standard `
+                        -Mode $mode -ThreadId $(if ($mode -eq 'Resume') { 'context-session' } else { '' }) `
+                        -ReviewBase HEAD -Prompt $(if ($role -eq 'Reviewer') { '' } else { 'Current work.' }) `
+                        -LogRoot $logs -CallId "$role-context-$attempt" -State $s `
+                        -StatePath (Join-Path $logs 'run-v1.json') -CodexPath $fake
+                } $config $state $case.Repo $case.LogRoot $fakeCodex $role $mode $attempt
+                $call.Success | Should Be $true
+            }
+        }
+        $records = @(Get-Content $env:CODEX_REVIEW_LOOP_FAKE_LOG | ForEach-Object { $_ | ConvertFrom-Json })
+        $records.Count | Should Be 12
+        @($records | Where-Object callKind -eq 'resume').Count | Should Be 5
+        for ($index = 0; $index -lt $records.Count; $index++) {
+            $record = $records[$index]
+            if ($record.callKind -eq 'review') { $record.prompt | Should Be '' }
+            $text = if ($record.callKind -eq 'review') {
+                $value = @($record.arguments | Where-Object { $_ -like 'developer_instructions=*' })[0]
+                $value.Substring('developer_instructions='.Length) | ConvertFrom-Json
+            } else { $record.prompt }
+            if ($index -ge 10) { $text | Should Not Match 'DESIRED_OUTCOME|Legacy compatibility|USER_REQUIREMENTS|UNCONFIRMED_UI_BEHAVIOR' }
+            else {
+                $text | Should Match 'DESIRED_OUTCOME'
+                $text | Should Match 'USER_REQUIREMENTS'
+                $text | Should Match 'UNCONFIRMED_UI_BEHAVIOR'
+                $payload = [regex]::Match($text, '(?m)^\{"taskContext":.*$').Value | ConvertFrom-Json
+                $payload.taskContext | Should Be $state.TaskContext
+            }
         }
     }
 }

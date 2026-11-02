@@ -1,6 +1,9 @@
 Clarify the overall task before review. Inspect branch changes, commit messages,
 source, tests and project documentation. Distinguish explicit requirements from
 inferences; record sources and uncertainties. Existing behavior can be wrong.
+Describe the intended outcome in goal.statement, not current defects, repair
+steps or acceptance status. Put discovered defects and necessary corrections
+in orders; put implementation judgments in assessments.
 Reconcile earlier open work instead of silently dropping it. Propose only work
 necessary for the evidenced goal, with stable IDs and observable completion criteria.
 

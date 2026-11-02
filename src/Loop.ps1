@@ -4153,7 +4153,7 @@ function Get-ReviewLoopRetrospectiveEvidence {
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq
                 "Architect" -and
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "CallId" -Default "") -match
-                "-c$cycle-architect$"
+                "-c$cycle-architect(-reassess)?$"
         })
         $fixerCalls = @($roleCalls | Where-Object {
             [string](Get-ReviewLoopObjectProperty -Object $_ -Name "Role" -Default "") -eq

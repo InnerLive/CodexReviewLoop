@@ -6,7 +6,7 @@ CriticStartAfterReviews is the current starting threshold of completed native re
 Additional Operator requests (assess their reasons independently):
 {{OPERATOR_REQUESTS}}
 
-Available task guidance supplied to the Reviewer:
+Additional Reviewer-specific instructions:
 {{REVIEWER_INSTRUCTIONS}}
 
 Run retrospective:

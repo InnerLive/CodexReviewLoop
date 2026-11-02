@@ -171,16 +171,21 @@ Describe "Shared architecture work" -Tags @("FullLocal") {
         & (Get-Module CodexReviewLoop) { param($s) Test-ReviewLoopGoalAccepted $s } $state | Should Be $true
     }
 
-    It "handles an open architecture order despite a clean native review and accepts a no-op" {
+    It "keeps the desired goal and task stable across repair acceptance and subsequent clean review" {
+        $task = 'Preserve the percentage behavior. Legacy compatibility is not required.'
+        $order = New-WorkTestOrder
+        $order.objective = 'Correct the inconsistent percentage export'
         Set-WorkTestPlans @(
-            (New-WorkTestOrientation @((New-WorkTestOrder))),
+            (New-WorkTestOrientation @($order)),
             @{result="No findings."}, (New-WorkTestAdvice), (New-WorkTestFix), (New-WorkTestAssessment))
-        $result = Invoke-CodexReviewLoop @arguments
+        $result = Invoke-CodexReviewLoop @arguments -TaskContext $task
         $result.Status | Should Be "limit_reached"
         $state = Read-ReviewLoopState $result.StatePath
         $state.CleanPasses | Should Be 0
         $state.ArchitectWork.Orders[0].status | Should Be "accepted"
         $state.ArchitectWork.Orders[0].outcomeEvidence | Should Not BeNullOrEmpty
+        $state.ArchitectWork.Goal.statement | Should Be 'Preserve public percentage behavior'
+        $state.TaskContext | Should Be $task
         Set-WorkTestPlans @(@{result="No findings."})
         $resumed = Invoke-CodexReviewLoop @arguments
         $resumed.Status | Should Be "completed"
@@ -189,6 +194,18 @@ Describe "Shared architecture work" -Tags @("FullLocal") {
         $fixCall = @($calls | Where-Object schemaPath -Match "fixer")[0]
         $fixCall.prompt | Should Match "Preserve public percentage behavior"
         $fixCall.prompt | Should Match "W-1"
+        $fixCall.prompt | Should Match 'Legacy compatibility is not required'
+        $reviews = @($calls | Where-Object callKind -eq 'review')
+        $reviews.Count | Should Be 2
+        ($reviews[0].arguments -join ' ') | Should Match 'Correct the inconsistent percentage export'
+        ($reviews[1].arguments -join ' ') | Should Not Match 'Correct the inconsistent percentage export|W-1'
+        foreach ($review in $reviews) {
+            ($review.arguments -join ' ') | Should Match 'Preserve public percentage behavior'
+            ($review.arguments -join ' ') | Should Match 'Legacy compatibility is not required'
+        }
+        $finished = Read-ReviewLoopState $resumed.StatePath
+        $finished.ArchitectWork.Goal.statement | Should Be $state.ArchitectWork.Goal.statement
+        $finished.TaskContext | Should Be $task
         @(& git -C $arguments.RepoPath status --porcelain).Count | Should Be 0
     }
 
@@ -299,7 +316,7 @@ Describe "Shared architecture work" -Tags @("FullLocal") {
         (Invoke-CodexReviewLoop @arguments).Status | Should Be "completed"
     }
 
-    It "delivers shared context to mechanical classification without replacing native review evidence" {
+    It "classifies native review text without receiving shared task context or overriding findings" {
         Set-WorkTestPlans @(
             @{result="The overall implementation seems reasonable."},
             @{result='{"schemaVersion":"1.0","hasFindings":false}'})

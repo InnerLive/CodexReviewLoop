@@ -9,11 +9,12 @@ not intercept shell commands started internally by Codex. All six roles receive
 the same short instruction to keep each shell call concise. Structured roles
 receive it on stdin, including resume; native review appends it to the original
 Reviewer guidance. This is guidance, without an artificial 200- or 500-character
-limit. Use concise Reviewer
-guidance; native review already uses
-the pinned base and repository instructions. Shared state, ref inventories and
-history are not Reviewer instructions. Structured roles receive the current
-task and relevant open work once through stdin, without technical snapshots.
+limit. Native review receives the complete saved assignment, clarified goal,
+compact open work, its latest Critic feedback and pending Operator evidence
+through supplemental developer instructions, alongside Reviewer-specific guidance.
+Full checkpoints, ref inventories and history are not serialized into those
+instructions. Structured roles receive their instructions once through stdin,
+including resume, without technical snapshots.
 The adapter uses equivalent short flags and paths, retaining model, reasoning,
 service tier, authentication, repository scope, schema and result identity.
 Artifact basenames use a deterministic CallId digest and role; durable calls retain

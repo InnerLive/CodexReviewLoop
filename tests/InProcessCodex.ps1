@@ -281,10 +281,8 @@ function Invoke-InProcessCodexRole {
     elseif ($effectiveMode -eq "Review") {
         $arguments += @("review", "--base", $ReviewBase)
     }
-    $developer = if ($Mode -eq "Review") { [string]$Config.ReviewerInstructions } else { Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config }
-    if ($Mode -ne 'Review' -and $null -ne $State -and $State.SchemaVersion -eq "2.0") {
-        $developer += "`n`n" + (Get-ReviewLoopSharedContextInstructions -State $State -RepoPath $RepoPath -Role $Role)
-    }
+    $developer = Get-ReviewLoopRoleInstructions -Role $Role -Config $Config -RepoPath $RepoPath `
+        -State $State -Critic (Get-ReviewLoopLatestCritique -State $State)
     if ($Mode -eq 'Review') {
         if ($developer) { $arguments += @("-c", "developer_instructions=$(ConvertTo-Json -InputObject $developer -Compress)") }
     } else { $Prompt = $developer + "`n`n" + $Prompt }

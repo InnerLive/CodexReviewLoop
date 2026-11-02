@@ -109,6 +109,9 @@ original texts; they supply no Fixer feedback. New schema 2.0 critiques require
 all three texts and replace the feedback delivered on subsequent role calls.
 Existing session history is not rewritten. Each recipient call records the
 critique ID actually delivered; old results are not relabeled as new decisions.
+The shared retrospective includes ordinary Architect advice and targeted
+reassessments in call order, so later decisions remain visible to both Critic
+and Lessons Learned alongside the original advice.
 
 ## Shared goal and architecture work
 
@@ -117,13 +120,21 @@ behavior from the branch diff, commit messages, source, tests, and documentation
 Optional `TaskContext` supplies the original assignment. Explicit requirements,
 repository evidence, and remaining uncertainties stay distinguishable; existing
 code is not automatically the specification.
+The goal describes the intended outcome, not current defects, repair steps or
+acceptance status. Defects and corrections belong to work orders; implementation
+judgments belong to assessments. Completing work does not rewrite the goal.
 
 The versioned run state stores this goal and architecture orders with stable IDs,
 rationale, evidence, completion criteria, and status. The Architect may create
 necessary work without a native finding, but must justify its connection to the
 goal or a defect cause. Omitting an order never closes it. Every working role,
-including resumed sessions, receives the compact current goal and open orders.
-Larger artifacts are referenced instead of replayed.
+including resumed sessions, receives the complete original assignment, the goal
+with its sources and uncertainties, and compact open orders. This applies to
+Reviewer, Architect, Fixer, Critic and Lessons Learned; the mechanical
+ReviewClassifier receives only review text. Only the Fixer's orders are limited
+to its selected work. The original assignment, including exceptions and non-goals,
+remains authoritative. Prior decisions never suppress current findings.
+Larger artifacts and repository snapshots are not replayed as shared context.
 
 ## The cycle
 
@@ -160,6 +171,9 @@ repository and configured review base, but no positional reviewer prompt or
 output schema. Optional `ReviewerInstructions` are supplied as supplemental
 developer instructions without replacing the native `review --base` workflow.
 Every native review starts fresh; Reviewer threads are deliberately not reused.
+The same developer-instructions setting also carries the shared task context,
+the latest Critic feedback addressed to the Reviewer, and pending one-time
+Operator evidence. These supplement the native review rather than replace it.
 
 The native Reviewer is treated as a repository transaction. Each call starts
 from a clean checkpoint or the exact owned, retained Fixer candidate. Dirty
@@ -206,7 +220,7 @@ All fixed developer-instruction, phase, and technical-recovery prompt text is
 versioned as Markdown under `prompts/`; PowerShell only selects templates and
 supplies dynamic values.
 
-The structured Architect response is passed unchanged to the Fixer. After each
+The Fixer receives the Architect's advice and selected open work. After each
 Fixer result, the same Architect thread assesses the resulting repository state.
 The periodic Critic supplies advice only; there is no judge, confirmation,
 veto, or tie-break role in the acceptance path.

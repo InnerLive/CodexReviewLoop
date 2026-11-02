@@ -468,8 +468,9 @@ Describe 'One-time Operator Critic requests' {
         $calls[1].prompt | Should Not Match 'Reviewer: examine|Fixer: implement'
         $calls[2].prompt | Should Match 'Fixer: implement'
         $calls[2].prompt | Should Not Match 'Reviewer: examine|Architect: make'
-        # Preserve the native Reviewer's existing guidance surface and recorded Critic binding.
+        # The recorded Critic binding must correspond to feedback actually sent.
         ($calls[3].arguments -join ' ') | Should Match 'review --base HEAD'
+        ($calls[3].arguments -join ' ') | Should Match 'Reviewer: examine the current work independently'
         ($calls[3].arguments -join ' ') | Should Not Match 'Architect: make|Fixer: implement'
         (Read-ReviewLoopState $c.Paths.StatePath).RoleCalls[-1].CriticId | Should Be $s.RoleCalls[-1].CallId
     }
@@ -746,15 +747,49 @@ Describe 'Durable operator messages' {
         (Get-OperatorCalls)[1].prompt | Should Match NEW_EVIDENCE
     }
 
-    It 'preserves the native Reviewer contract and delivers short developer guidance' {
+    It 'combines persistent task and Critic guidance with one-time Reviewer evidence' {
         $c=New-OperatorCase
+        & (Get-Module CodexReviewLoop) {
+            param($c)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $s.TaskContext='ORIGINAL_SCOPE: legacy compatibility is not required.'
+            $s.ArchitectWork.OrientationRequired=$false
+            $s.ArchitectWork.Goal=[pscustomobject]@{statement='DESIRED_OUTCOME';sources=@('USER');uncertainties=@()}
+            Write-ReviewLoopState $c.Paths.StatePath $s | Out-Null
+        } $c
+        Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -RequestCritic -Message 'Inspect the collaboration.' | Out-Null
+        Invoke-OperatorCritic $c
         Send-ReviewLoopOperatorMessage $c.Paths.RunRoot -To Reviewer -Message 'REVIEW_EVIDENCE' | Out-Null
-        (Invoke-OperatorRole $c -Role Reviewer).Success | Should Be $true
-        $call=(Get-OperatorCalls)[0]
-        $call.prompt | Should Be ''
-        ($call.arguments -join ' ') | Should Match 'review --base HEAD'
-        ($call.arguments -join ' ') | Should Match REVIEW_EVIDENCE
-        ($call.arguments -join ' ') | Should Not Match 'output-schema|--json| -o '
+        & (Get-Module CodexReviewLoop) {
+            param($c,$fake)
+            $s=Read-ReviewLoopState $c.Paths.StatePath
+            $config=Import-ReviewLoopConfig -ConfigPath $c.Profile -RepoPath $c.Repo
+            $config.ReviewerInstructions='CONFIGURED_REVIEW_GUIDANCE'
+            foreach ($id in @('first-review','next-review')) {
+                $call=Invoke-ConfiguredCodexRole -Config $config -Role Reviewer -RepoPath $c.Repo `
+                    -Speed standard -Mode Review -ReviewBase HEAD -Prompt '' -CallId $id `
+                    -State $s -StatePath $c.Paths.StatePath -LogRoot $c.Paths.RunRoot -CodexPath $fake
+                $call.Success | Should Be $true
+            }
+        } $c $fakeCodex
+        $reviews=@(Get-OperatorCalls | Where-Object callKind -eq review)
+        $reviews.Count | Should Be 2
+        foreach ($call in $reviews) {
+            $call.prompt | Should Be ''
+            ($call.arguments -join ' ') | Should Match 'review --base HEAD'
+            ($call.arguments -join ' ') | Should Match 'CONFIGURED_REVIEW_GUIDANCE'
+            ($call.arguments -join ' ') | Should Match 'ORIGINAL_SCOPE'
+            ($call.arguments -join ' ') | Should Match 'DESIRED_OUTCOME'
+            ($call.arguments -join ' ') | Should Match 'Reviewer: examine the current work independently'
+            ($call.arguments -join ' ') | Should Not Match 'output-schema|--json| -o |Architect: make|Fixer: implement'
+        }
+        ($reviews[0].arguments -join ' ') | Should Match REVIEW_EVIDENCE
+        ($reviews[1].arguments -join ' ') | Should Not Match REVIEW_EVIDENCE
+        $saved=Read-ReviewLoopState $c.Paths.StatePath
+        $critic=@($saved.RoleCalls | Where-Object Role -eq Critic)[0]
+        foreach ($review in @($saved.RoleCalls | Where-Object Role -eq Reviewer)) {
+            $review.CriticId | Should Be $critic.CallId
+        }
     }
 
     It 'rejects wrong-run and malformed requests durably and ignores unpublished files' {

@@ -10,7 +10,7 @@ function Get-ReviewLoopResourcePath {
 function Get-ReviewLoopSharedContextInstructions {
     param([Parameter(Mandatory = $true)][object]$State, [Parameter(Mandatory = $true)][string]$RepoPath,
         [string]$Role = 'Architect')
-    if ($Role -notin @('Architect', 'Fixer')) { return '' }
+    if ($Role -notin @('Reviewer', 'Architect', 'Fixer', 'Critic', 'LessonsLearned')) { return '' }
     $orders = @(Get-ReviewLoopOpenWork -State $State)
     if ($Role -eq 'Fixer') { $orders = @($orders | Where-Object id -In $State.ActiveWorkIds) }
     $work = @($orders | ForEach-Object {
@@ -18,8 +18,14 @@ function Get-ReviewLoopSharedContextInstructions {
     })
     return Get-ReviewLoopPrompt -Name "architecture-context.md" -Values @{
         WORK = ConvertTo-ReviewLoopJsonCompact ([pscustomobject]@{
-            taskContext = if ($State.ArchitectWork.OrientationRequired) { [string]$State.TaskContext } else { '' }
-            goal = if ($null -ne $State.ArchitectWork.Goal) { [pscustomobject]@{statement=[string]$State.ArchitectWork.Goal.statement} } else { $null }
+            taskContext = [string]$State.TaskContext
+            goal = if ($null -ne $State.ArchitectWork.Goal) {
+                [pscustomobject]@{
+                    statement = [string]$State.ArchitectWork.Goal.statement
+                    sources = @($State.ArchitectWork.Goal.sources)
+                    uncertainties = @($State.ArchitectWork.Goal.uncertainties)
+                }
+            } else { $null }
             openWork = $work
         })
     }
@@ -61,6 +67,48 @@ function Get-ReviewLoopOperationalInstructions {
     $sections += Get-ReviewLoopPrompt -Name $rolePromptName -Values @{}
     return (@($sections | ForEach-Object { $_.Trim() }) -join (
         [Environment]::NewLine + [Environment]::NewLine))
+}
+
+function Get-ReviewLoopRoleInstructions {
+    param(
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][hashtable]$Config,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [object]$State = $null,
+        [object]$Critic = $null,
+        [object[]]$OperatorMessages = @()
+    )
+
+    $sections = @(if ($Role -eq 'Reviewer') {
+        (@([string]$Config.ReviewerInstructions,
+            (Get-ReviewLoopPrompt -Name 'shell-command-hint.md' -Values @{}).Trim()) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+    } else {
+        Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
+    })
+    if ($null -ne $State -and $State.SchemaVersion -eq '2.0') {
+        $sections += Get-ReviewLoopSharedContextInstructions -State $State -RepoPath $RepoPath -Role $Role
+    }
+    if ($Role -in @('Reviewer', 'Architect', 'Fixer') -and $null -ne $Critic) {
+        $feedback = [string](Get-ReviewLoopObjectProperty -Object $Critic.StructuredResult `
+            -Name ($Role.ToLowerInvariant() + 'Feedback') -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($feedback)) {
+            $sections += Get-ReviewLoopPrompt -Name 'critic-feedback.md' -Values @{
+                CRITIC_ID = [string]$Critic.CallId
+                COVERED_REVIEWS = [string]$Critic.CoveredReviewCount
+                FEEDBACK = $feedback
+            }
+        }
+    }
+    if ($OperatorMessages.Count -gt 0) {
+        $sections += Get-ReviewLoopPrompt -Name 'operator-message.md' -Values @{
+            MESSAGES = (@($OperatorMessages | ForEach-Object {
+                $label = if ((Get-ReviewLoopObjectProperty $_ -Name Kind -Default '') -eq 'architect_reassessment') { ' (Architect reassessment)' } else { '' }
+                "$($_.Id)${label}: $($_.Message)"
+            }) -join "`n")
+        }
+    }
+    return (@($sections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n")
 }
 
 function Get-ReviewLoopPrompt {
@@ -641,37 +689,8 @@ function Invoke-ConfiguredCodexRole {
     if (-not [string]::IsNullOrWhiteSpace($CodexPath)) {
         $arguments.CodexPath = $CodexPath
     }
-    $developerInstructions = if ($Mode -eq "Review" -and $Role -eq "Reviewer") {
-        (@([string]$Config.ReviewerInstructions,
-            (Get-ReviewLoopPrompt -Name "shell-command-hint.md" -Values @{}).Trim()) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
-    }
-    else {
-        Get-ReviewLoopOperationalInstructions -Role $Role -Config $Config
-    }
-    if ($Role -ne 'Reviewer' -and $null -ne $State -and $State.SchemaVersion -eq "2.0") {
-        $developerInstructions = (@($developerInstructions,
-            (Get-ReviewLoopSharedContextInstructions -State $State -RepoPath $RepoPath -Role $Role)) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n"
-    }
-    if ($Role -ne 'Reviewer' -and $null -ne $critic) {
-        $feedback = Get-ReviewLoopPrompt -Name "critic-feedback.md" -Values @{
-            CRITIC_ID = $criticId
-            COVERED_REVIEWS = [string]$critic.CoveredReviewCount
-            FEEDBACK = [string]$critic.StructuredResult.$feedbackField
-        }
-        $developerInstructions = (@($developerInstructions, $feedback) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n`n"
-    }
-    if ($operatorMessages.Count -gt 0) {
-        $operatorText = Get-ReviewLoopPrompt -Name 'operator-message.md' -Values @{
-            MESSAGES = (@($operatorMessages | ForEach-Object {
-                $label = if ((Get-ReviewLoopObjectProperty $_ -Name Kind -Default '') -eq 'architect_reassessment') { ' (Architect reassessment)' } else { '' }
-                "$($_.Id)${label}: $($_.Message)"
-            }) -join "`n")
-        }
-        $developerInstructions = "$developerInstructions`n`n$operatorText"
-    }
+    $developerInstructions = Get-ReviewLoopRoleInstructions -Role $Role -Config $Config `
+        -RepoPath $RepoPath -State $State -Critic $critic -OperatorMessages $operatorMessages
     if ($Mode -eq 'Review') {
         $arguments.DeveloperInstructions = $developerInstructions
     }
