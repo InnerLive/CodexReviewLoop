@@ -17,6 +17,7 @@ profiles/
 .codex/review-loop.psd1
 
 # Local editor, operating-system, and PowerShell artifacts
+/tmp/
 .idea/
 .vscode/
 *.user
